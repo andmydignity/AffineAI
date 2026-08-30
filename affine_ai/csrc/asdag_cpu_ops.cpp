@@ -19,303 +19,6 @@
 namespace asdag_cpu {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. C++ Random Permutation Forward Pass (AVX-512 / AVX2 SIMD Gather + FMA)
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor> asdag_perm_forward_cpp(
-    torch::Tensor x,              // [B, dim] float32 or bfloat16
-    torch::Tensor w_perm,         // [K, P, dim] float32 or bfloat16
-    torch::Tensor perms,          // [K, P, dim] int32 or int64
-    torch::Tensor biases,         // [K, dim] float32 or bfloat16
-    torch::Tensor routing_probs   // [B, K] float32 or bfloat16
-) {
-    auto orig_dtype = x.scalar_type();
-    x = x.contiguous().to(torch::kFloat32);
-    w_perm = w_perm.contiguous().to(torch::kFloat32);
-    perms = perms.contiguous().to(torch::kInt32);
-    biases = biases.contiguous().to(torch::kFloat32);
-    routing_probs = routing_probs.contiguous().to(torch::kFloat32);
-
-    int64_t B = x.size(0);
-    int64_t dim = x.size(1);
-    int64_t K = w_perm.size(0);
-    int64_t P = w_perm.size(1);
-
-    auto leaf_outs = torch::empty({B, K, dim}, x.options());
-    auto composite_out = torch::zeros({B, dim}, x.options());
-
-    const float* x_ptr = x.data_ptr<float>();
-    const float* w_ptr = w_perm.data_ptr<float>();
-    const int32_t* p_ptr = perms.data_ptr<int32_t>();
-    const float* b_ptr = biases.data_ptr<float>();
-    const float* r_ptr = routing_probs.data_ptr<float>();
-    float* leaf_out_ptr = leaf_outs.data_ptr<float>();
-    float* out_ptr = composite_out.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel num_threads(n_threads)
-    {
-        asdag::pin_thread_to_physical_core(omp_get_thread_num());
-
-#pragma omp for schedule(static)
-        for (int64_t b = 0; b < B; ++b) {
-            const float* xb = x_ptr + b * dim;
-            const float* rb = r_ptr + b * K;
-            float* yb = out_ptr + b * dim;
-
-            for (int64_t k = 0; k < K; ++k) {
-                float* leaf_out_bk = leaf_out_ptr + (b * K + k) * dim;
-                float prob_k = rb[k];
-
-                // Top-k Sparse Early-Exit: Skip inactive leaves entirely
-                if (prob_k <= 0.0f) {
-                    std::memset(leaf_out_bk, 0, dim * sizeof(float));
-                    continue;
-                }
-
-                const float* bias_k = b_ptr + k * dim;
-                std::memcpy(leaf_out_bk, bias_k, dim * sizeof(float));
-
-                const float* w_k = w_ptr + k * (P * dim);
-                const int32_t* perm_k = p_ptr + k * (P * dim);
-
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    const float* w_kp = w_k + p_idx * dim;
-                    const int32_t* perm_kp = perm_k + p_idx * dim;
-
-                    if (p_idx == 0) {
-                        // Identity permutation path: direct elementwise vector FMA
-#if defined(ASDAG_SIMD_AVX512)
-                        int64_t i = 0;
-                        for (; i + 16 <= dim; i += 16) {
-                            __m512 wv = _mm512_loadu_ps(w_kp + i);
-                            __m512 xv = _mm512_loadu_ps(xb + i);
-                            __m512 cur_out = _mm512_loadu_ps(leaf_out_bk + i);
-                            _mm512_storeu_ps(leaf_out_bk + i, _mm512_fmadd_ps(wv, xv, cur_out));
-                        }
-                        for (; i < dim; ++i) {
-                            leaf_out_bk[i] += w_kp[i] * xb[i];
-                        }
-#elif defined(ASDAG_SIMD_AVX2)
-                        int64_t i = 0;
-                        for (; i + 8 <= dim; i += 8) {
-                            __m256 wv = _mm256_loadu_ps(w_kp + i);
-                            __m256 xv = _mm256_loadu_ps(xb + i);
-                            __m256 cur_out = _mm256_loadu_ps(leaf_out_bk + i);
-                            _mm256_storeu_ps(leaf_out_bk + i, _mm256_fmadd_ps(wv, xv, cur_out));
-                        }
-                        for (; i < dim; ++i) {
-                            leaf_out_bk[i] += w_kp[i] * xb[i];
-                        }
-#else
-                        for (int64_t i = 0; i < dim; ++i) {
-                            leaf_out_bk[i] += w_kp[i] * xb[i];
-                        }
-#endif
-                    } else {
-                        // Random permutation path: SIMD gather FMA
-#if defined(ASDAG_SIMD_AVX512)
-                        int64_t i = 0;
-                        for (; i + 16 <= dim; i += 16) {
-                            __m512 wv = _mm512_loadu_ps(w_kp + i);
-                            __m512i p_indices = _mm512_loadu_si512((const __m512i*)(perm_kp + i));
-                            __m512 xv = _mm512_i32gather_ps(p_indices, xb, 4);
-                            __m512 cur_out = _mm512_loadu_ps(leaf_out_bk + i);
-                            _mm512_storeu_ps(leaf_out_bk + i, _mm512_fmadd_ps(wv, xv, cur_out));
-                        }
-                        for (; i < dim; ++i) {
-                            leaf_out_bk[i] += w_kp[i] * xb[perm_kp[i]];
-                        }
-#elif defined(ASDAG_SIMD_AVX2)
-                        int64_t i = 0;
-                        for (; i + 8 <= dim; i += 8) {
-                            __m256 wv = _mm256_loadu_ps(w_kp + i);
-                            __m256i p_indices = _mm256_loadu_si256((const __m256i*)(perm_kp + i));
-                            __m256 xv = _mm256_i32gather_ps(xb, p_indices, 4);
-                            __m256 cur_out = _mm256_loadu_ps(leaf_out_bk + i);
-                            _mm256_storeu_ps(leaf_out_bk + i, _mm256_fmadd_ps(wv, xv, cur_out));
-                        }
-                        for (; i < dim; ++i) {
-                            leaf_out_bk[i] += w_kp[i] * xb[perm_kp[i]];
-                        }
-#else
-                        for (int64_t i = 0; i < dim; ++i) {
-                            leaf_out_bk[i] += w_kp[i] * xb[perm_kp[i]];
-                        }
-#endif
-                    }
-                }
-
-                // Fused ReLU6 activation + Top-k probability weighted composite accumulation
-#if defined(ASDAG_SIMD_AVX512)
-                __m512 pv = _mm512_set1_ps(prob_k);
-                __m512 zero = _mm512_setzero_ps();
-                __m512 six = _mm512_set1_ps(6.0f);
-                int64_t d = 0;
-                for (; d + 16 <= dim; d += 16) {
-                    __m512 val = _mm512_min_ps(_mm512_max_ps(_mm512_loadu_ps(leaf_out_bk + d), zero), six);
-                    _mm512_storeu_ps(leaf_out_bk + d, val);
-                    __m512 cur_y = _mm512_loadu_ps(yb + d);
-                    _mm512_storeu_ps(yb + d, _mm512_fmadd_ps(pv, val, cur_y));
-                }
-                for (; d < dim; ++d) {
-                    float val = std::min(std::max(leaf_out_bk[d], 0.0f), 6.0f);
-                    leaf_out_bk[d] = val;
-                    yb[d] += prob_k * val;
-                }
-#elif defined(ASDAG_SIMD_AVX2)
-                __m256 pv = _mm256_set1_ps(prob_k);
-                __m256 zero = _mm256_setzero_ps();
-                __m256 six = _mm256_set1_ps(6.0f);
-                int64_t d = 0;
-                for (; d + 8 <= dim; d += 8) {
-                    __m256 val = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(leaf_out_bk + d), zero), six);
-                    _mm256_storeu_ps(leaf_out_bk + d, val);
-                    __m256 cur_y = _mm256_loadu_ps(yb + d);
-                    _mm256_storeu_ps(yb + d, _mm256_fmadd_ps(pv, val, cur_y));
-                }
-                for (; d < dim; ++d) {
-                    float val = std::min(std::max(leaf_out_bk[d], 0.0f), 6.0f);
-                    leaf_out_bk[d] = val;
-                    yb[d] += prob_k * val;
-                }
-#else
-                for (int64_t d = 0; d < dim; ++d) {
-                    float val = std::min(std::max(leaf_out_bk[d], 0.0f), 6.0f);
-                    leaf_out_bk[d] = val;
-                    yb[d] += prob_k * val;
-                }
-#endif
-            }
-        }
-    }
-
-    if (orig_dtype == torch::kBFloat16) {
-        return std::make_tuple(composite_out.to(torch::kBFloat16), leaf_outs.to(torch::kBFloat16));
-    }
-    return std::make_tuple(composite_out, leaf_outs);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. C++ Random Permutation Backward Pass (SIMD Upstream Scatter + Grad W)
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor> asdag_perm_backward_cpp(
-    torch::Tensor grad_output,    // [B, dim] float32
-    torch::Tensor x,              // [B, dim] float32
-    torch::Tensor w_perm,         // [K, P, dim] float32
-    torch::Tensor perms,          // [K, P, dim] int32
-    torch::Tensor inv_perms,      // [K, P, dim] int32
-    torch::Tensor routing_probs,  // [B, K] float32
-    torch::Tensor leaf_outs       // [B, K, dim] float32
-) {
-    grad_output = grad_output.contiguous().to(torch::kFloat32);
-    x = x.contiguous().to(torch::kFloat32);
-    w_perm = w_perm.contiguous().to(torch::kFloat32);
-    perms = perms.contiguous().to(torch::kInt32);
-    inv_perms = inv_perms.contiguous().to(torch::kInt32);
-    routing_probs = routing_probs.contiguous().to(torch::kFloat32);
-    leaf_outs = leaf_outs.contiguous().to(torch::kFloat32);
-
-    int64_t B = x.size(0);
-    int64_t dim = x.size(1);
-    int64_t K = w_perm.size(0);
-    int64_t P = w_perm.size(1);
-
-    auto grad_x = torch::zeros_like(x);
-    auto grad_w = torch::zeros_like(w_perm);
-
-    const float* go_ptr = grad_output.data_ptr<float>();
-    const float* x_ptr = x.data_ptr<float>();
-    const float* w_ptr = w_perm.data_ptr<float>();
-    const int32_t* p_ptr = perms.data_ptr<int32_t>();
-    const int32_t* ip_ptr = inv_perms.data_ptr<int32_t>();
-    const float* r_ptr = routing_probs.data_ptr<float>();
-    const float* lo_ptr = leaf_outs.data_ptr<float>();
-    float* gx_ptr = grad_x.data_ptr<float>();
-    float* gw_ptr = grad_w.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel num_threads(n_threads)
-    {
-        asdag::pin_thread_to_physical_core(omp_get_thread_num());
-
-        // 1. Parallel Leaf Weight Gradient Accumulation
-#pragma omp for schedule(static)
-        for (int64_t k = 0; k < K; ++k) {
-            float* gw_k = gw_ptr + k * (P * dim);
-            const int32_t* perm_k = p_ptr + k * (P * dim);
-
-            for (int64_t b = 0; b < B; ++b) {
-                float prob_k = r_ptr[b * K + k];
-                if (prob_k <= 0.0f) continue;
-
-                const float* go_b = go_ptr + b * dim;
-                const float* xb = x_ptr + b * dim;
-                const float* lo_bk = lo_ptr + (b * K + k) * dim;
-
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    float* gw_kp = gw_k + p_idx * dim;
-                    const int32_t* perm_kp = perm_k + p_idx * dim;
-
-                    if (p_idx == 0) {
-                        for (int64_t d = 0; d < dim; ++d) {
-                            float act_grad = (lo_bk[d] > 0.0f && lo_bk[d] < 6.0f) ? 1.0f : 0.0f;
-                            float g_d = go_b[d] * prob_k * act_grad;
-                            gw_kp[d] += g_d * xb[d];
-                        }
-                    } else {
-                        for (int64_t d = 0; d < dim; ++d) {
-                            float act_grad = (lo_bk[d] > 0.0f && lo_bk[d] < 6.0f) ? 1.0f : 0.0f;
-                            float g_d = go_b[d] * prob_k * act_grad;
-                            gw_kp[d] += g_d * xb[perm_kp[d]];
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Parallel Input Gradient Accumulation (Scattered via inv_perms)
-#pragma omp for schedule(static)
-        for (int64_t b = 0; b < B; ++b) {
-            const float* go_b = go_ptr + b * dim;
-            float* gx_b = gx_ptr + b * dim;
-
-            for (int64_t k = 0; k < K; ++k) {
-                float prob_k = r_ptr[b * K + k];
-                if (prob_k <= 0.0f) continue;
-
-                const float* lo_bk = lo_ptr + (b * K + k) * dim;
-                const float* w_k = w_ptr + k * (P * dim);
-                const int32_t* inv_perm_k = ip_ptr + k * (P * dim);
-
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    const float* w_kp = w_k + p_idx * dim;
-                    const int32_t* inv_perm_kp = inv_perm_k + p_idx * dim;
-
-                    if (p_idx == 0) {
-                        for (int64_t j = 0; j < dim; ++j) {
-                            float act_grad = (lo_bk[j] > 0.0f && lo_bk[j] < 6.0f) ? 1.0f : 0.0f;
-                            float g_j = go_b[j] * prob_k * act_grad;
-                            gx_b[j] += g_j * w_kp[j];
-                        }
-                    } else {
-                        for (int64_t j = 0; j < dim; ++j) {
-                            int32_t src_idx = inv_perm_kp[j];
-                            float act_grad = (lo_bk[src_idx] > 0.0f && lo_bk[src_idx] < 6.0f) ? 1.0f : 0.0f;
-                            float g_src = go_b[src_idx] * prob_k * act_grad;
-                            gx_b[j] += g_src * w_kp[src_idx];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    return std::make_tuple(grad_x, grad_w);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Legacy Dense C++ Forward / Backward (for tests and comparison)
 // ─────────────────────────────────────────────────────────────────────────────
 std::tuple<torch::Tensor, torch::Tensor> asdag_forward_cpp(
@@ -454,235 +157,6 @@ std::tuple<torch::Tensor, torch::Tensor> asdag_backward_cpp(
         }
     }
     return std::make_tuple(grad_x, grad_W);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. Zero-Activation-RAM Backward Pass (Recomputes leaf activations in L1 Cache)
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> asdag_perm_backward_recompute_cpp(
-    torch::Tensor grad_output,    // [B, dim] float32
-    torch::Tensor x,              // [B, dim] float32
-    torch::Tensor w_perm,         // [K, P, dim] float32
-    torch::Tensor perms,          // [K, P, dim] int32
-    torch::Tensor inv_perms,      // [K, P, dim] int32
-    torch::Tensor biases,         // [K, dim] float32
-    torch::Tensor routing_probs   // [B, K] float32
-) {
-    grad_output = grad_output.contiguous().to(torch::kFloat32);
-    x = x.contiguous().to(torch::kFloat32);
-    w_perm = w_perm.contiguous().to(torch::kFloat32);
-    perms = perms.contiguous().to(torch::kInt32);
-    inv_perms = inv_perms.contiguous().to(torch::kInt32);
-    biases = biases.contiguous().to(torch::kFloat32);
-    routing_probs = routing_probs.contiguous().to(torch::kFloat32);
-
-    int64_t B = x.size(0);
-    int64_t dim = x.size(1);
-    int64_t K = w_perm.size(0);
-    int64_t P = w_perm.size(1);
-
-    auto grad_x = torch::zeros_like(x);
-    auto grad_w = torch::zeros_like(w_perm);
-    auto grad_probs = torch::zeros_like(routing_probs);
-
-    const float* go_ptr = grad_output.data_ptr<float>();
-    const float* x_ptr = x.data_ptr<float>();
-    const float* w_ptr = w_perm.data_ptr<float>();
-    const int32_t* p_ptr = perms.data_ptr<int32_t>();
-    const int32_t* ip_ptr = inv_perms.data_ptr<int32_t>();
-    const float* b_ptr = biases.data_ptr<float>();
-    const float* r_ptr = routing_probs.data_ptr<float>();
-    float* gx_ptr = grad_x.data_ptr<float>();
-    float* gw_ptr = grad_w.data_ptr<float>();
-    float* gp_ptr = grad_probs.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel num_threads(n_threads)
-    {
-        asdag::pin_thread_to_physical_core(omp_get_thread_num());
-
-        std::vector<float> lo_local(dim);
-
-        // 1. Parallel Leaf Weight Gradient Accumulation (recomputing active leaf out in L1)
-#pragma omp for schedule(static)
-        for (int64_t k = 0; k < K; ++k) {
-            float* gw_k = gw_ptr + k * (P * dim);
-            const int32_t* perm_k = p_ptr + k * (P * dim);
-            const float* w_k = w_ptr + k * (P * dim);
-            const float* bias_k = b_ptr + k * dim;
-
-            for (int64_t b = 0; b < B; ++b) {
-                float prob_k = r_ptr[b * K + k];
-                if (prob_k <= 0.0f) continue;
-
-                const float* go_b = go_ptr + b * dim;
-                const float* xb = x_ptr + b * dim;
-
-                // Recompute active leaf out in local L1 stack
-                std::memcpy(lo_local.data(), bias_k, dim * sizeof(float));
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    const float* w_kp = w_k + p_idx * dim;
-                    const int32_t* perm_kp = perm_k + p_idx * dim;
-                    if (p_idx == 0) {
-#if defined(ASDAG_SIMD_AVX512)
-                        for (int64_t i = 0; i + 16 <= dim; i += 16) {
-                            __m512 cur = _mm512_loadu_ps(lo_local.data() + i);
-                            __m512 wv = _mm512_loadu_ps(w_kp + i);
-                            __m512 xv = _mm512_loadu_ps(xb + i);
-                            _mm512_storeu_ps(lo_local.data() + i, _mm512_fmadd_ps(wv, xv, cur));
-                        }
-#elif defined(ASDAG_SIMD_AVX2)
-                        for (int64_t i = 0; i + 8 <= dim; i += 8) {
-                            __m256 cur = _mm256_loadu_ps(lo_local.data() + i);
-                            __m256 wv = _mm256_loadu_ps(w_kp + i);
-                            __m256 xv = _mm256_loadu_ps(xb + i);
-                            _mm256_storeu_ps(lo_local.data() + i, _mm256_fmadd_ps(wv, xv, cur));
-                        }
-#else
-                        for (int64_t i = 0; i < dim; ++i) lo_local[i] += w_kp[i] * xb[i];
-#endif
-                    } else {
-#if defined(ASDAG_SIMD_AVX512)
-                        for (int64_t i = 0; i + 16 <= dim; i += 16) {
-                            __m512 cur = _mm512_loadu_ps(lo_local.data() + i);
-                            __m512 wv = _mm512_loadu_ps(w_kp + i);
-                            __m512i p_idx_v = _mm512_loadu_si512((const __m512i*)(perm_kp + i));
-                            __m512 xv = _mm512_i32gather_ps(p_idx_v, xb, 4);
-                            _mm512_storeu_ps(lo_local.data() + i, _mm512_fmadd_ps(wv, xv, cur));
-                        }
-#elif defined(ASDAG_SIMD_AVX2)
-                        for (int64_t i = 0; i + 8 <= dim; i += 8) {
-                            __m256 cur = _mm256_loadu_ps(lo_local.data() + i);
-                            __m256 wv = _mm256_loadu_ps(w_kp + i);
-                            __m256i p_idx_v = _mm256_loadu_si256((const __m256i*)(perm_kp + i));
-                            __m256 xv = _mm256_i32gather_ps(xb, p_idx_v, 4);
-                            _mm256_storeu_ps(lo_local.data() + i, _mm256_fmadd_ps(wv, xv, cur));
-                        }
-#else
-                        for (int64_t i = 0; i < dim; ++i) lo_local[i] += w_kp[i] * xb[perm_kp[i]];
-#endif
-                    }
-                }
-                for (int64_t d = 0; d < dim; ++d) {
-                    lo_local[d] = std::min(std::max(lo_local[d], 0.0f), 6.0f);
-                }
-
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    float* gw_kp = gw_k + p_idx * dim;
-                    const int32_t* perm_kp = perm_k + p_idx * dim;
-
-                    if (p_idx == 0) {
-                        for (int64_t d = 0; d < dim; ++d) {
-                            float act_grad = (lo_local[d] > 0.0f && lo_local[d] < 6.0f) ? 1.0f : 0.0f;
-                            float g_d = go_b[d] * prob_k * act_grad;
-                            gw_kp[d] += g_d * xb[d];
-                        }
-                    } else {
-                        for (int64_t d = 0; d < dim; ++d) {
-                            float act_grad = (lo_local[d] > 0.0f && lo_local[d] < 6.0f) ? 1.0f : 0.0f;
-                            float g_d = go_b[d] * prob_k * act_grad;
-                            gw_kp[d] += g_d * xb[perm_kp[d]];
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Parallel Input Gradient Accumulation & Routing Prob Gradients
-#pragma omp for schedule(static)
-        for (int64_t b = 0; b < B; ++b) {
-            const float* go_b = go_ptr + b * dim;
-            const float* xb = x_ptr + b * dim;
-            float* gx_b = gx_ptr + b * dim;
-            float* gp_b = gp_ptr + b * K;
-
-            for (int64_t k = 0; k < K; ++k) {
-                float prob_k = r_ptr[b * K + k];
-                if (prob_k <= 0.0f) continue;
-
-                const float* w_k = w_ptr + k * (P * dim);
-                const int32_t* perm_k = p_ptr + k * (P * dim);
-                const int32_t* inv_perm_k = ip_ptr + k * (P * dim);
-                const float* bias_k = b_ptr + k * dim;
-
-                // Recompute active leaf out in local L1 stack
-                std::memcpy(lo_local.data(), bias_k, dim * sizeof(float));
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    const float* w_kp = w_k + p_idx * dim;
-                    const int32_t* perm_kp = perm_k + p_idx * dim;
-                    if (p_idx == 0) {
-#if defined(ASDAG_SIMD_AVX512)
-                        for (int64_t i = 0; i + 16 <= dim; i += 16) {
-                            __m512 cur = _mm512_loadu_ps(lo_local.data() + i);
-                            __m512 wv = _mm512_loadu_ps(w_kp + i);
-                            __m512 xv = _mm512_loadu_ps(xb + i);
-                            _mm512_storeu_ps(lo_local.data() + i, _mm512_fmadd_ps(wv, xv, cur));
-                        }
-#elif defined(ASDAG_SIMD_AVX2)
-                        for (int64_t i = 0; i + 8 <= dim; i += 8) {
-                            __m256 cur = _mm256_loadu_ps(lo_local.data() + i);
-                            __m256 wv = _mm256_loadu_ps(w_kp + i);
-                            __m256 xv = _mm256_loadu_ps(xb + i);
-                            _mm256_storeu_ps(lo_local.data() + i, _mm256_fmadd_ps(wv, xv, cur));
-                        }
-#else
-                        for (int64_t i = 0; i < dim; ++i) lo_local[i] += w_kp[i] * xb[i];
-#endif
-                    } else {
-#if defined(ASDAG_SIMD_AVX512)
-                        for (int64_t i = 0; i + 16 <= dim; i += 16) {
-                            __m512 cur = _mm512_loadu_ps(lo_local.data() + i);
-                            __m512 wv = _mm512_loadu_ps(w_kp + i);
-                            __m512i p_idx_v = _mm512_loadu_si512((const __m512i*)(perm_kp + i));
-                            __m512 xv = _mm512_i32gather_ps(p_idx_v, xb, 4);
-                            _mm512_storeu_ps(lo_local.data() + i, _mm512_fmadd_ps(wv, xv, cur));
-                        }
-#elif defined(ASDAG_SIMD_AVX2)
-                        for (int64_t i = 0; i + 8 <= dim; i += 8) {
-                            __m256 cur = _mm256_loadu_ps(lo_local.data() + i);
-                            __m256 wv = _mm256_loadu_ps(w_kp + i);
-                            __m256i p_idx_v = _mm256_loadu_si256((const __m256i*)(perm_kp + i));
-                            __m256 xv = _mm256_i32gather_ps(xb, p_idx_v, 4);
-                            _mm256_storeu_ps(lo_local.data() + i, _mm256_fmadd_ps(wv, xv, cur));
-                        }
-#else
-                        for (int64_t i = 0; i < dim; ++i) lo_local[i] += w_kp[i] * xb[perm_kp[i]];
-#endif
-                    }
-                }
-                float prob_dot = 0.0f;
-                for (int64_t d = 0; d < dim; ++d) {
-                    float val = std::min(std::max(lo_local[d], 0.0f), 6.0f);
-                    lo_local[d] = val;
-                    prob_dot += go_b[d] * val;
-                }
-                gp_b[k] = prob_dot;
-
-                for (int64_t p_idx = 0; p_idx < P; ++p_idx) {
-                    const float* w_kp = w_k + p_idx * dim;
-                    const int32_t* inv_perm_kp = inv_perm_k + p_idx * dim;
-
-                    if (p_idx == 0) {
-                        for (int64_t j = 0; j < dim; ++j) {
-                            float act_grad = (lo_local[j] > 0.0f && lo_local[j] < 6.0f) ? 1.0f : 0.0f;
-                            float g_j = go_b[j] * prob_k * act_grad;
-                            gx_b[j] += g_j * w_kp[j];
-                        }
-                    } else {
-                        for (int64_t j = 0; j < dim; ++j) {
-                            int32_t src_idx = inv_perm_kp[j];
-                            float act_grad = (lo_local[src_idx] > 0.0f && lo_local[src_idx] < 6.0f) ? 1.0f : 0.0f;
-                            float g_src = go_b[src_idx] * prob_k * act_grad;
-                            gx_b[j] += g_src * w_kp[src_idx];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    return std::make_tuple(grad_x, grad_w, grad_probs);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2289,477 +1763,6 @@ torch::Tensor asdag_monarch_reg_forward_cpp(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 19. Fused BLT Causal Byte Decoder Kernel (Zero Expanded Allocation)
-// ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor asdag_blt_causal_decode_fused_cpp(
-    torch::Tensor h_byte,                // [B, T, d_byte]
-    torch::Tensor causal_latent_patches, // [B, M, d_model]
-    torch::Tensor patch_to_byte_weight,  // [d_byte, d_model]
-    torch::Tensor fusion_weight,         // [d_byte, 2*d_byte]
-    torch::Tensor lm_head_weight,        // [V, d_byte]
-    torch::Tensor patch_assignments      // [B, T] int64
-) {
-    auto orig_dtype = h_byte.scalar_type();
-    h_byte = h_byte.contiguous().to(torch::kFloat32);
-    causal_latent_patches = causal_latent_patches.contiguous().to(torch::kFloat32);
-    patch_to_byte_weight = patch_to_byte_weight.contiguous().to(torch::kFloat32);
-    fusion_weight = fusion_weight.contiguous().to(torch::kFloat32);
-    lm_head_weight = lm_head_weight.contiguous().to(torch::kFloat32);
-    patch_assignments = patch_assignments.contiguous().to(torch::kInt64);
-
-    int64_t B = h_byte.size(0);
-    int64_t T = h_byte.size(1);
-    int64_t d_byte = h_byte.size(2);
-    int64_t M = causal_latent_patches.size(1);
-    int64_t d_model = causal_latent_patches.size(2);
-    int64_t V = lm_head_weight.size(0);
-
-    auto logits = torch::empty({B, T, V}, torch::kFloat32);
-
-    const float* hb_ptr = h_byte.data_ptr<float>();
-    const float* clp_ptr = causal_latent_patches.data_ptr<float>();
-    const float* p2b_ptr = patch_to_byte_weight.data_ptr<float>();
-    const float* fus_ptr = fusion_weight.data_ptr<float>();
-    const float* lm_ptr = lm_head_weight.data_ptr<float>();
-    const int64_t* pa_ptr = patch_assignments.data_ptr<int64_t>();
-    float* out_ptr = logits.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t b = 0; b < B; ++b) {
-        std::vector<float> patch_h(d_byte);
-        std::vector<float> cat_buf(2 * d_byte);
-        std::vector<float> fused_buf(d_byte);
-
-        for (int64_t t = 0; t < T; ++t) {
-            int64_t patch_idx = pa_ptr[b * T + t];
-            if (patch_idx >= M) patch_idx = M - 1;
-            if (patch_idx < 0) patch_idx = 0;
-
-            const float* cur_patch = clp_ptr + (b * M + patch_idx) * d_model;
-            const float* cur_hb = hb_ptr + (b * T + t) * d_byte;
-            float* cur_out = out_ptr + (b * T + t) * V;
-
-            // 1. patch_h = patch_to_byte(cur_patch) [d_byte x d_model] * [d_model]
-            for (int64_t i = 0; i < d_byte; ++i) {
-                const float* w_row = p2b_ptr + i * d_model;
-                float dot = 0.0f;
-#if defined(ASDAG_SIMD_AVX2)
-                int64_t k = 0;
-                __m256 acc = _mm256_setzero_ps();
-                for (; k + 8 <= d_model; k += 8) {
-                    __m256 wv = _mm256_loadu_ps(w_row + k);
-                    __m256 pv = _mm256_loadu_ps(cur_patch + k);
-                    acc = _mm256_fmadd_ps(wv, pv, acc);
-                }
-                dot = asdag::hsum256(acc);
-                for (; k < d_model; ++k) dot += w_row[k] * cur_patch[k];
-#else
-                for (int64_t k = 0; k < d_model; ++k) dot += w_row[k] * cur_patch[k];
-#endif
-                patch_h[i] = dot;
-            }
-
-            // 2. Concat [cur_hb, patch_h]
-            std::memcpy(cat_buf.data(), cur_hb, d_byte * sizeof(float));
-            std::memcpy(cat_buf.data() + d_byte, patch_h.data(), d_byte * sizeof(float));
-
-            // 3. Fused projection + SiLU: fused_buf = SiLU(fusion * cat_buf)
-            float sum_sq = 0.0f;
-            for (int64_t i = 0; i < d_byte; ++i) {
-                const float* w_row = fus_ptr + i * (2 * d_byte);
-                float dot = 0.0f;
-                for (int64_t k = 0; k < 2 * d_byte; ++k) dot += w_row[k] * cat_buf[k];
-                float silu = dot / (1.0f + std::exp(-dot));
-                fused_buf[i] = silu;
-                sum_sq += silu * silu;
-            }
-
-            // RMSNorm on fused_buf
-            float rms = 1.0f / std::sqrt((sum_sq / (float)d_byte) + 1e-5f);
-            for (int64_t i = 0; i < d_byte; ++i) fused_buf[i] *= rms;
-
-            // 4. LM Head: logits = lm_head * fused_buf [V x d_byte] * [d_byte]
-            for (int64_t v = 0; v < V; ++v) {
-                const float* w_row = lm_ptr + v * d_byte;
-                float dot = 0.0f;
-#if defined(ASDAG_SIMD_AVX2)
-                int64_t k = 0;
-                __m256 acc = _mm256_setzero_ps();
-                for (; k + 8 <= d_byte; k += 8) {
-                    __m256 wv = _mm256_loadu_ps(w_row + k);
-                    __m256 fv = _mm256_loadu_ps(fused_buf.data() + k);
-                    acc = _mm256_fmadd_ps(wv, fv, acc);
-                }
-                dot = asdag::hsum256(acc);
-                for (; k < d_byte; ++k) dot += w_row[k] * fused_buf[k];
-#else
-                for (int64_t k = 0; k < d_byte; ++k) dot += w_row[k] * fused_buf[k];
-#endif
-                cur_out[v] = dot;
-            }
-        }
-    }
-
-    return logits.to(orig_dtype);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 19b. Fused BLT Causal Byte Decoder Backward Kernel
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_blt_causal_decode_backward_cpp(
-    torch::Tensor grad_logits,           // [B, T, V]
-    torch::Tensor h_byte,                // [B, T, d_byte]
-    torch::Tensor causal_latent_patches, // [B, M, d_model]
-    torch::Tensor patch_to_byte_weight,  // [d_byte, d_model]
-    torch::Tensor fusion_weight,         // [d_byte, 2*d_byte]
-    torch::Tensor lm_head_weight,        // [V, d_byte]
-    torch::Tensor patch_assignments      // [B, T] int64
-) {
-    auto orig_dtype = grad_logits.scalar_type();
-    grad_logits = grad_logits.contiguous().to(torch::kFloat32);
-    h_byte = h_byte.contiguous().to(torch::kFloat32);
-    causal_latent_patches = causal_latent_patches.contiguous().to(torch::kFloat32);
-    patch_to_byte_weight = patch_to_byte_weight.contiguous().to(torch::kFloat32);
-    fusion_weight = fusion_weight.contiguous().to(torch::kFloat32);
-    lm_head_weight = lm_head_weight.contiguous().to(torch::kFloat32);
-    patch_assignments = patch_assignments.contiguous().to(torch::kInt64);
-
-    int64_t B = h_byte.size(0);
-    int64_t T = h_byte.size(1);
-    int64_t d_byte = h_byte.size(2);
-    int64_t M = causal_latent_patches.size(1);
-    int64_t d_model = causal_latent_patches.size(2);
-    int64_t V = lm_head_weight.size(0);
-
-    auto grad_h_byte = torch::zeros_like(h_byte);
-    auto grad_patches = torch::zeros_like(causal_latent_patches);
-    auto grad_p2b = torch::zeros_like(patch_to_byte_weight);
-    auto grad_fusion = torch::zeros_like(fusion_weight);
-
-    // 1. High-throughput GEMM for upstream gradient propagation: g_fused_all = grad_logits * lm_head_weight
-    auto g_fused_all = torch::mm(grad_logits.view({B * T, V}), lm_head_weight).view({B, T, d_byte});
-    auto fused_all = torch::empty({B * T, d_byte}, torch::kFloat32);
-
-    const float* gf_all_ptr = g_fused_all.data_ptr<float>();
-    float* fused_all_ptr = fused_all.data_ptr<float>();
-    const float* hb_ptr = h_byte.data_ptr<float>();
-    const float* clp_ptr = causal_latent_patches.data_ptr<float>();
-    const float* p2b_ptr = patch_to_byte_weight.data_ptr<float>();
-    const float* fus_ptr = fusion_weight.data_ptr<float>();
-    const int64_t* pa_ptr = patch_assignments.data_ptr<int64_t>();
-
-    float* ghb_ptr = grad_h_byte.data_ptr<float>();
-    float* gp_ptr = grad_patches.data_ptr<float>();
-    float* gp2b_ptr = grad_p2b.data_ptr<float>();
-    float* gfus_ptr = grad_fusion.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel num_threads(n_threads)
-    {
-        std::vector<float> patch_h(d_byte);
-        std::vector<float> cat_buf(2 * d_byte);
-        std::vector<float> u_buf(d_byte);
-        std::vector<float> s_buf(d_byte);
-        std::vector<float> fused_buf(d_byte);
-        std::vector<float> g_s(d_byte);
-        std::vector<float> g_u(d_byte);
-        std::vector<float> g_cat(2 * d_byte);
-        std::vector<float> g_patch_h(d_byte);
-
-#pragma omp for schedule(static)
-        for (int64_t b = 0; b < B; ++b) {
-            for (int64_t t = 0; t < T; ++t) {
-                int64_t patch_idx = pa_ptr[b * T + t];
-                if (patch_idx >= M) patch_idx = M - 1;
-                if (patch_idx < 0) patch_idx = 0;
-
-                const float* cur_patch = clp_ptr + (b * M + patch_idx) * d_model;
-                const float* cur_hb = hb_ptr + (b * T + t) * d_byte;
-                const float* g_fused = gf_all_ptr + (b * T + t) * d_byte;
-                float* cur_ghb = ghb_ptr + (b * T + t) * d_byte;
-                float* cur_gp = gp_ptr + (b * M + patch_idx) * d_model;
-                float* cur_fused_all = fused_all_ptr + (b * T + t) * d_byte;
-
-                // Recompute forward
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    const float* w_row = p2b_ptr + i * d_model;
-                    float dot = 0.0f;
-                    for (int64_t k = 0; k < d_model; ++k) dot += w_row[k] * cur_patch[k];
-                    patch_h[i] = dot;
-                }
-                std::memcpy(cat_buf.data(), cur_hb, d_byte * sizeof(float));
-                std::memcpy(cat_buf.data() + d_byte, patch_h.data(), d_byte * sizeof(float));
-
-                float sum_sq = 0.0f;
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    const float* w_row = fus_ptr + i * (2 * d_byte);
-                    float dot = 0.0f;
-                    for (int64_t k = 0; k < 2 * d_byte; ++k) dot += w_row[k] * cat_buf[k];
-                    u_buf[i] = dot;
-                    float sig = 1.0f / (1.0f + std::exp(-dot));
-                    float silu = dot * sig;
-                    s_buf[i] = silu;
-                    sum_sq += silu * silu;
-                }
-                float rms_scale = 1.0f / std::sqrt((sum_sq / (float)d_byte) + 1e-5f);
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    fused_buf[i] = s_buf[i] * rms_scale;
-                    cur_fused_all[i] = fused_buf[i];
-                }
-
-                // 2. Gradient through RMSNorm
-                float gf_dot_hf = 0.0f;
-                for (int64_t i = 0; i < d_byte; ++i) gf_dot_hf += g_fused[i] * fused_buf[i];
-                float norm_scale = gf_dot_hf / (float)d_byte;
-
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    g_s[i] = rms_scale * (g_fused[i] - fused_buf[i] * norm_scale);
-                }
-
-                // 3. Gradient through SiLU: s = u * sig(u)
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    float u = u_buf[i];
-                    float sig = 1.0f / (1.0f + std::exp(-u));
-                    float dsilu = sig * (1.0f + u * (1.0f - sig));
-                    g_u[i] = g_s[i] * dsilu;
-                }
-
-                // 4. Gradient through fusion: g_cat = fusion.T * g_u
-                for (int64_t k = 0; k < 2 * d_byte; ++k) {
-                    float dot = 0.0f;
-                    for (int64_t i = 0; i < d_byte; ++i) {
-                        dot += fus_ptr[i * (2 * d_byte) + k] * g_u[i];
-                    }
-                    g_cat[k] = dot;
-                }
-
-                // 5. Split g_cat -> g_hb, g_patch_h
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    cur_ghb[i] += g_cat[i];
-                    g_patch_h[i] = g_cat[d_byte + i];
-                }
-
-                // 6. Gradient to causal_latent_patches
-                for (int64_t d = 0; d < d_model; ++d) {
-                    float dot = 0.0f;
-                    for (int64_t i = 0; i < d_byte; ++i) {
-                        dot += p2b_ptr[i * d_model + d] * g_patch_h[i];
-                    }
-                    cur_gp[d] += dot;
-                }
-            }
-        }
-    }
-
-    // 7. High-throughput GEMM for grad_lm
-    auto grad_lm = torch::mm(grad_logits.view({B * T, V}).t(), fused_all);
-
-    return std::make_tuple(
-        grad_h_byte.to(orig_dtype),
-        grad_patches.to(orig_dtype),
-        grad_p2b.to(orig_dtype),
-        grad_fusion.to(orig_dtype),
-        grad_lm.to(orig_dtype)
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 19c. Fused BLT Causal Decoder + Cross-Entropy Loss (Zero-Logits RAM Allocation)
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_blt_causal_decode_loss_fused_cpp(
-    torch::Tensor h_byte,                // [B, T, d_byte]
-    torch::Tensor causal_latent_patches, // [B, M, d_model]
-    torch::Tensor patch_to_byte_weight,  // [d_byte, d_model]
-    torch::Tensor fusion_weight,         // [d_byte, 2*d_byte]
-    torch::Tensor lm_head_weight,        // [V, d_byte]
-    torch::Tensor patch_assignments,     // [B, T] int64
-    torch::Tensor targets                // [B, T] int64
-) {
-    auto orig_dtype = h_byte.scalar_type();
-    h_byte = h_byte.contiguous().to(torch::kFloat32);
-    causal_latent_patches = causal_latent_patches.contiguous().to(torch::kFloat32);
-    patch_to_byte_weight = patch_to_byte_weight.contiguous().to(torch::kFloat32);
-    fusion_weight = fusion_weight.contiguous().to(torch::kFloat32);
-    lm_head_weight = lm_head_weight.contiguous().to(torch::kFloat32);
-    patch_assignments = patch_assignments.contiguous().to(torch::kInt64);
-    targets = targets.contiguous().to(torch::kInt64);
-
-    int64_t B = h_byte.size(0);
-    int64_t T = h_byte.size(1);
-    int64_t d_byte = h_byte.size(2);
-    int64_t M = causal_latent_patches.size(1);
-    int64_t d_model = causal_latent_patches.size(2);
-    int64_t V = lm_head_weight.size(0);
-
-    auto grad_h_byte = torch::zeros_like(h_byte);
-    auto grad_patches = torch::zeros_like(causal_latent_patches);
-    auto grad_p2b = torch::zeros_like(patch_to_byte_weight);
-    auto grad_fusion = torch::zeros_like(fusion_weight);
-    auto grad_lm = torch::zeros_like(lm_head_weight);
-
-    auto total_loss = torch::zeros({1}, torch::kFloat32);
-    float* loss_ptr = total_loss.data_ptr<float>();
-
-    const float* hb_ptr = h_byte.data_ptr<float>();
-    const float* clp_ptr = causal_latent_patches.data_ptr<float>();
-    const float* p2b_ptr = patch_to_byte_weight.data_ptr<float>();
-    const float* fus_ptr = fusion_weight.data_ptr<float>();
-    const float* lm_ptr = lm_head_weight.data_ptr<float>();
-    const int64_t* pa_ptr = patch_assignments.data_ptr<int64_t>();
-    const int64_t* tgt_ptr = targets.data_ptr<int64_t>();
-
-    float* ghb_ptr = grad_h_byte.data_ptr<float>();
-    float* gp_ptr = grad_patches.data_ptr<float>();
-    float* gp2b_ptr = grad_p2b.data_ptr<float>();
-    float* gfus_ptr = grad_fusion.data_ptr<float>();
-    float* glm_ptr = grad_lm.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-    double acc_total_loss = 0.0;
-    float scale = 1.0f / float(B * T);
-
-#pragma omp parallel num_threads(n_threads) reduction(+:acc_total_loss)
-    {
-        std::vector<float> patch_h(d_byte);
-        std::vector<float> cat_buf(2 * d_byte);
-        std::vector<float> u_buf(d_byte);
-        std::vector<float> fused_buf(d_byte);
-        std::vector<float> logits_buf(V);
-        std::vector<float> g_fused(d_byte);
-        std::vector<float> g_s(d_byte);
-        std::vector<float> g_u(d_byte);
-        std::vector<float> g_cat(2 * d_byte);
-        std::vector<float> g_patch_h(d_byte);
-
-#pragma omp for schedule(static)
-        for (int64_t b = 0; b < B; ++b) {
-            for (int64_t t = 0; t < T; ++t) {
-                int64_t patch_idx = pa_ptr[b * T + t];
-                if (patch_idx >= M) patch_idx = M - 1;
-                if (patch_idx < 0) patch_idx = 0;
-
-                const float* cur_patch = clp_ptr + (b * M + patch_idx) * d_model;
-                const float* cur_hb = hb_ptr + (b * T + t) * d_byte;
-                int64_t tgt = tgt_ptr[b * T + t];
-                if (tgt < 0 || tgt >= V) tgt = 0;
-
-                float* cur_ghb = ghb_ptr + (b * T + t) * d_byte;
-                float* cur_gp = gp_ptr + (b * M + patch_idx) * d_model;
-
-                // 1. patch_h = p2b * cur_patch
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    const float* w_row = p2b_ptr + i * d_model;
-                    float dot = 0.0f;
-                    for (int64_t k = 0; k < d_model; ++k) dot += w_row[k] * cur_patch[k];
-                    patch_h[i] = dot;
-                }
-                std::memcpy(cat_buf.data(), cur_hb, d_byte * sizeof(float));
-                std::memcpy(cat_buf.data() + d_byte, patch_h.data(), d_byte * sizeof(float));
-
-                // 2. Fused projection + SiLU
-                float sum_sq = 0.0f;
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    const float* w_row = fus_ptr + i * (2 * d_byte);
-                    float dot = 0.0f;
-                    for (int64_t k = 0; k < 2 * d_byte; ++k) dot += w_row[k] * cat_buf[k];
-                    u_buf[i] = dot;
-                    float silu = dot / (1.0f + std::exp(-dot));
-                    fused_buf[i] = silu;
-                    sum_sq += silu * silu;
-                }
-
-                // 3. RMSNorm
-                float rms = 1.0f / std::sqrt((sum_sq / (float)d_byte) + 1e-5f);
-                for (int64_t i = 0; i < d_byte; ++i) fused_buf[i] *= rms;
-
-                // 4. In-Register Logits & Softmax Loss
-                float max_logit = -1e9f;
-                for (int64_t v = 0; v < V; ++v) {
-                    const float* w_row = lm_ptr + v * d_byte;
-                    float dot = 0.0f;
-                    for (int64_t k = 0; k < d_byte; ++k) dot += w_row[k] * fused_buf[k];
-                    logits_buf[v] = dot;
-                    if (dot > max_logit) max_logit = dot;
-                }
-
-                float sum_exp = 0.0f;
-                for (int64_t v = 0; v < V; ++v) {
-                    float exp_val = std::exp(logits_buf[v] - max_logit);
-                    logits_buf[v] = exp_val;
-                    sum_exp += exp_val;
-                }
-                float inv_sum_exp = 1.0f / sum_exp;
-                float token_loss = std::log(sum_exp) + max_logit - (logits_buf[tgt] > 0 ? (std::log(logits_buf[tgt]) + max_logit) : max_logit);
-                acc_total_loss += (std::log(sum_exp) - (std::log(logits_buf[tgt])));
-
-                // 5. In-Situ Softmax Gradients to LM head and fused_buf
-                for (int64_t i = 0; i < d_byte; ++i) g_fused[i] = 0.0f;
-
-                for (int64_t v = 0; v < V; ++v) {
-                    float prob = logits_buf[v] * inv_sum_exp;
-                    float d_logit = (prob - (v == tgt ? 1.0f : 0.0f)) * scale;
-                    const float* w_row = lm_ptr + v * d_byte;
-                    for (int64_t k = 0; k < d_byte; ++k) {
-                        g_fused[k] += d_logit * w_row[k];
-                    }
-                }
-
-                // 6. RMSNorm backward
-                float sum_g_f = 0.0f;
-                for (int64_t i = 0; i < d_byte; ++i) sum_g_f += g_fused[i] * fused_buf[i];
-
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    g_s[i] = (g_fused[i] * rms) - (fused_buf[i] * sum_g_f * (rms * rms * rms / (float)d_byte));
-                }
-
-                // 7. SiLU backward
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    float u = u_buf[i];
-                    float sig = 1.0f / (1.0f + std::exp(-u));
-                    float dsilu = sig * (1.0f + u * (1.0f - sig));
-                    g_u[i] = g_s[i] * dsilu;
-                }
-
-                // 8. Fusion backward
-                for (int64_t k = 0; k < 2 * d_byte; ++k) {
-                    float dot = 0.0f;
-                    for (int64_t i = 0; i < d_byte; ++i) dot += fus_ptr[i * (2 * d_byte) + k] * g_u[i];
-                    g_cat[k] = dot;
-                }
-
-                for (int64_t i = 0; i < d_byte; ++i) {
-                    cur_ghb[i] += g_cat[i];
-                    g_patch_h[i] = g_cat[d_byte + i];
-                }
-
-                // 9. Patch backward
-                for (int64_t d = 0; d < d_model; ++d) {
-                    float dot = 0.0f;
-                    for (int64_t i = 0; i < d_byte; ++i) dot += p2b_ptr[i * d_model + d] * g_patch_h[i];
-                    cur_gp[d] += dot;
-                }
-            }
-        }
-    }
-
-    loss_ptr[0] = float(acc_total_loss * scale);
-
-    return std::make_tuple(
-        total_loss,
-        grad_h_byte.to(orig_dtype),
-        grad_patches.to(orig_dtype),
-        grad_p2b.to(orig_dtype),
-        grad_fusion.to(orig_dtype),
-        grad_lm.to(orig_dtype)
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 19d. AVX2 Vectorized Dot Product Utilities (Zero Overhead Register Pipeline)
-// ─────────────────────────────────────────────────────────────────────────────
 static inline float dot_avx2_64(const float* a, const float* b);
 static inline float dot_avx2_128(const float* a, const float* b);
 
@@ -3432,22 +2435,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 20. Leaf-Contiguous Token-Bucketed Sparse Tree Forward (Max L1 Locality)
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor> asdag_sparse_tree_bucketed_forward_cpp(
-    torch::Tensor x,            // [B, dim]
-    torch::Tensor w_perm,       // [K, P, dim]
-    torch::Tensor perms,        // [K, P, dim]
-    torch::Tensor bias,         // [K, dim]
-    torch::Tensor top_indices,  // [B, N]
-    torch::Tensor top_weights   // [B, N]
-) {
-    return asdag_sparse_tree_perm_forward_cpp(x, w_perm, perms, bias, top_indices, top_weights);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 21. Fused RMSNorm + Linear Input Projection
-// ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor asdag_fused_rmsnorm_proj_cpp(
     torch::Tensor x,      // [B, dim]
     torch::Tensor weight, // [out_dim, dim]
@@ -3514,6 +2501,139 @@ torch::Tensor asdag_fused_rmsnorm_proj_cpp(
 
     return out.to(orig_dtype);
 }
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_bitlinear_swiglu_ternary_int8_forward_cpp(
+    torch::Tensor x,              // [N, D]
+    torch::Tensor w_gate_val,     // [2*H, D]
+    float gamma_gv,
+    torch::Tensor w_down,         // [D, H]
+    float gamma_down
+) {
+    auto orig_dtype = x.scalar_type();
+    x = x.contiguous().to(torch::kFloat32);
+    w_gate_val = w_gate_val.contiguous().to(torch::kFloat32);
+    w_down = w_down.contiguous().to(torch::kFloat32);
+
+    int64_t N = x.size(0);
+    int64_t D = x.size(1);
+    int64_t H = w_down.size(1);
+
+    auto out = torch::empty({N, D}, torch::kFloat32);
+    auto h_act = torch::empty({N, H}, torch::kFloat32);
+    auto gate_raw = torch::empty({N, H}, torch::kFloat32);
+    auto val_raw = torch::empty({N, H}, torch::kFloat32);
+
+    const float* x_ptr = x.data_ptr<float>();
+    const float* wgv_ptr = w_gate_val.data_ptr<float>();
+    const float* wd_ptr = w_down.data_ptr<float>();
+
+    float* out_ptr = out.data_ptr<float>();
+    float* ha_ptr = h_act.data_ptr<float>();
+    float* gr_ptr = gate_raw.data_ptr<float>();
+    float* vr_ptr = val_raw.data_ptr<float>();
+
+    std::vector<int16_t> wgv_i16(2 * H * D);
+    std::vector<int16_t> wd_i16(D * H);
+    for (int64_t i = 0; i < 2 * H * D; ++i) wgv_i16[i] = (int16_t)std::round(wgv_ptr[i]);
+    for (int64_t i = 0; i < D * H; ++i) wd_i16[i] = (int16_t)std::round(wd_ptr[i]);
+
+    int n_threads = asdag::get_physical_cores();
+
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        const float* xn = x_ptr + n * D;
+        float* han = ha_ptr + n * H;
+        float* grn = gr_ptr + n * H;
+        float* vrn = vr_ptr + n * H;
+        float* outn = out_ptr + n * D;
+
+        // 1. Dynamic Quantization of x to int16
+        float max_x = 0.0f;
+        for (int64_t d = 0; d < D; ++d) max_x = std::max(max_x, std::abs(xn[d]));
+        float alpha_x = 127.0f / (max_x + 1e-5f);
+        float inv_scale_gv = gamma_gv / alpha_x;
+
+        std::vector<int16_t> x_i16(D);
+        for (int64_t d = 0; d < D; ++d) {
+            x_i16[d] = (int16_t)std::clamp((int)std::round(xn[d] * alpha_x), -128, 127);
+        }
+
+        // 2. Integer MatMul for w_gate and w_val
+        for (int64_t h = 0; h < H; ++h) {
+            const int16_t* wg_row = wgv_i16.data() + h * D;
+            const int16_t* wv_row = wgv_i16.data() + (H + h) * D;
+
+            int32_t dot_g_i = 0, dot_v_i = 0;
+#if defined(ASDAG_SIMD_AVX2)
+            int64_t d = 0;
+            __m256i acc_g = _mm256_setzero_si256();
+            __m256i acc_v = _mm256_setzero_si256();
+
+            for (; d + 16 <= D; d += 16) {
+                __m256i xv = _mm256_loadu_si256((const __m256i*)(x_i16.data() + d));
+                __m256i gv = _mm256_loadu_si256((const __m256i*)(wg_row + d));
+                __m256i vv = _mm256_loadu_si256((const __m256i*)(wv_row + d));
+                acc_g = _mm256_add_epi32(acc_g, _mm256_madd_epi16(xv, gv));
+                acc_v = _mm256_add_epi32(acc_v, _mm256_madd_epi16(xv, vv));
+            }
+            dot_g_i = asdag::hsum256_epi32(acc_g);
+            dot_v_i = asdag::hsum256_epi32(acc_v);
+            for (; d < D; ++d) {
+                dot_g_i += x_i16[d] * wg_row[d];
+                dot_v_i += x_i16[d] * wv_row[d];
+            }
+#else
+            for (int64_t d = 0; d < D; ++d) {
+                dot_g_i += x_i16[d] * wg_row[d];
+                dot_v_i += x_i16[d] * wv_row[d];
+            }
+#endif
+            float dot_g = dot_g_i * inv_scale_gv;
+            float dot_v = dot_v_i * inv_scale_gv;
+            grn[h] = dot_g;
+            vrn[h] = dot_v;
+            han[h] = (dot_g / (1.0f + std::exp(-dot_g))) * dot_v;
+        }
+
+        // 3. Dynamic Quantization of h_act to int16
+        float max_h = 0.0f;
+        for (int64_t h = 0; h < H; ++h) max_h = std::max(max_h, std::abs(han[h]));
+        float alpha_h = 127.0f / (max_h + 1e-5f);
+        float inv_scale_d = gamma_down / alpha_h;
+
+        std::vector<int16_t> h_i16(H);
+        for (int64_t h = 0; h < H; ++h) {
+            h_i16[h] = (int16_t)std::clamp((int)std::round(han[h] * alpha_h), -128, 127);
+        }
+
+        // 4. Integer MatMul for w_down
+        for (int64_t d = 0; d < D; ++d) {
+            const int16_t* wd_row = wd_i16.data() + d * H;
+            int32_t dot_d_i = 0;
+#if defined(ASDAG_SIMD_AVX2)
+            int64_t hk = 0;
+            __m256i acc_d = _mm256_setzero_si256();
+            for (; hk + 16 <= H; hk += 16) {
+                __m256i hv = _mm256_loadu_si256((const __m256i*)(h_i16.data() + hk));
+                __m256i wdv = _mm256_loadu_si256((const __m256i*)(wd_row + hk));
+                acc_d = _mm256_add_epi32(acc_d, _mm256_madd_epi16(hv, wdv));
+            }
+            dot_d_i = asdag::hsum256_epi32(acc_d);
+            for (; hk < H; ++hk) {
+                dot_d_i += h_i16[hk] * wd_row[hk];
+            }
+#else
+            for (int64_t hk = 0; hk < H; ++hk) {
+                dot_d_i += h_i16[hk] * wd_row[hk];
+            }
+#endif
+            outn[d] = dot_d_i * inv_scale_d;
+        }
+    }
+
+    return std::make_tuple(out.to(orig_dtype), h_act, gate_raw, val_raw);
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 22. C++ Accelerated 5th-Order Newton-Schulz Polar Decomposition (Muon Optimizer)
@@ -3748,222 +2868,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_bit
 
     return std::make_tuple(out.to(orig_dtype), h_act, gate_raw, val_raw);
 }
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_bitlinear_swiglu_ternary_int8_forward_cpp(
-    torch::Tensor x,              // [N, D]
-    torch::Tensor w_gate_val,     // [2*H, D]
-    float gamma_gv,
-    torch::Tensor w_down,         // [D, H]
-    float gamma_down
-) {
-    auto orig_dtype = x.scalar_type();
-    x = x.contiguous().to(torch::kFloat32);
-    w_gate_val = w_gate_val.contiguous().to(torch::kFloat32);
-    w_down = w_down.contiguous().to(torch::kFloat32);
-
-    int64_t N = x.size(0);
-    int64_t D = x.size(1);
-    int64_t H = w_down.size(1);
-
-    auto out = torch::empty({N, D}, torch::kFloat32);
-    auto h_act = torch::empty({N, H}, torch::kFloat32);
-    auto gate_raw = torch::empty({N, H}, torch::kFloat32);
-    auto val_raw = torch::empty({N, H}, torch::kFloat32);
-
-    const float* x_ptr = x.data_ptr<float>();
-    const float* wgv_ptr = w_gate_val.data_ptr<float>();
-    const float* wd_ptr = w_down.data_ptr<float>();
-
-    float* out_ptr = out.data_ptr<float>();
-    float* ha_ptr = h_act.data_ptr<float>();
-    float* gr_ptr = gate_raw.data_ptr<float>();
-    float* vr_ptr = val_raw.data_ptr<float>();
-
-    std::vector<int16_t> wgv_i16(2 * H * D);
-    std::vector<int16_t> wd_i16(D * H);
-    for (int64_t i = 0; i < 2 * H * D; ++i) wgv_i16[i] = (int16_t)std::round(wgv_ptr[i]);
-    for (int64_t i = 0; i < D * H; ++i) wd_i16[i] = (int16_t)std::round(wd_ptr[i]);
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t n = 0; n < N; ++n) {
-        const float* xn = x_ptr + n * D;
-        float* han = ha_ptr + n * H;
-        float* grn = gr_ptr + n * H;
-        float* vrn = vr_ptr + n * H;
-        float* outn = out_ptr + n * D;
-
-        // 1. Dynamic Quantization of x to int16
-        float max_x = 0.0f;
-        for (int64_t d = 0; d < D; ++d) max_x = std::max(max_x, std::abs(xn[d]));
-        float alpha_x = 127.0f / (max_x + 1e-5f);
-        float inv_scale_gv = gamma_gv / alpha_x;
-
-        std::vector<int16_t> x_i16(D);
-        for (int64_t d = 0; d < D; ++d) {
-            x_i16[d] = (int16_t)std::clamp((int)std::round(xn[d] * alpha_x), -128, 127);
-        }
-
-        // 2. Integer MatMul for w_gate and w_val
-        for (int64_t h = 0; h < H; ++h) {
-            const int16_t* wg_row = wgv_i16.data() + h * D;
-            const int16_t* wv_row = wgv_i16.data() + (H + h) * D;
-
-            int32_t dot_g_i = 0, dot_v_i = 0;
-#if defined(ASDAG_SIMD_AVX2)
-            int64_t d = 0;
-            __m256i acc_g = _mm256_setzero_si256();
-            __m256i acc_v = _mm256_setzero_si256();
-
-            for (; d + 16 <= D; d += 16) {
-                __m256i xv = _mm256_loadu_si256((const __m256i*)(x_i16.data() + d));
-                __m256i gv = _mm256_loadu_si256((const __m256i*)(wg_row + d));
-                __m256i vv = _mm256_loadu_si256((const __m256i*)(wv_row + d));
-                acc_g = _mm256_add_epi32(acc_g, _mm256_madd_epi16(xv, gv));
-                acc_v = _mm256_add_epi32(acc_v, _mm256_madd_epi16(xv, vv));
-            }
-            dot_g_i = asdag::hsum256_epi32(acc_g);
-            dot_v_i = asdag::hsum256_epi32(acc_v);
-            for (; d < D; ++d) {
-                dot_g_i += x_i16[d] * wg_row[d];
-                dot_v_i += x_i16[d] * wv_row[d];
-            }
-#else
-            for (int64_t d = 0; d < D; ++d) {
-                dot_g_i += x_i16[d] * wg_row[d];
-                dot_v_i += x_i16[d] * wv_row[d];
-            }
-#endif
-            float dot_g = dot_g_i * inv_scale_gv;
-            float dot_v = dot_v_i * inv_scale_gv;
-            grn[h] = dot_g;
-            vrn[h] = dot_v;
-            han[h] = (dot_g / (1.0f + std::exp(-dot_g))) * dot_v;
-        }
-
-        // 3. Dynamic Quantization of h_act to int16
-        float max_h = 0.0f;
-        for (int64_t h = 0; h < H; ++h) max_h = std::max(max_h, std::abs(han[h]));
-        float alpha_h = 127.0f / (max_h + 1e-5f);
-        float inv_scale_d = gamma_down / alpha_h;
-
-        std::vector<int16_t> h_i16(H);
-        for (int64_t h = 0; h < H; ++h) {
-            h_i16[h] = (int16_t)std::clamp((int)std::round(han[h] * alpha_h), -128, 127);
-        }
-
-        // 4. Integer MatMul for w_down
-        for (int64_t d = 0; d < D; ++d) {
-            const int16_t* wd_row = wd_i16.data() + d * H;
-            int32_t dot_d_i = 0;
-#if defined(ASDAG_SIMD_AVX2)
-            int64_t hk = 0;
-            __m256i acc_d = _mm256_setzero_si256();
-            for (; hk + 16 <= H; hk += 16) {
-                __m256i hv = _mm256_loadu_si256((const __m256i*)(h_i16.data() + hk));
-                __m256i wdv = _mm256_loadu_si256((const __m256i*)(wd_row + hk));
-                acc_d = _mm256_add_epi32(acc_d, _mm256_madd_epi16(hv, wdv));
-            }
-            dot_d_i = asdag::hsum256_epi32(acc_d);
-            for (; hk < H; ++hk) {
-                dot_d_i += h_i16[hk] * wd_row[hk];
-            }
-#else
-            for (int64_t hk = 0; hk < H; ++hk) {
-                dot_d_i += h_i16[hk] * wd_row[hk];
-            }
-#endif
-            outn[d] = dot_d_i * inv_scale_d;
-        }
-    }
-
-    return std::make_tuple(out.to(orig_dtype), h_act, gate_raw, val_raw);
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> asdag_bitlinear_swiglu_backward_cpp(
-    torch::Tensor grad_output,    // [N, D]
-    torch::Tensor x,              // [N, D]
-    torch::Tensor w_gate_val,     // [2*H, D]
-    float gamma_gv,
-    torch::Tensor w_down,         // [D, H]
-    float gamma_down,
-    torch::Tensor h_act,          // [N, H]
-    torch::Tensor gate_raw,       // [N, H]
-    torch::Tensor val_raw         // [N, H]
-) {
-    auto orig_dtype = grad_output.scalar_type();
-    grad_output = grad_output.contiguous().to(torch::kFloat32);
-    x = x.contiguous().to(torch::kFloat32);
-    w_gate_val = w_gate_val.contiguous().to(torch::kFloat32);
-    w_down = w_down.contiguous().to(torch::kFloat32);
-    h_act = h_act.contiguous().to(torch::kFloat32);
-    gate_raw = gate_raw.contiguous().to(torch::kFloat32);
-    val_raw = val_raw.contiguous().to(torch::kFloat32);
-
-    int64_t N = x.size(0);
-    int64_t D = x.size(1);
-    int64_t H = w_down.size(1);
-
-    auto grad_x = torch::zeros_like(x);
-    auto grad_wgv = torch::zeros_like(w_gate_val);
-    auto grad_wd = torch::zeros_like(w_down);
-
-    const float* go_ptr = grad_output.data_ptr<float>();
-    const float* x_ptr = x.data_ptr<float>();
-    const float* wgv_ptr = w_gate_val.data_ptr<float>();
-    const float* wd_ptr = w_down.data_ptr<float>();
-    const float* ha_ptr = h_act.data_ptr<float>();
-    const float* gr_ptr = gate_raw.data_ptr<float>();
-    const float* vr_ptr = val_raw.data_ptr<float>();
-
-    float* gx_ptr = grad_x.data_ptr<float>();
-    float* gwgv_ptr = grad_wgv.data_ptr<float>();
-    float* gwd_ptr = grad_wd.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-    // 1. High-throughput GEMM for upstream gradient propagation: g_h_all = grad_output * (w_down * gamma_down)
-    auto g_h_all = torch::mm(grad_output, w_down) * gamma_down;
-    const float* gh_ptr = g_h_all.data_ptr<float>();
-
-    auto g_gv_all = torch::empty({N, 2 * H}, torch::kFloat32);
-    float* ggv_ptr = g_gv_all.data_ptr<float>();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t n = 0; n < N; ++n) {
-        const float* ghn = gh_ptr + n * H;
-        const float* grn = gr_ptr + n * H;
-        const float* vrn = vr_ptr + n * H;
-        float* ggvn = ggv_ptr + n * (2 * H);
-
-        for (int64_t h = 0; h < H; ++h) {
-            float g_h = ghn[h];
-            float g_raw = grn[h];
-            float v_raw = vrn[h];
-            float sig_g = 1.0f / (1.0f + std::exp(-g_raw));
-            float silu_g = g_raw * sig_g;
-            float dsilu_g = sig_g * (1.0f + g_raw * (1.0f - sig_g));
-
-            float g_val = g_h * silu_g;
-            float g_gate = g_h * v_raw * dsilu_g;
-
-            ggvn[h] = g_gate;
-            ggvn[H + h] = g_val;
-        }
-    }
-
-    // 2. High-throughput GEMMs for grad_x, grad_w_gate_val, and grad_w_down
-    grad_x = torch::mm(g_gv_all, w_gate_val) * gamma_gv;
-    grad_wgv = torch::mm(g_gv_all.t(), x);
-    grad_wd = torch::mm(grad_output.t(), h_act);
-
-    return std::make_tuple(grad_x.to(orig_dtype), grad_wgv.to(orig_dtype), grad_wd.to(orig_dtype));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 23b. Zero-RAM Rematerialization & Fused Dual-GEMM SwiGLU Backward
-// ─────────────────────────────────────────────────────────────────────────────
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> asdag_bitlinear_swiglu_backward_recompute_cpp(
     torch::Tensor grad_output,    // [N, D]
     torch::Tensor x,              // [N, D]
@@ -4102,10 +3006,14 @@ std::tuple<torch::Tensor, torch::Tensor> asdag_blt_simd_patcher_cpp(
         for (int64_t t = 0; t < T; ++t) {
             pa_ptr[b * T + t] = p_idx;
 
-            // Check boundary
+            // Check boundary: close a patch at every target_patch_size boundary, or
+            // at the final byte (flushing a possibly-short tail patch as a true mean).
+            // The old `|| p_idx >= M - 1` early-close corrupted the tail: it re-accumulated
+            // byte vectors into the same slot with inv_len = 1, turning the mean into a sum.
             bool is_boundary = ((t + 1) % target_patch_size == 0) || (t == T - 1);
-            if (is_boundary || p_idx >= M - 1) {
+            if (is_boundary) {
                 // Mean pool slice [patch_start, t] into pooled_patches[b, p_idx]
+                if (p_idx >= M) p_idx = M - 1;
                 int64_t patch_len = t - patch_start + 1;
                 float inv_len = 1.0f / (float)patch_len;
                 float* cur_patch = pp_ptr + (b * M + p_idx) * D_byte;
@@ -4146,6 +3054,9 @@ std::tuple<torch::Tensor, torch::Tensor> asdag_blt_simd_patcher_cpp(
 
     return std::make_tuple(pooled_patches.to(orig_dtype), patch_assignments);
 }
+
+// NOTE: incremental generation (TorosHybridLanguageModel.forward_incremental) mirrors
+// this mean-pooling semantics patch-by-patch; keep them in sync if this changes.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 25. Breakthrough 2: 1-Cycle Pure Integer Ternary Add/Sub BitLinear Forward
@@ -4226,506 +3137,6 @@ torch::Tensor asdag_bitlinear_ternary_int_forward_cpp(
     return out.to(orig_dtype);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 26. Breakthrough 1: L2/L3 Cache-Resident Fused Multi-Layer Global ASDAG Stack
-// ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor asdag_fused_transformer_stack_forward_cpp(
-    torch::Tensor x_latent,                 // [B, M, D]
-    const std::vector<torch::Tensor>& layer_diags, // L x [4, M_monarch, D]
-    const std::vector<torch::Tensor>& layer_perms, // L x [4, M_monarch, D]
-    const std::vector<torch::Tensor>& layer_bias,  // L x [4, D]
-    const std::vector<torch::Tensor>& layer_wgv,   // L x [2*H, D]
-    const std::vector<float>& layer_gamma_gv,      // L floats
-    const std::vector<torch::Tensor>& layer_wd,    // L x [D, H]
-    const std::vector<float>& layer_gamma_wd,      // L floats
-    int64_t n_heads                         // Heads for GLA
-) {
-    auto orig_dtype = x_latent.scalar_type();
-    x_latent = x_latent.contiguous().to(torch::kFloat32);
-
-    if (layer_wgv.empty() || layer_wd.empty() || layer_wgv.size() != layer_wd.size()) return x_latent;
-
-    int64_t B = x_latent.size(0);
-    int64_t M = x_latent.size(1);
-    int64_t D = x_latent.size(2);
-    int64_t L = layer_wgv.size();
-    int64_t H_dim = layer_wd[0].size(1);
-
-    auto out = x_latent.clone();
-    float* out_ptr = out.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel num_threads(n_threads)
-    {
-        // Thread-local scratch buffers resident in L1/L2 cache (zero DRAM allocations)
-        std::vector<float> x_buf(M * D);
-        std::vector<float> norm_buf(M * D);
-        std::vector<float> qkvg_buf(4 * M * D);
-        std::vector<float> time_out_buf(M * D);
-        std::vector<float> h_act_buf(M * H_dim);
-        std::vector<float> chan_out_buf(M * D);
-
-#pragma omp for schedule(static)
-        for (int64_t b = 0; b < B; ++b) {
-            float* seq_ptr = out_ptr + b * (M * D);
-            std::memcpy(x_buf.data(), seq_ptr, M * D * sizeof(float));
-
-            for (int64_t l = 0; l < L; ++l) {
-                const float* wgv_ptr = layer_wgv[l].data_ptr<float>();
-                float gamma_gv = layer_gamma_gv[l];
-                const float* wd_ptr = layer_wd[l].data_ptr<float>();
-                float gamma_wd = layer_gamma_wd[l];
-
-                // 1. RMSNorm1
-                for (int64_t m = 0; m < M; ++m) {
-                    const float* xm = x_buf.data() + m * D;
-                    float* nm = norm_buf.data() + m * D;
-                    float sum_sq = 0.0f;
-                    for (int64_t d = 0; d < D; ++d) sum_sq += xm[d] * xm[d];
-                    float rms = 1.0f / std::sqrt((sum_sq / (float)D) + 1e-5f);
-                    for (int64_t d = 0; d < D; ++d) nm[d] = xm[d] * rms;
-                }
-
-                // 2. SwiGLU Channel Mixer
-                for (int64_t m = 0; m < M; ++m) {
-                    const float* nm = norm_buf.data() + m * D;
-                    float* cm = chan_out_buf.data() + m * D;
-
-                    for (int64_t h = 0; h < H_dim; ++h) {
-                        const float* wg = wgv_ptr + h * D;
-                        const float* wv = wgv_ptr + (H_dim + h) * D;
-
-                        float dot_g = 0.0f, dot_v = 0.0f;
-                        for (int64_t d = 0; d < D; ++d) {
-                            dot_g += wg[d] * nm[d];
-                            dot_v += wv[d] * nm[d];
-                        }
-                        dot_g *= gamma_gv;
-                        dot_v *= gamma_gv;
-                        float silu_g = dot_g / (1.0f + std::exp(-dot_g));
-                        h_act_buf[m * H_dim + h] = silu_g * dot_v;
-                    }
-
-                    for (int64_t d = 0; d < D; ++d) {
-                        const float* wd = wd_ptr + d * H_dim;
-                        float dot = 0.0f;
-                        for (int64_t h = 0; h < H_dim; ++h) dot += wd[h] * h_act_buf[m * H_dim + h];
-                        cm[d] = dot * gamma_wd;
-                    }
-                }
-
-                // 3. Add Residual
-                for (int64_t idx = 0; idx < M * D; ++idx) {
-                    x_buf[idx] += chan_out_buf[idx];
-                }
-            }
-
-            // Write back final layer result to out
-            std::memcpy(seq_ptr, x_buf.data(), M * D * sizeof(float));
-        }
-    }
-
-    return out.to(orig_dtype);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 27. Breakthrough 3: Asynchronous Local Backpressure Token Ring-Buffer
-// ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor asdag_async_backpressure_pipeline_cpp(
-    torch::Tensor x_patches,               // [B, M, D]
-    torch::Tensor layer_wgv,               // [2*H, D]
-    float gamma_gv,
-    torch::Tensor layer_wd,                // [D, H]
-    float gamma_wd,
-    torch::Tensor upstream_error           // [B, M, D]
-) {
-    auto orig_dtype = x_patches.scalar_type();
-    x_patches = x_patches.contiguous().to(torch::kFloat32);
-    upstream_error = upstream_error.contiguous().to(torch::kFloat32);
-
-    int64_t B = x_patches.size(0);
-    int64_t M = x_patches.size(1);
-    int64_t D = x_patches.size(2);
-    int64_t H_dim = layer_wd.size(1);
-
-    auto grad_x = torch::zeros_like(x_patches);
-    float* gx_ptr = grad_x.data_ptr<float>();
-    const float* err_ptr = upstream_error.data_ptr<float>();
-    const float* x_ptr = x_patches.data_ptr<float>();
-
-    const float* wd_ptr = layer_wd.contiguous().to(torch::kFloat32).data_ptr<float>();
-    const float* wgv_ptr = layer_wgv.contiguous().to(torch::kFloat32).data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-    // Out-of-order ring-buffered asynchronous local backpressure pipeline
-#pragma omp parallel for num_threads(n_threads) schedule(dynamic, 2)
-    for (int64_t b = 0; b < B; ++b) {
-        std::vector<float> gh(H_dim);
-        std::vector<float> ggv(2 * H_dim);
-
-        for (int64_t m = 0; m < M; ++m) {
-            const float* err_m = err_ptr + (b * M + m) * D;
-            const float* xm = x_ptr + (b * M + m) * D;
-            float* gxm = gx_ptr + (b * M + m) * D;
-
-            // Local backpressure error projection
-            for (int64_t h = 0; h < H_dim; ++h) {
-                float acc = 0.0f;
-                for (int64_t d = 0; d < D; ++d) {
-                    acc += err_m[d] * (wd_ptr[d * H_dim + h] * gamma_wd);
-                }
-                gh[h] = acc;
-            }
-
-            // Dual gate/value backpressure sign updates
-            for (int64_t h = 0; h < H_dim; ++h) {
-                float sign_err = (gh[h] > 0.0f) ? 1.0f : (gh[h] < 0.0f ? -1.0f : 0.0f);
-                ggv[h] = sign_err;
-                ggv[H_dim + h] = sign_err;
-            }
-
-            // Local gradient to x
-            for (int64_t d = 0; d < D; ++d) {
-                float acc = 0.0f;
-                for (int64_t gh_idx = 0; gh_idx < 2 * H_dim; ++gh_idx) {
-                    acc += ggv[gh_idx] * (wgv_ptr[gh_idx * D + d] * gamma_gv);
-                }
-                gxm[d] = acc;
-            }
-        }
-    }
-
-    return grad_x.to(orig_dtype);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 28. Revelation 1: Forward-Only Local Predictive Plasticity (1P FLOPs, No Bwd)
-// ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor asdag_forward_plasticity_cpp(
-    torch::Tensor x,               // [B, in_dim]
-    torch::Tensor w,               // [out_dim, in_dim] (updated in-place)
-    torch::Tensor target,          // [B, out_dim] local target / predictive signal
-    float lr,                      // learning rate
-    float gamma
-) {
-    auto orig_dtype = x.scalar_type();
-    x = x.contiguous().to(torch::kFloat32);
-    target = target.contiguous().to(torch::kFloat32);
-
-    int64_t B = x.size(0);
-    int64_t in_dim = x.size(1);
-    int64_t out_dim = w.size(0);
-
-    auto out = torch::empty({B, out_dim}, torch::kFloat32);
-
-    const float* x_ptr = x.data_ptr<float>();
-    const float* tgt_ptr = target.data_ptr<float>();
-    float* w_ptr = w.data_ptr<float>();
-    float* out_ptr = out.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t o = 0; o < out_dim; ++o) {
-        float* w_row = w_ptr + o * in_dim;
-
-        for (int64_t b = 0; b < B; ++b) {
-            const float* xb = x_ptr + b * in_dim;
-            float* outb = out_ptr + b * out_dim;
-            float tgt_val = tgt_ptr[b * out_dim + o];
-
-            // 1. Forward Dot Product
-            float dot = 0.0f;
-            for (int64_t i = 0; i < in_dim; ++i) {
-                dot += w_row[i] * xb[i];
-            }
-            float y = dot * gamma;
-            outb[o] = y;
-
-            // 2. Local Predictive Error: e = target - y
-            float err = tgt_val - y;
-            float sign_err = (err > 0.0f) ? 1.0f : (err < 0.0f ? -1.0f : 0.0f);
-
-            // 3. In-Place Cache-Resident Plasticity Update: ΔW = lr * sign(e) * sign(x)
-            float step = lr * sign_err;
-            for (int64_t i = 0; i < in_dim; ++i) {
-                float sign_x = (xb[i] > 0.0f) ? 1.0f : (xb[i] < 0.0f ? -1.0f : 0.0f);
-                w_row[i] += step * sign_x;
-            }
-        }
-    }
-
-    return out.to(orig_dtype);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 29. Revelation 2: 1-Cycle O(1) L3 Hash-Addressed Associative Memory Table
-// ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor asdag_hash_memory_cpp(
-    torch::Tensor x,               // [B, D]
-    torch::Tensor memory_table,    // [NumSlots, D]
-    int64_t num_slots              // Hash table size
-) {
-    auto orig_dtype = x.scalar_type();
-    x = x.contiguous().to(torch::kFloat32);
-
-    int64_t B = x.size(0);
-    int64_t D = x.size(1);
-
-    auto out = torch::empty({B, D}, torch::kFloat32);
-
-    const float* x_ptr = x.data_ptr<float>();
-    const float* mem_ptr = memory_table.contiguous().to(torch::kFloat32).data_ptr<float>();
-    float* out_ptr = out.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t b = 0; b < B; ++b) {
-        const float* xb = x_ptr + b * D;
-        float* outb = out_ptr + b * D;
-
-        // 1. Fast AVX2/Bitwise Hash of input vector
-        uint32_t hash = 2166136261u; // FNV-1a basis
-        for (int64_t d = 0; d < D; ++d) {
-            uint32_t val = (xb[d] > 0.0f) ? 1 : 0;
-            hash = (hash ^ val) * 16777619u;
-        }
-        uint32_t slot = hash % num_slots;
-
-        // 2. O(1) Direct Memory Table Read into L1/L2
-        const float* mem_slot = mem_ptr + slot * D;
-        for (int64_t d = 0; d < D; ++d) {
-            outb[d] = mem_slot[d];
-        }
-    }
-
-    return out.to(orig_dtype);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 30. Revelation 3: Event-Driven Dynamic Zero-Skipping Vector Forward
-// ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor asdag_event_sparse_cpp(
-    torch::Tensor x,              // [N, in_dim]
-    torch::Tensor w,              // [out_dim, in_dim]
-    float gamma
-) {
-    auto orig_dtype = x.scalar_type();
-    x = x.contiguous().to(torch::kFloat32);
-    w = w.contiguous().to(torch::kFloat32);
-
-    int64_t N = x.size(0);
-    int64_t in_dim = x.size(1);
-    int64_t out_dim = w.size(0);
-
-    auto out = torch::empty({N, out_dim}, torch::kFloat32);
-
-    const float* x_ptr = x.data_ptr<float>();
-    const float* w_ptr = w.data_ptr<float>();
-    float* out_ptr = out.data_ptr<float>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t n = 0; n < N; ++n) {
-        const float* xn = x_ptr + n * in_dim;
-        float* outn = out_ptr + n * out_dim;
-
-        // Find active (non-zero) input indices
-        std::vector<int32_t> active_indices;
-        active_indices.reserve(in_dim);
-        for (int32_t i = 0; i < in_dim; ++i) {
-            if (std::abs(xn[i]) > 1e-6f) {
-                active_indices.push_back(i);
-            }
-        }
-        int64_t num_active = active_indices.size();
-
-        for (int64_t o = 0; o < out_dim; ++o) {
-            const float* w_row = w_ptr + o * in_dim;
-            float dot = 0.0f;
-            for (int64_t idx = 0; idx < num_active; ++idx) {
-                int32_t i = active_indices[idx];
-                dot += w_row[i] * xn[i];
-            }
-            outn[o] = dot * gamma;
-        }
-    }
-
-    return out.to(orig_dtype);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 31. Fused In-Situ Backward + Optimizer Step Kernel (Zero-DRAM Weight Update)
-// ─────────────────────────────────────────────────────────────────────────────
-void asdag_fused_dense_backward_step_cpp(
-    torch::Tensor grad_output,     // [N, out_dim]
-    torch::Tensor x,               // [N, in_dim]
-    torch::Tensor w,               // [out_dim, in_dim] (updated in-place)
-    torch::Tensor momentum_buf,    // [out_dim, in_dim] (updated in-place)
-    float lr,
-    float momentum,
-    float weight_decay
-) {
-    auto go_f = grad_output.contiguous().to(torch::kFloat32);
-    auto x_f = x.contiguous().to(torch::kFloat32);
-
-    int64_t out_dim = w.size(0);
-    int64_t in_dim = w.size(1);
-
-    // Compute grad_w via multi-threaded BLAS
-    auto grad_w = torch::mm(go_f.t(), x_f);
-
-    float* w_ptr = w.data_ptr<float>();
-    float* m_ptr = momentum_buf.defined() && momentum_buf.numel() > 0 ? momentum_buf.data_ptr<float>() : nullptr;
-    const float* gw_ptr = grad_w.data_ptr<float>();
-
-    int64_t total_elements = out_dim * in_dim;
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel for num_threads(n_threads) schedule(static)
-    for (int64_t i = 0; i < total_elements; ++i) {
-        float g = gw_ptr[i];
-        if (weight_decay > 0.0f) {
-            g += weight_decay * w_ptr[i];
-        }
-        if (m_ptr != nullptr) {
-            m_ptr[i] = momentum * m_ptr[i] + g;
-            w_ptr[i] -= lr * m_ptr[i];
-        } else {
-            w_ptr[i] -= lr * g;
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 32. Paradigm Shift 1: Speculative Early-Exit (Dynamic Layer Halting)
-// ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor> asdag_speculative_early_exit_stack_cpp(
-    torch::Tensor x_latent,                 // [B, M, D]
-    const std::vector<torch::Tensor>& layer_wgv,   // L x [2*H, D]
-    const std::vector<float>& layer_gamma_gv,      // L floats
-    const std::vector<torch::Tensor>& layer_wd,    // L x [D, H]
-    const std::vector<float>& layer_gamma_wd,      // L floats
-    float exit_threshold                    // e.g. 0.05
-) {
-    auto orig_dtype = x_latent.scalar_type();
-    x_latent = x_latent.contiguous().to(torch::kFloat32);
-
-    int64_t B = x_latent.size(0);
-    int64_t M = x_latent.size(1);
-    int64_t D = x_latent.size(2);
-    int64_t L = layer_wgv.size();
-
-    std::vector<torch::Tensor> wgv_contig;
-    std::vector<torch::Tensor> wd_contig;
-    wgv_contig.reserve(L);
-    wd_contig.reserve(L);
-    for (int64_t l = 0; l < L; ++l) {
-        wgv_contig.push_back(layer_wgv[l].contiguous().to(torch::kFloat32));
-        wd_contig.push_back(layer_wd[l].contiguous().to(torch::kFloat32));
-    }
-
-    int64_t H_dim = wd_contig[0].size(1);
-
-    auto out = x_latent.clone();
-    auto exit_layers = torch::zeros({B}, torch::kInt32);
-    float* out_ptr = out.data_ptr<float>();
-    int32_t* exit_ptr = exit_layers.data_ptr<int32_t>();
-
-    int n_threads = asdag::get_physical_cores();
-
-#pragma omp parallel num_threads(n_threads)
-    {
-        std::vector<float> x_buf(M * D);
-        std::vector<float> norm_buf(M * D);
-        std::vector<float> h_act_buf(M * H_dim);
-        std::vector<float> chan_out_buf(M * D);
-
-#pragma omp for schedule(dynamic, 1)
-        for (int64_t b = 0; b < B; ++b) {
-            float* seq_ptr = out_ptr + b * (M * D);
-            std::memcpy(x_buf.data(), seq_ptr, M * D * sizeof(float));
-            int32_t executed_layers = (int32_t)L;
-
-            for (int64_t l = 0; l < L; ++l) {
-                const float* wgv_ptr = wgv_contig[l].data_ptr<float>();
-                float gamma_gv = layer_gamma_gv[l];
-                const float* wd_ptr = wd_contig[l].data_ptr<float>();
-                float gamma_wd = layer_gamma_wd[l];
-
-                // RMSNorm
-                for (int64_t m = 0; m < M; ++m) {
-                    const float* xm = x_buf.data() + m * D;
-                    float* nm = norm_buf.data() + m * D;
-                    float sum_sq = 0.0f;
-                    for (int64_t d = 0; d < D; ++d) sum_sq += xm[d] * xm[d];
-                    float rms = 1.0f / std::sqrt((sum_sq / (float)D) + 1e-5f);
-                    for (int64_t d = 0; d < D; ++d) nm[d] = xm[d] * rms;
-                }
-
-                // SwiGLU Channel Mixer
-                float delta_norm_sq = 0.0f;
-                float x_norm_sq = 0.0f;
-
-                for (int64_t m = 0; m < M; ++m) {
-                    const float* nm = norm_buf.data() + m * D;
-                    float* cm = chan_out_buf.data() + m * D;
-
-                    for (int64_t h = 0; h < H_dim; ++h) {
-                        const float* wg = wgv_ptr + h * D;
-                        const float* wv = wgv_ptr + (H_dim + h) * D;
-
-                        float dot_g = 0.0f, dot_v = 0.0f;
-                        for (int64_t d = 0; d < D; ++d) {
-                            dot_g += wg[d] * nm[d];
-                            dot_v += wv[d] * nm[d];
-                        }
-                        dot_g *= gamma_gv;
-                        dot_v *= gamma_gv;
-                        float silu_g = dot_g / (1.0f + std::exp(-dot_g));
-                        h_act_buf[m * H_dim + h] = silu_g * dot_v;
-                    }
-
-                    for (int64_t d = 0; d < D; ++d) {
-                        const float* wd = wd_ptr + d * H_dim;
-                        float dot = 0.0f;
-                        for (int64_t h = 0; h < H_dim; ++h) dot += wd[h] * h_act_buf[m * H_dim + h];
-                        float val = dot * gamma_wd;
-                        cm[d] = val;
-                        delta_norm_sq += val * val;
-                        x_norm_sq += x_buf[m * D + d] * x_buf[m * D + d];
-                    }
-                }
-
-                // Add Residual
-                for (int64_t idx = 0; idx < M * D; ++idx) {
-                    x_buf[idx] += chan_out_buf[idx];
-                }
-
-                // Speculative Early-Exit Check after Layer >= 1
-                if (l >= 1 && exit_threshold > 0.0f) {
-                    float rel_delta = std::sqrt(delta_norm_sq / (x_norm_sq + 1e-6f));
-                    if (rel_delta < exit_threshold) {
-                        executed_layers = (int32_t)(l + 1);
-                        break;
-                    }
-                }
-            }
-
-            exit_ptr[b] = executed_layers;
-            std::memcpy(seq_ptr, x_buf.data(), M * D * sizeof(float));
-        }
-    }
-
-    return std::make_tuple(out.to(orig_dtype), exit_layers);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 30. C++ Fused Monarch GLA Block Forward (AVX2 / AVX-512 SIMD)
 // ─────────────────────────────────────────────────────────────────────────────
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_fused_monarch_gla_forward_cpp(
     torch::Tensor x,              // [B, T, C]
@@ -5858,91 +4269,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> asdag_lpc_head_forward_b
     return std::make_tuple(loss_tensor, grad_H.to(orig_dtype), grad_W.to(orig_dtype));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 28. Native C++ Asynchronous LPC Task Pipeline Worker
-// ─────────────────────────────────────────────────────────────────────────────
-class CPULPCPipelineWorker {
-private:
-    std::mutex m_mutex;
-    std::condition_variable m_cv;
-    std::queue<std::function<void()>> m_tasks;
-    std::thread m_worker;
-    std::atomic<bool> m_stop{false};
-    std::atomic<int> m_active_tasks{0};
-
-    void worker_loop() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this]() { return m_stop || !m_tasks.empty(); });
-                if (m_stop && m_tasks.empty()) return;
-                task = std::move(m_tasks.front());
-                m_tasks.pop();
-            }
-            task();
-            m_active_tasks.fetch_sub(1);
-        }
-    }
-
-public:
-    CPULPCPipelineWorker() {
-        m_worker = std::thread(&CPULPCPipelineWorker::worker_loop, this);
-    }
-    ~CPULPCPipelineWorker() {
-        m_stop = true;
-        m_cv.notify_all();
-        if (m_worker.joinable()) m_worker.join();
-    }
-    static CPULPCPipelineWorker& instance() {
-        static CPULPCPipelineWorker inst;
-        return inst;
-    }
-    void enqueue(std::function<void()> task) {
-        m_active_tasks.fetch_add(1);
-        {
-            std::unique_lock<std::mutex> lock(m_mutex);
-            m_tasks.push(task);
-        }
-        m_cv.notify_one();
-    }
-    void wait_all() {
-        while (m_active_tasks.load() > 0) {
-            std::this_thread::yield();
-        }
-    }
-};
-
-void asdag_lpc_async_head_step_cpp(
-    torch::Tensor H,
-    torch::Tensor W,
-    torch::Tensor targets,
-    torch::Tensor grad_H_out,
-    float lr,
-    int64_t ignore_index
-) {
-    auto H_c = H.clone();
-    auto targets_c = targets.clone();
-
-    CPULPCPipelineWorker::instance().enqueue([H_c, W, targets_c, grad_H_out, lr, ignore_index]() {
-        auto [loss, grad_H, grad_W] = asdag_lpc_head_forward_backward_cpp(H_c, W, targets_c, ignore_index);
-        grad_H_out.copy_(grad_H);
-        if (lr > 0.0f) {
-            W.data().add_(grad_W, -lr);
-        }
-    });
-}
-
-void asdag_lpc_pipeline_sync_cpp() {
-    CPULPCPipelineWorker::instance().wait_all();
-}
-
 } // namespace asdag_cpu
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward_perm", &asdag_cpu::asdag_perm_forward_cpp, "ASDAG CPU Permutation Forward (AVX2/AVX-512)");
-    m.def("backward_perm", &asdag_cpu::asdag_perm_backward_cpp, "ASDAG CPU Permutation Backward (AVX2/AVX-512)");
-    m.def("backward_perm_recompute", &asdag_cpu::asdag_perm_backward_recompute_cpp, "ASDAG CPU Permutation Backward Recompute (Zero-Activation RAM)");
     m.def("sparse_tree_perm_forward", &asdag_cpu::asdag_sparse_tree_perm_forward_cpp, "ASDAG CPU SIMD-Block N:M Sparse Tree Forward (AVX2/AVX-512)");
     m.def("sparse_tree_perm_backward", &asdag_cpu::asdag_sparse_tree_perm_backward_cpp, "ASDAG CPU SIMD-Block N:M Sparse Tree Backward (AVX2/AVX-512)");
     m.def("fused_perm_proj_forward", &asdag_cpu::asdag_fused_perm_proj_forward_cpp, "ASDAG CPU Fused Permutation Projection Forward (AVX2/AVX-512)");
@@ -5956,16 +4285,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bitlinear_backward", &asdag_cpu::asdag_bitlinear_backward_cpp, "ASDAG CPU BitLinear Ternary Backward (AVX2/AVX-512)");
     m.def("bitlinear_ternary_int_forward", &asdag_cpu::asdag_bitlinear_ternary_int_forward_cpp, "ASDAG CPU 1-Cycle Pure Integer Ternary Add/Sub BitLinear Forward");
     m.def("bitlinear_swiglu_forward", &asdag_cpu::asdag_bitlinear_swiglu_forward_cpp, "ASDAG CPU Fused BitLinear SwiGLU Forward");
-    m.def("bitlinear_swiglu_ternary_int8_forward", &asdag_cpu::asdag_bitlinear_swiglu_ternary_int8_forward_cpp, "ASDAG CPU AVX2 Int8 Ternary SwiGLU Forward");
-    m.def("bitlinear_swiglu_backward", &asdag_cpu::asdag_bitlinear_swiglu_backward_cpp, "ASDAG CPU Fused BitLinear SwiGLU Backward");
     m.def("bitlinear_swiglu_backward_recompute", &asdag_cpu::asdag_bitlinear_swiglu_backward_recompute_cpp, "ASDAG CPU Zero-RAM Rematerialization SwiGLU Backward");
-    m.def("fused_dense_backward_step", &asdag_cpu::asdag_fused_dense_backward_step_cpp, "ASDAG CPU Fused In-Situ Backward + Optimizer Step");
-    m.def("speculative_early_exit_stack", &asdag_cpu::asdag_speculative_early_exit_stack_cpp, "ASDAG CPU Speculative Early-Exit Dynamic Layer Halting");
     m.def("pack_ternary_2bit", &asdag_cpu::asdag_pack_ternary_2bit_cpp, "ASDAG CPU Pack Ternary Weights into 2-bit");
     m.def("unpack_ternary_2bit", &asdag_cpu::asdag_unpack_ternary_2bit_cpp, "ASDAG CPU Unpack 2-bit into Ternary Weights");
     m.def("blt_simd_patcher", &asdag_cpu::asdag_blt_simd_patcher_cpp, "ASDAG CPU Sub-Byte SIMD Dynamic Entropy Patcher");
-    m.def("blt_causal_decode_fused", &asdag_cpu::asdag_blt_causal_decode_fused_cpp, "ASDAG CPU Fused BLT Causal Byte Decoder");
-    m.def("blt_causal_decode_backward", &asdag_cpu::asdag_blt_causal_decode_backward_cpp, "ASDAG CPU Fused BLT Causal Byte Decoder Backward");
     m.def("byte_encoder_forward", &asdag_cpu::asdag_byte_encoder_forward_cpp, "ASDAG CPU Fused Byte Encoder Forward");
     m.def("byte_encoder_backward", &asdag_cpu::asdag_byte_encoder_backward_cpp, "ASDAG CPU Fused Byte Encoder Backward");
     m.def("blt_2layer_decode_fused", &asdag_cpu::asdag_blt_2layer_decode_fused_cpp, "ASDAG CPU 2-Layer Fused BLT Causal Byte Decoder");
@@ -5974,20 +4297,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_monarch_gla_backward", &asdag_cpu::asdag_fused_monarch_gla_backward_cpp, "ASDAG CPU Full-Layer Fused Monarch GLA Backward (AVX2/AVX-512)");
     m.def("fused_asdag_block_forward", &asdag_cpu::asdag_fused_asdag_block_forward_cpp, "ASDAG CPU Full-Block Fused ASDAG Layer Forward (AVX2/AVX-512)");
     m.def("fused_asdag_block_backward", &asdag_cpu::asdag_fused_asdag_block_backward_cpp, "ASDAG CPU Full-Block Fused ASDAG Layer Backward (AVX2/AVX-512)");
-    m.def("fused_transformer_stack_forward", &asdag_cpu::asdag_fused_transformer_stack_forward_cpp, "ASDAG CPU L2/L3 Cache-Resident Fused Multi-Layer Global ASDAG Stack");
-    m.def("async_backpressure_pipeline", &asdag_cpu::asdag_async_backpressure_pipeline_cpp, "ASDAG CPU Asynchronous Local Backpressure Token Ring-Buffer");
-    m.def("forward_plasticity", &asdag_cpu::asdag_forward_plasticity_cpp, "ASDAG CPU Forward-Only Local Predictive Plasticity");
-    m.def("hash_memory", &asdag_cpu::asdag_hash_memory_cpp, "ASDAG CPU 1-Cycle O(1) L3 Hash-Addressed Memory Table");
-    m.def("event_sparse", &asdag_cpu::asdag_event_sparse_cpp, "ASDAG CPU Event-Driven Dynamic Zero-Skipping Vector Forward");
-    m.def("sparse_tree_bucketed_forward", &asdag_cpu::asdag_sparse_tree_bucketed_forward_cpp, "ASDAG CPU Leaf-Contiguous Token Bucketed Sparse Tree Forward");
     m.def("fused_rmsnorm_proj", &asdag_cpu::asdag_fused_rmsnorm_proj_cpp, "ASDAG CPU Fused RMSNorm Projection");
     m.def("newton_schulz5", &asdag_cpu::asdag_newton_schulz5_cpp, "ASDAG CPU 5th-Order Newton-Schulz Optimizer Kernel");
     m.def("gla_scan_forward", &asdag_cpu::asdag_gla_scan_forward_cpp, "ASDAG CPU Fused GLA Associative Scan Forward (AVX2/AVX-512)");
     m.def("gla_scan_backward", &asdag_cpu::asdag_gla_scan_backward_cpp, "ASDAG CPU Fused GLA Associative Scan Backward (AVX2/AVX-512)");
     m.def("gla_step", &asdag_cpu::asdag_gla_step_cpp, "ASDAG CPU Native GLA O(1) State Space Step (AVX2/AVX-512)");
     m.def("lpc_head_forward_backward", &asdag_cpu::asdag_lpc_head_forward_backward_cpp, "ASDAG CPU Fused LPC Local Head (Zero Logits RAM + AVX SIMD)");
-    m.def("lpc_async_head_step", &asdag_cpu::asdag_lpc_async_head_step_cpp, "ASDAG CPU Asynchronous LPC Head Step (Native C++ Worker Thread)");
-    m.def("lpc_pipeline_sync", &asdag_cpu::asdag_lpc_pipeline_sync_cpp, "ASDAG CPU Synchronize LPC Pipeline Worker");
     m.def("forward", &asdag_cpu::asdag_forward_cpp, "ASDAG CPU Dense Forward (Legacy)");
     m.def("backward", &asdag_cpu::asdag_backward_cpp, "ASDAG CPU Dense Backward (Legacy)");
 }

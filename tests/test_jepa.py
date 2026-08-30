@@ -16,12 +16,11 @@ def test_jepa_forward_and_loss():
     assert loss is not None
     assert loss.item() > 0
     assert "loss_invariance" in metrics
-    assert "loss_variance" in metrics
-    assert "loss_covariance" in metrics
+    assert "loss_sigreg" in metrics
     assert "latent_std" in metrics
 
 
-def test_jepa_gradients_and_ema_update():
+def test_jepa_gradients_and_stop_grad_target():
     config = TorosJEPAConfig(dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2, target_patch_size=16)
     jepa = TorosJEPA(config)
     
@@ -34,18 +33,9 @@ def test_jepa_gradients_and_ema_update():
     # Check context encoder has gradients
     assert jepa.context_encoder.patcher.patch_proj.weight.grad is not None
     assert jepa.predictor.pred_proj.weight.grad is not None
-    
-    # Check target encoder has NO gradients
-    for p in jepa.target_encoder.parameters():
-        assert p.grad is None
-        
-    # Check EMA update modifies target encoder weights
-    orig_w = jepa.target_encoder.patcher.patch_proj.weight.data.clone()
-    jepa.context_encoder.patcher.patch_proj.weight.data.add_(1.0)
-    jepa.update_target_encoder(momentum=0.9)
-    new_w = jepa.target_encoder.patcher.patch_proj.weight.data
-    
-    assert not torch.allclose(orig_w, new_w)
+
+    # Stop-grad design: no separate EMA target encoder exists
+    assert not hasattr(jepa, "target_encoder")
 
 
 def test_jepa_latent_rollout():

@@ -64,64 +64,6 @@ def get_asdag_cpu_ops():
     return _CPP_OPS
 
 
-class ASDAGPermCPUAutogradFunction(torch.autograd.Function):
-    """
-    Autograd Function connecting Permutation ASDAG Training directly to native C++ AVX2/AVX-512 SIMD engine.
-    """
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,              # [B, dim]
-        w_perm: torch.Tensor,         # [K, P, dim]
-        perms: torch.Tensor,          # [K, P, dim]
-        inv_perms: torch.Tensor,      # [K, P, dim]
-        biases: torch.Tensor,         # [K, dim]
-        routing_probs: torch.Tensor   # [B, K]
-    ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        ops = get_asdag_cpu_ops()
-        if not ops or x.is_cuda:
-            # Fully vectorized PyTorch computation
-            B, dim = x.shape
-            K, P, _ = w_perm.shape
-            xg = torch.gather(x.unsqueeze(1).unsqueeze(2).expand(B, K, P, dim), -1, perms.unsqueeze(0).expand(B, K, P, dim))
-            leaf_prim = (xg * w_perm.unsqueeze(0)).sum(dim=2) + biases.unsqueeze(0)
-            leaf_outs = torch.clamp(leaf_prim, 0.0, 6.0)
-            composite_out = torch.einsum('bk, bkd -> bd', routing_probs, leaf_outs)
-            ctx.save_for_backward(x, w_perm, perms, inv_perms, biases, routing_probs, leaf_outs)
-            return composite_out.to(orig_dtype)
-
-        composite_out, _ = ops.forward_perm(x, w_perm, perms, biases, routing_probs)
-        ctx.save_for_backward(x, w_perm, perms, inv_perms, biases, routing_probs)
-        return composite_out.to(orig_dtype)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, None, None, torch.Tensor, torch.Tensor]:
-        saved = ctx.saved_tensors
-        orig_dtype = grad_output.dtype
-        ops = get_asdag_cpu_ops()
-        if not ops or grad_output.is_cuda or len(saved) == 7:
-            x, w_perm, perms, inv_perms, biases, routing_probs, leaf_outs = saved
-            with torch.enable_grad():
-                xv = x.detach().requires_grad_(True)
-                wv = w_perm.detach().requires_grad_(True)
-                bv = biases.detach().requires_grad_(True)
-                rv = routing_probs.detach().requires_grad_(True)
-                B, dim = xv.shape
-                K, P, _ = wv.shape
-                xg = torch.gather(xv.unsqueeze(1).unsqueeze(2).expand(B, K, P, dim), -1, perms.unsqueeze(0).expand(B, K, P, dim))
-                l_prim = (xg * wv.unsqueeze(0)).sum(dim=2) + bv.unsqueeze(0)
-                l_act = torch.clamp(l_prim, 0.0, 6.0)
-                c_out = torch.einsum('bk, bkd -> bd', rv, l_act)
-                torch.autograd.backward(c_out, grad_output.float())
-                return xv.grad.to(orig_dtype), wv.grad.to(orig_dtype), None, None, bv.grad.to(orig_dtype), rv.grad.to(orig_dtype)
-
-        x, w_perm, perms, inv_perms, biases, routing_probs = saved
-        grad_x, grad_w, grad_probs = ops.backward_perm_recompute(grad_output, x, w_perm, perms, inv_perms, biases, routing_probs)
-        grad_biases = torch.zeros_like(biases)
-        return grad_x.to(orig_dtype), grad_w.to(orig_dtype), None, None, grad_biases.to(orig_dtype), grad_probs.to(orig_dtype)
-
-
 class ASDAGCPUAutogradFunction(torch.autograd.Function):
     """
     Autograd Function connecting PyTorch Training directly to native C++ SIMD engine (Dense Mode).
@@ -167,18 +109,6 @@ class ASDAGCPUAutogradFunction(torch.autograd.Function):
         grad_biases = g_d.sum(dim=0)
         grad_probs = torch.einsum('bd, bkd -> bk', grad_output, leaf_outs.to(orig_dtype))
         return grad_x.to(orig_dtype), grad_W.to(orig_dtype), grad_biases.to(orig_dtype), grad_probs.to(orig_dtype)
-
-
-def asdag_cpu_perm_forward_backward(
-    x: torch.Tensor,
-    w_perm: torch.Tensor,
-    perms: torch.Tensor,
-    inv_perms: torch.Tensor,
-    biases: torch.Tensor,
-    routing_probs: torch.Tensor
-) -> torch.Tensor:
-    """Invokes the native C++ ASDAG AVX2/AVX-512 SIMD permutation forward/backward engine."""
-    return ASDAGPermCPUAutogradFunction.apply(x, w_perm, perms, inv_perms, biases, routing_probs)
 
 
 class ASDAGFusedPermProjAutogradFunction(torch.autograd.Function):
@@ -824,138 +754,6 @@ def asdag_cpu_fused_rmsnorm_proj(
     return F.linear(x / torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + eps), weight)
 
 
-class ASDAGBLTDecoderAutogradFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments):
-        orig_dtype = h_byte.dtype
-        ops = get_asdag_cpu_ops()
-        if ops and hasattr(ops, 'blt_causal_decode_fused') and not h_byte.is_cuda:
-            logits = ops.blt_causal_decode_fused(h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments)
-            ctx.save_for_backward(h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments)
-            return logits.to(orig_dtype)
-
-        # PyTorch fallback
-        B, T, _ = h_byte.shape
-        M = causal_latent_patches.shape[1]
-        idx_expanded = patch_assignments.clamp(0, M - 1).unsqueeze(-1).expand(-1, -1, causal_latent_patches.shape[-1])
-        patch_context = torch.gather(causal_latent_patches, 1, idx_expanded)
-        patch_h = F.linear(patch_context.to(w_p2b.dtype), w_p2b)
-        cat_h = torch.cat([h_byte.to(patch_h.dtype), patch_h], dim=-1)
-        fused = F.silu(F.linear(cat_h, w_fusion))
-        rms = 1.0 / torch.sqrt(torch.mean(fused ** 2, dim=-1, keepdim=True) + 1e-5)
-        logits = F.linear(fused * rms, w_lm)
-        ctx.save_for_backward(h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments)
-        ctx.is_fallback = True
-        return logits.to(orig_dtype)
-
-    @staticmethod
-    def backward(ctx, grad_logits):
-        h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments = ctx.saved_tensors
-        orig_dtype = grad_logits.dtype
-        ops = get_asdag_cpu_ops()
-        if ops and hasattr(ops, 'blt_causal_decode_backward') and not grad_logits.is_cuda and not getattr(ctx, 'is_fallback', False):
-            ghb, gp, gp2b, gfus, glm = ops.blt_causal_decode_backward(
-                grad_logits, h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments
-            )
-            return ghb.to(orig_dtype), gp.to(orig_dtype), gp2b.to(w_p2b.dtype), gfus.to(w_fusion.dtype), glm.to(w_lm.dtype), None
-
-        # Autograd Fallback
-        with torch.enable_grad():
-            hb_v = h_byte.detach().requires_grad_(True)
-            clp_v = causal_latent_patches.detach().requires_grad_(True)
-            wp_v = w_p2b.detach().requires_grad_(True)
-            wf_v = w_fusion.detach().requires_grad_(True)
-            wl_v = w_lm.detach().requires_grad_(True)
-            B, T, _ = hb_v.shape
-            M = clp_v.shape[1]
-            idx_expanded = patch_assignments.clamp(0, M - 1).unsqueeze(-1).expand(-1, -1, clp_v.shape[-1])
-            patch_context = torch.gather(clp_v, 1, idx_expanded)
-            patch_h = F.linear(patch_context.to(wp_v.dtype), wp_v)
-            cat_h = torch.cat([hb_v.to(patch_h.dtype), patch_h], dim=-1)
-            fused = F.silu(F.linear(cat_h, wf_v))
-            rms = 1.0 / torch.sqrt(torch.mean(fused ** 2, dim=-1, keepdim=True) + 1e-5)
-            out = F.linear(fused * rms, wl_v)
-            torch.autograd.backward(out, grad_logits.float())
-            return hb_v.grad.to(orig_dtype), clp_v.grad.to(orig_dtype), wp_v.grad.to(w_p2b.dtype), wf_v.grad.to(w_fusion.dtype), wl_v.grad.to(w_lm.dtype), None
-
-
-def asdag_cpu_blt_decoder(
-    h_byte: torch.Tensor,
-    causal_latent_patches: torch.Tensor,
-    w_p2b: torch.Tensor,
-    w_fusion: torch.Tensor,
-    w_lm: torch.Tensor,
-    patch_assignments: torch.Tensor
-) -> torch.Tensor:
-    """Invokes native C++ Fused BLT Causal Byte Decoder with C++ Autograd."""
-    return ASDAGBLTDecoderAutogradFunction.apply(
-        h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments
-    )
-
-
-class ASDAGBLTDecoderLossAutogradFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        h_byte: torch.Tensor,
-        causal_latent_patches: torch.Tensor,
-        w_p2b: torch.Tensor,
-        w_fusion: torch.Tensor,
-        w_lm: torch.Tensor,
-        patch_assignments: torch.Tensor,
-        targets: torch.Tensor
-    ) -> torch.Tensor:
-        orig_dtype = h_byte.dtype
-        ops = get_asdag_cpu_ops()
-        if ops and hasattr(ops, 'blt_causal_decode_loss_fused') and not h_byte.is_cuda:
-            loss, ghb, gp, gp2b, gfus, glm = ops.blt_causal_decode_loss_fused(
-                h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments, targets
-            )
-            ctx.grads = (ghb, gp, gp2b, gfus, glm)
-            return loss
-
-        # Fallback
-        logits = asdag_cpu_blt_decoder(h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments)
-        loss = F.cross_entropy(logits.float().view(-1, w_lm.size(0)), targets.view(-1))
-        ctx.save_for_backward(h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments, targets)
-        ctx.is_fallback = True
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if not getattr(ctx, 'is_fallback', False):
-            ghb, gp, gp2b, gfus, glm = ctx.grads
-            scale = grad_output.item()
-            return ghb * scale, gp * scale, gp2b * scale, gfus * scale, glm * scale, None, None
-
-        h_byte, clp, w_p2b, w_fusion, w_lm, pa, targets = ctx.saved_tensors
-        with torch.enable_grad():
-            hb_v = h_byte.detach().requires_grad_(True)
-            clp_v = clp.detach().requires_grad_(True)
-            wp_v = w_p2b.detach().requires_grad_(True)
-            wf_v = w_fusion.detach().requires_grad_(True)
-            wl_v = w_lm.detach().requires_grad_(True)
-            logits = asdag_cpu_blt_decoder(hb_v, clp_v, wp_v, wf_v, wl_v, pa)
-            loss = F.cross_entropy(logits.float().view(-1, w_lm.size(0)), targets.view(-1))
-            torch.autograd.backward(loss, grad_output)
-            return hb_v.grad, clp_v.grad, wp_v.grad, wf_v.grad, wl_v.grad, None, None
-
-
-def asdag_cpu_blt_decoder_loss(
-    h_byte: torch.Tensor,
-    causal_latent_patches: torch.Tensor,
-    w_p2b: torch.Tensor,
-    w_fusion: torch.Tensor,
-    w_lm: torch.Tensor,
-    patch_assignments: torch.Tensor,
-    targets: torch.Tensor
-) -> torch.Tensor:
-    """Fused C++ BLT Causal Decoder + Cross-Entropy Loss (Zero-Logits RAM)."""
-    return ASDAGBLTDecoderLossAutogradFunction.apply(
-        h_byte, causal_latent_patches, w_p2b, w_fusion, w_lm, patch_assignments, targets
-    )
-
-
 class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1179,10 +977,24 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
             prob = log_sm.exp()
             prob.scatter_add_(1, tgt_c.unsqueeze(1), torch.full_like(tgt_c.unsqueeze(1), -1.0, dtype=prob.dtype))
             d_logits = prob * scale
-            
+
+            g_lm.addmm_(d_logits.t(), fused2)
+            g_fused2 = d_logits.mm(lm_w_f)
+
+            # Layer 2 RMSNorm & SwiGLU backward
+            sum_g_f2 = (g_fused2 * fused2).sum(dim=-1, keepdim=True)
+            g_f2_pre = rms2 * (g_fused2 - fused2 * (sum_g_f2 / float(d_byte)))
+
+            g_down.addmm_(hact.t(), g_f2_pre)
+            g_hact = g_f2_pre.mm(down_w_f)
+
+            dsilu_g = sig_g * (1.0 + ug * (1.0 - sig_g))
+            g_ug = g_hact * uv * dsilu_g
+            g_uv = g_hact * (ug * sig_g)
+
             g_gate.addmm_(g_ug.t(), fused1)
             g_val.addmm_(g_uv.t(), fused1)
-            
+
             g_fused1 = g_f2_pre + g_ug.mm(gate_w_f) + g_uv.mm(val_w_f)
             
             sum_g_f1 = (g_fused1 * fused1).sum(dim=-1, keepdim=True)
@@ -1533,187 +1345,6 @@ def asdag_cpu_bitlinear_ternary_int(
     return F.linear(x, w_ternary * gamma, b_ten)
 
 
-def asdag_cpu_fused_transformer_stack(
-    x_latent: torch.Tensor,
-    blocks: List[Any],
-    n_heads: int = 4
-) -> torch.Tensor:
-    """L2/L3 Cache-Resident Fused Multi-Layer Global ASDAG Stack Forward."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'fused_transformer_stack_forward') and not x_latent.is_cuda:
-        layer_diags = []
-        layer_perms = []
-        layer_bias = []
-        layer_wgv = []
-        layer_gamma_gv = []
-        layer_wd = []
-        layer_gamma_wd = []
-
-        for block in blocks:
-            # Monarch weights
-            if hasattr(block.time_mixer, 'qkvg_proj') and hasattr(block.time_mixer.qkvg_proj, 'diagonals'):
-                layer_diags.append(block.time_mixer.qkvg_proj.diagonals)
-                layer_perms.append(block.time_mixer.qkvg_proj.perms)
-                layer_bias.append(block.time_mixer.qkvg_proj.bias)
-            else:
-                layer_diags.append(torch.empty(0))
-                layer_perms.append(torch.empty(0))
-                layer_bias.append(torch.empty(0))
-
-            # SwiGLU weights
-            cm = block.channel_mixer
-            if hasattr(cm, 'w_gate_val') and hasattr(cm, 'w_down'):
-                wgv = cm.w_gate_val.weight
-                gamma_gv = wgv.abs().mean().clamp(min=1e-5).item()
-                w_gv_t = torch.round(wgv / gamma_gv).clamp(-1.0, 1.0)
-                layer_wgv.append(w_gv_t)
-                layer_gamma_gv.append(gamma_gv)
-
-                wd = cm.w_down.weight
-                gamma_wd = wd.abs().mean().clamp(min=1e-5).item()
-                w_d_t = torch.round(wd / gamma_wd).clamp(-1.0, 1.0)
-                layer_wd.append(w_d_t)
-                layer_gamma_wd.append(gamma_wd)
-            else:
-                for b in blocks:
-                    x_latent = b(x_latent)
-                return x_latent
-
-        return ops.fused_transformer_stack_forward(
-            x_latent, layer_diags, layer_perms, layer_bias,
-            layer_wgv, layer_gamma_gv, layer_wd, layer_gamma_wd, n_heads
-        )
-
-    for block in blocks:
-        x_latent = block(x_latent)
-    return x_latent
-
-
-def asdag_cpu_async_backpressure_pipeline(
-    x_patches: torch.Tensor,
-    w_gate_val: torch.Tensor,
-    gamma_gv: float,
-    w_down: torch.Tensor,
-    gamma_wd: float,
-    upstream_error: torch.Tensor
-) -> torch.Tensor:
-    """Asynchronous Local Backpressure Token Ring-Buffer."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'async_backpressure_pipeline') and not x_patches.is_cuda:
-        return ops.async_backpressure_pipeline(x_patches, w_gate_val, gamma_gv, w_down, gamma_wd, upstream_error)
-    return upstream_error
-
-
-def asdag_cpu_forward_plasticity(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    target: torch.Tensor,
-    lr: float = 0.01,
-    gamma: float = 1.0
-) -> torch.Tensor:
-    """Forward-Only Local Predictive Plasticity (1P FLOPs, 0 backward pass)."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'forward_plasticity') and not x.is_cuda:
-        return ops.forward_plasticity(x, w, target, lr, gamma)
-    out = F.linear(x, w * gamma)
-    err = target - out
-    w.data.add_(torch.mm(err.sign().t(), x.sign()) * lr)
-    return out
-
-
-def asdag_cpu_hash_memory(
-    x: torch.Tensor,
-    memory_table: torch.Tensor,
-    num_slots: int = 1024
-) -> torch.Tensor:
-    """1-Cycle O(1) L3 Hash-Addressed Associative Memory Table."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'hash_memory') and not x.is_cuda:
-        return ops.hash_memory(x, memory_table, num_slots)
-    B, D = x.shape
-    hashes = (x > 0).long().sum(dim=-1) % num_slots
-    return memory_table[hashes]
-
-
-def asdag_cpu_event_sparse(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    gamma: float = 1.0
-) -> torch.Tensor:
-    """Event-Driven Dynamic Zero-Skipping Vector Forward."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'event_sparse') and not x.is_cuda:
-        return ops.event_sparse(x, w, gamma)
-    return F.linear(x, w * gamma)
-
-
-def asdag_cpu_fused_dense_backward_step(
-    grad_output: torch.Tensor,
-    x: torch.Tensor,
-    w: torch.Tensor,
-    momentum_buf: Optional[torch.Tensor] = None,
-    lr: float = 0.01,
-    momentum: float = 0.9,
-    weight_decay: float = 0.0
-) -> None:
-    """Fused In-Situ Backward + Optimizer Step (Zero-DRAM parameter updates)."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'fused_dense_backward_step') and not grad_output.is_cuda:
-        m_buf = momentum_buf if momentum_buf is not None else torch.empty(0, dtype=w.dtype, device=w.device)
-        ops.fused_dense_backward_step(grad_output, x, w, m_buf, lr, momentum, weight_decay)
-        return
-    # Fallback
-    gw = torch.mm(grad_output.t(), x)
-    if weight_decay > 0.0:
-        gw.add_(w, alpha=weight_decay)
-    if momentum_buf is not None:
-        momentum_buf.mul_(momentum).add_(gw)
-        w.add_(momentum_buf, alpha=-lr)
-    else:
-        w.add_(gw, alpha=-lr)
-
-
-def asdag_cpu_speculative_early_exit_stack(
-    x_latent: torch.Tensor,
-    blocks: nn.ModuleList,
-    exit_threshold: float = 0.05
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Speculative Early-Exit Dynamic Layer Halting Stack."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, 'speculative_early_exit_stack') and not x_latent.is_cuda:
-        layer_wgv = []
-        layer_gamma_gv = []
-        layer_wd = []
-        layer_gamma_wd = []
-
-        for b in blocks:
-            cm = b.channel_mixer
-            if hasattr(cm, 'w_gate_val') and hasattr(cm, 'w_down'):
-                wgv = cm.w_gate_val.weight
-                gamma_gv = wgv.abs().mean().clamp(min=1e-5).item()
-                w_gv_t = torch.round(wgv / gamma_gv).clamp(-1.0, 1.0)
-                layer_wgv.append(w_gv_t)
-                layer_gamma_gv.append(gamma_gv)
-
-                wd = cm.w_down.weight
-                gamma_wd = wd.abs().mean().clamp(min=1e-5).item()
-                w_d_t = torch.round(wd / gamma_wd).clamp(-1.0, 1.0)
-                layer_wd.append(w_d_t)
-                layer_gamma_wd.append(gamma_wd)
-            else:
-                for blk in blocks:
-                    x_latent = blk(x_latent)
-                return x_latent, torch.full((x_latent.size(0),), len(blocks), dtype=torch.int32)
-
-        return ops.speculative_early_exit_stack(
-            x_latent, layer_wgv, layer_gamma_gv, layer_wd, layer_gamma_wd, exit_threshold
-        )
-
-    for b in blocks:
-        x_latent = b(x_latent)
-    return x_latent, torch.full((x_latent.size(0),), len(blocks), dtype=torch.int32)
-
-
 def asdag_cpu_byte_encoder_forward(
     byte_ids: torch.Tensor,
     embed_weight: torch.Tensor,
@@ -1788,31 +1419,5 @@ class ASDAGCPULPCHeadAutogradFunction(torch.autograd.Function):
 def asdag_cpu_lpc_head(h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
     """Native C++ AVX2/AVX-512 OpenMP Fused LPC Local Head (Zero Logit Materialization)."""
     return ASDAGCPULPCHeadAutogradFunction.apply(h, w, targets, ignore_index)
-
-
-def asdag_cpu_lpc_async_head_step(
-    h: torch.Tensor,
-    w: torch.Tensor,
-    targets: torch.Tensor,
-    grad_h_out: torch.Tensor,
-    lr: float = 0.0,
-    ignore_index: int = -100
-):
-    """Executes LPC Local Head forward + backward + update in native C++ worker thread."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, "lpc_async_head_step"):
-        ops.lpc_async_head_step(h, w, targets, grad_h_out, lr, ignore_index)
-
-
-def asdag_cpu_lpc_pipeline_sync():
-    """Synchronizes all background C++ LPC worker pipeline tasks."""
-    ops = get_asdag_cpu_ops()
-    if ops and hasattr(ops, "lpc_pipeline_sync"):
-        ops.lpc_pipeline_sync()
-
-
-
-
-
 
 

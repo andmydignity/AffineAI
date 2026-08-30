@@ -19,8 +19,7 @@ def test_hybrid_forward_and_joint_loss():
     assert loss.item() > 0
     assert "loss_gen" in metrics
     assert "loss_jepa" in metrics
-    assert "loss_inv" in metrics
-    assert "latent_std" in metrics
+    assert metrics["loss_jepa"] == 0.0  # JEPA off by default: no jepa sub-metrics
 
 
 def test_hybrid_gradients_and_ema():
@@ -35,22 +34,37 @@ def test_hybrid_gradients_and_ema():
     _, loss, _ = model(x, targets=y)
     loss.backward()
     
-    # Check context encoder, predictor, and decoder have gradients
+    # Gen loss reaches patcher and decoder; predictor is JEPA-scaffolding only
     assert model.context_encoder.patcher.patch_proj.weight.grad is not None
-    assert model.predictor.pred_proj.weight.grad is not None
     assert model.byte_decoder.lm_head.weight.grad is not None
-    
-    # Check target encoder has NO gradients
-    for p in model.target_encoder.parameters():
-        assert p.grad is None
-        
-    # Check EMA update
-    orig_w = model.target_encoder.patcher.patch_proj.weight.data.clone()
-    model.context_encoder.patcher.patch_proj.weight.data.add_(1.0)
-    model.update_target_encoder(momentum=0.9)
-    new_w = model.target_encoder.patcher.patch_proj.weight.data
-    
-    assert not torch.allclose(orig_w, new_w)
+
+
+def test_hybrid_stop_grad_target_and_sigreg():
+    config = TorosHybridConfig(
+        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2, target_patch_size=8,
+        jepa_loss_weight=0.5
+    )
+    model = TorosHybridLanguageModel(config)
+
+    # No EMA target encoder should exist
+    assert not hasattr(model, "target_encoder")
+    assert not hasattr(model.config, "ema_momentum")
+
+    x = torch.randint(0, 256, (2, 16))
+    y = torch.randint(0, 256, (2, 16))
+    _, loss, m = model(x, targets=y)
+    assert m["loss_jepa"] > 0.0
+    assert "loss_sigreg" in m
+
+    # Collapsed embeddings: constant predictor output sorts to a point mass,
+    # far from the N(0,1) quantiles SIGReg matches against -> SIGReg must grow.
+    healthy_sigreg = m["loss_sigreg"]
+    with torch.no_grad():
+        for p in model.predictor.parameters():
+            p.zero_()
+    _, _, m2 = model(x, targets=y)
+    collapsed_sigreg = m2["loss_sigreg"]
+    assert collapsed_sigreg > healthy_sigreg
 
 
 def test_hybrid_generation():

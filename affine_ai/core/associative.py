@@ -562,7 +562,8 @@ class NativeASDAGAssociativeMixer(nn.Module):
             y = y_scan.transpose(1, 2).reshape(B, T, C).to(orig_dtype)
             return self.out_proj(y * g), None
 
-        if x.is_cuda and not return_state and T % 16 == 0:
+        # Chunked fast path requires T to divide evenly into C_eff-sized chunks
+        if x.is_cuda and not return_state and T % 64 == 0:
             y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
             return self.out_proj(y * g), None
 

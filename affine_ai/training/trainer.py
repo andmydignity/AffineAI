@@ -253,7 +253,6 @@ class ASDAGTrainer:
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
-                self.model.hybrid.update_target_encoder()
                 return loss.item()
 
         if self.use_backpressure:

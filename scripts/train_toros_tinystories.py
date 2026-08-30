@@ -34,7 +34,6 @@ def main():
         n_heads=4,
         target_patch_size=16,
         channel_mixer_type="ternary_swiglu",
-        jepa_loss_weight=0.3,
         gen_loss_weight=1.0,
         dtype=torch.float32
     )
@@ -100,7 +99,6 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        model.update_target_encoder()
         t_step = time.time() - t_step_0
 
         if step % eval_interval == 0 or step == 1:

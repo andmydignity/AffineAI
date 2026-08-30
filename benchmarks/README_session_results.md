@@ -32,3 +32,78 @@ trees; inherited trees do better with hardened gradients (phase-dependent).
   mild temp anneal helps branchy tasks; deploy sparse_dispatch=True.
 - route_mode='soft' is the exact-backprop regime + self-organization telemetry;
   pure soft training then hard deploy loses to interface mismatch.
+
+## jepa_ab (2026-08-30, GPU A/B, harness at /tmp/opencode/jepa_ab.py)
+Question: can a JEPA-family auxiliary latent loss extract extra quality from the
+same bytes? Answer at TorosHybrid scale (dim=136, 6 blocks, ~1M params): NO.
+
+Protocol: B=16, T=512, 15k steps, lr 3e-3 cosine+warmup, fixed eval batches,
+SimpleStories full-dataset memmap (2.24 GB bytes; 123 MB seen = 5.5%), seed 42.
+TinyStories A/B (1k steps, 100 MB cap) agreed in direction on every checkpoint.
+
+  arm                     params      ms/step   final val ppl
+  no-jepa (gen only)      1,013,009    38.3      3.317
+  masked-patch JEPA       1,013,009    85.5      3.388   (+2.1% ppl, 2.2x time)
+  roll-shift JEPA (old)   1,013,009    55.1      3.398   (+2.4% ppl, 1.4x time)
+  (TinyStories, 1k steps: no-jepa 3.997 vs roll-shift 4.068 vs EMA-old 4.058)
+
+Variants tested:
+- roll-shift invariance (predict E(x shifted 64B) from E(x), stop-grad target):
+  near-copy task, no information bottleneck; aux gradient competes with gen
+  loss for the same tiny ternary encoder -> consistent small regression.
+- EMA teacher + VICReg (pre-rework recipe): statistically indistinguishable
+  from stop-grad + SIGReg at equal depth (4.058 vs 4.053). EMA machinery
+  (extra 721k-param frozen copy + update) bought nothing.
+- masked-patch JEPA (learned mask token on ~30% of patch spans, predictor
+  reconstructs held-out latents, loss on masked slots vs clean pass): beat
+  roll-shift at every checkpoint -> bottleneck hypothesis confirmed -- but
+  still lost to no-jepa. Next-byte prediction on raw text is already a hard
+  masked-modeling task; little latent-side quality left to extract at this
+  scale, and the 2nd encoder pass doubles step cost.
+
+Machinery kept in hybrid.py behind jepa_loss_weight (default 0.0): masked-
+patch objective + SIGReg (4-sketch sorted 1D Wasserstein vs fixed N(0,1)) +
+EMA-free stop-grad design. Worth revisiting only for: low-data regimes,
+larger dim, or System-2 latent planning (predictor wired into generation).
+Predictor stays stripped from .toros/inference exports.
+
+## repetition_collapse + unlikelihood_ab (2026-08-30, GPU probes, 1k-step protocol)
+Question: TorosHybrid (and siblings) collapse into greedy decode loops
+("the stories and the stories..."). Where does it come from and can objective-
+side unlikelihood training (Welleck et al. 2020) fix it at the 1k-step budget?
+
+Diagnosis probes (48B real prompt, 256B greedy, SimpleStories val):
+  model                 data_ppl  gen self-ppl  distinct-4gram  drift curve
+  hybrid 1k             4.02      2.06 flat    0.02             zero (converged)
+  hybrid 1k temp 0.7    --        --           0.95             loops masked -> word salad
+  LPLM plain 1k         11.4      3.35 flat    0.019            "the the the"
+  unl-trained 1k        4.01      2.15 flat    0.08             same basin
+  => No drift anywhere: gen self-ppl < data_ppl and flat. The loop is an
+  in-distribution attractor (GLA state contraction + marginal backoff under
+  ternary capacity pressure), NOT compounding error. This kills the case for
+  latent-planning rollouts at this scale (planning fixes drift; we converge).
+  Note: prior "it generates fine" impressions came from temp 0.7 + top_k 50 +
+  40-80B horizons + EOS truncation: sampling masks the loop, doesn't cure it.
+  At 1k steps temp-sampled text is unigram salad either way (likelihood trap).
+
+Unlikelihood A/B (w=0.05, n=4, window=64; same seed/protocol as jepa_ab):
+  clean 1k:      ppl 4.02, distinct-4gram 0.02
+  unlikelihood:  ppl 3.97 (CE unharmed), distinct-4gram 0.08 (4x more escapes)
+  BUT greedy still re-converges to the same "the stories and" basin.
+  Mechanism verified: unl trace 0.004 -> 0.70 over 1k steps (self-sharpening as
+  the model gains confidence in repeats); flag positions correct on synthetic
+  loops (T-7 of T). Failure mode: the penalty bites token-level repeats; the
+  attractor lives at the recurrent-state level. Once GLA state saturates, the
+  pre-loop context has decayed away and no readout-side token penalty can
+  point back out. Penalties: JEPA attacked quality, planning attacked drift,
+  unlikelihood attacked token loops -- none touch state contraction.
+
+Next candidate (untested): readout-level neuron fatigue (activity-adaptive
+gain on h_final before the LM head, fires-too-much -> suppressed, decays back).
+Only proposed mechanism that acts on the representation/state interface and
+stays deterministic + O(1) for CPU deployment. Evaluate on >=1k-step
+checkpoints at realistic training length (16k) before concluding anything.
+
+Machinery kept in hybrid.py behind config flags, all default-off:
+  unlikelihood_weight=0.0 (loss implemented, ~5% step cost when on,
+  doubles as a repetition monitor via its trace), jepa_loss_weight=0.0.

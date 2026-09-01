@@ -50,6 +50,7 @@ class ASDAGConfig:
     leaf_mode: str = "permutation"  # "permutation", "full", or "low_rank"
     num_permutations: int = 4
     channel_mixer_type: str = "asdag_tree"
+    time_mixer_rule: str = "gla"  # "gla" (accumulative) or "delta" (error-corrective)
     use_fp8: bool = True
     dtype: Any = torch.bfloat16
 

@@ -107,3 +107,55 @@ checkpoints at realistic training length (16k) before concluding anything.
 Machinery kept in hybrid.py behind config flags, all default-off:
   unlikelihood_weight=0.0 (loss implemented, ~5% step cost when on,
   doubles as a repetition monitor via its trace), jepa_loss_weight=0.0.
+
+## delta_rule_mixer_ab (2026-08-31, GPU, 1k-step protocol)
+Question: does swapping the GLA accumulate-recurrence for the error-corrective
+delta rule (DeltaNet-style, left-projection, unit-normalized keys) fix greedy
+decode repetition collapse at the 1k-step budget?
+
+Implementation (associative.py, rule="delta", config flag time_mixer_rule):
+  S <- g*S - (g*S) @ (b k k^T) + b k v^T     (k unit-normalized, b=delta_beta=1)
+  z <- g*z - b (z.k) k + b k                 (delta-aware denominator)
+  y_t = (q S) / (q z + eps);  autograd-exact sequential loop (train + state-carry).
+Plumbed via ASDAGConfig.time_mixer_rule -> ASDAGBlock -> TorosHybrid/JEPA configs.
+Fused C++ GLA paths correctly bypass delta blocks (gates check rule == "gla").
+
+ALSO FIXED (found during verification, PRE-EXISTING BUG in GLA):
+  Sequential state paths did y_t.unsqueeze(1) on a [B,H,D] tensor producing
+  [B,1,H,D] slices; cat+transpose scrambled head/position layout for ANY
+  multi-token state-carry call (GLA CPU multi-step, GLA CUDA recurrent, and my
+  new delta loops). H=2 short-prefix tests masked it; H=4 exposes it. Fixed to
+  unsqueeze(2) at 4 sites. This means pre-fix incremental generation with T>1
+  chunks silently produced head-scrambled time-mixer outputs.
+
+A/B (same protocol as all 1k arms: B=16, T=512, seed 42, SimpleStories):
+  arm        params  ms/step(GPU)  data_ppl  gen self-ppl  distinct-4gram  loop text
+  gla        1.01M      ~37          3.987     2.077 flat     0.086          "the stories and..."
+  delta      1.01M      ~361         4.013     2.061 flat     0.094          "the stories and..."
+
+VERDICT: delta does NOT fix the loop at this scale/budget. distinct-4gram
+0.086 -> 0.094 is noise-level; the loop content is the same corpus-mode
+attractor. Both models happily stay in their own loop (self-ppl ~2.0 flat).
+
+Why the oracle's 10x SNR improvement didn't translate: the oracle tested state
+mechanics given a FORCED loop input. But the loop is not caused by state
+flooding alone -- it is the argmax dynamics + objective (marginal-backoff)
+choosing to enter the loop. Delta makes the loop state more survivable/escapable
+AFTER entry, but the model still prefers entering it. Escape also requires the
+conditional distribution to rank a non-loop continuation above the loop token,
+and at 1k steps the conditionals are still corpus-marginal-dominated.
+
+Also notable: delta costs ~10x GPU step time in its sequential-loop training
+form (37 -> 361 ms). Production delta training needs the chunked-parallel form
+(WYD-representation chunking, as in DeltaNet paper) to be viable; inference
+state-stepping is unaffected (O(1) per byte either way). Do NOT adopt delta
+based on this A/B; the machinery stays behind time_mixer_rule="delta" for
+future long-horizon/longer-training experiments where the entry dynamics may
+differ.
+
+Culprit chain, final form: repetition collapse is caused by
+(objective: no anti-loop term) + (argmax decode) + (undertrained conditionals
+retreating to corpus marginals). State recurrence design (GLA vs delta) modulates
+how STUCK a loop gets, not whether the model ENTERS it. The remaining untested
+levers from the ranked menu: readout fatigue (state-level escape pressure,
+cheap) and decode-side penalties (rep-penalty/n-gram block), all composable.

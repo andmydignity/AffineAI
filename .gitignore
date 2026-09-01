@@ -8,7 +8,7 @@ __pycache__/
 data/
 
 # Trained artifacts
-models/
+/models/
 checkpoints/
 
 # C++ extension build cache
@@ -23,3 +23,4 @@ cpp_infer/affine_infer_cli
 .vscode/
 .DS_Store
 .omo/
+models/probe_ckpt

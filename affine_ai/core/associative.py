@@ -408,6 +408,14 @@ class NativeASDAGAssociativeMixer(nn.Module):
     5. Dual Execution:
        - Training: Fully Vectorized Cumulative Log-Decay Associative Scan (Zero Python Loops!).
        - Inference: Native C++ AVX2/AVX-512 O(1) Constant Memory State Space Step Kernel.
+
+    rule="delta" swaps the recurrence to the error-corrective delta rule
+    (DeltaNet-style, left-projection):
+        S_t = S_{t-1} (I - beta * khat_t khat_t^T) + beta * khat_t v_t^T
+    where khat is the unit-normalized key. A repeated (k, v) pair has zero
+    residual, so loops overwrite their own key slots instead of flooding the
+    whole state (the GLA accumulation pathology measured in the oracle probe:
+    28.6x loop/story state ratio for GLA vs 2.7x for delta).
     """
     def __init__(
         self,
@@ -418,7 +426,9 @@ class NativeASDAGAssociativeMixer(nn.Module):
         num_perms: int = 4,
         max_seq_len: int = 4096,
         seed_offset: int = 0,
-        dtype: Any = torch.bfloat16
+        dtype: Any = torch.bfloat16,
+        rule: str = "gla",  # "gla" or "delta"
+        delta_beta: float = 1.0
     ):
         super().__init__()
         assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
@@ -428,6 +438,8 @@ class NativeASDAGAssociativeMixer(nn.Module):
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.proj_type = proj_type
+        self.rule = rule
+        self.delta_beta = delta_beta
 
         # 1. Sequence Projections
         if proj_type == "monarch":
@@ -479,7 +491,8 @@ class NativeASDAGAssociativeMixer(nn.Module):
         D = self.d_head
         orig_dtype = x.dtype
 
-        if not x.is_cuda and not return_state and state is None and self.proj_type == "monarch":
+        if (self.rule == "gla"
+                and not x.is_cuda and not return_state and state is None and self.proj_type == "monarch"):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_monarch_gla
             out = asdag_cpu_fused_monarch_gla(
                 x,
@@ -517,6 +530,29 @@ class NativeASDAGAssociativeMixer(nn.Module):
         if state is not None:
             state_S, state_z = state
 
+            if self.rule == "delta":
+                # Delta recurrence, O(1) per step, autograd-exact (used for both
+                # state-carry stepping and short-sequence training):
+                #   S <- gamma * S (I - b k k^T) + b k v^T        (k unit-normalized)
+                #   z <- gamma * z (I - b k k^T) + b k            (delta-aware denom)
+                #   y_t = (q S) / (q z + eps)
+                beta = self.delta_beta
+                outs = []
+                for t in range(T):
+                    q_t = phi_q[:, :, t]                                    # [B, H, D]
+                    k_t = phi_k[:, :, t]
+                    v_t = v[:, :, t]
+                    gam_t = gamma[:, :, t]                                  # [B, H]
+                    khat = k_t / (k_t.norm(dim=-1, keepdim=True) + 1e-9)
+                    P = beta * (khat.unsqueeze(-1) @ khat.unsqueeze(-2))     # [B, H, D, D] outer
+                    state_S = state_S * gam_t[:, :, None, None] - (state_S * gam_t[:, :, None, None]) @ P + beta * (khat.unsqueeze(-1) * v_t.unsqueeze(-2))
+                    state_z = state_z * gam_t[:, :, None] - (state_z * khat).sum(dim=-1, keepdim=True) * beta * khat + beta * khat
+                    num = (q_t.unsqueeze(-2) @ state_S).squeeze(-2)
+                    den = (q_t * state_z).sum(dim=-1, keepdim=True).clamp(min=1e-5)
+                    outs.append((num / den).unsqueeze(2))
+                out = torch.cat(outs, dim=1).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+                return self.out_proj(out * g), (state_S, state_z)
+
             if not x.is_cuda:
                 from affine_ai.core.cpp_ops import asdag_cpu_gla_step
                 if T == 1:
@@ -535,7 +571,7 @@ class NativeASDAGAssociativeMixer(nn.Module):
                     v_t = v[:, :, t]
                     gam_t = gamma[:, :, t]
                     y_t, state_S, state_z = asdag_cpu_gla_step(q_t, k_t, v_t, gam_t, state_S, state_z)
-                    outs.append(y_t.unsqueeze(1))
+                    outs.append(y_t.unsqueeze(2))
                 out = torch.cat(outs, dim=1).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
                 return self.out_proj(out * g), (state_S, state_z)
             else:
@@ -550,12 +586,35 @@ class NativeASDAGAssociativeMixer(nn.Module):
                     state_z = state_z * gam_t.unsqueeze(-1) + k_t
                     num = torch.matmul(q_t.unsqueeze(-2), state_S).squeeze(-2)
                     den = (q_t * state_z).sum(dim=-1, keepdim=True).clamp(min=1e-5)
-                    outs.append((num / den).unsqueeze(1))
+                    outs.append((num / den).unsqueeze(2))
                 out = torch.cat(outs, dim=1).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
                 return self.out_proj(out * g), (state_S, state_z)
 
+        # 3. Delta-rule training forward: sequential recurrence from zero state,
+        #    autograd-exact. Reruns the state branch with S=0, z=0, collecting
+        #    per-step outputs and the final state.
+        if self.rule == "delta":
+            B_, H, T_ = phi_q.shape[0], self.n_heads, T
+            state_S = phi_q.new_zeros(B, H, D, D)
+            state_z = phi_q.new_zeros(B, H, D)
+            outs = []
+            beta = self.delta_beta
+            for t in range(T):
+                q_t = phi_q[:, :, t]
+                k_t = phi_k[:, :, t]
+                v_t = v[:, :, t]
+                gam_t = gamma[:, :, t]
+                khat = k_t / (k_t.norm(dim=-1, keepdim=True) + 1e-9)
+                P = beta * (khat.unsqueeze(-1) @ khat.unsqueeze(-2))
+                state_S = state_S * gam_t[:, :, None, None] - (state_S * gam_t[:, :, None, None]) @ P + beta * (khat.unsqueeze(-1) * v_t.unsqueeze(-2))
+                state_z = state_z * gam_t[:, :, None] - (state_z * khat).sum(dim=-1, keepdim=True) * beta * khat + beta * khat
+                num = (q_t.unsqueeze(-2) @ state_S).squeeze(-2)
+                den = (q_t * state_z).sum(dim=-1, keepdim=True).clamp(min=1e-5)
+                outs.append((num / den).unsqueeze(2))
+            out = torch.cat(outs, dim=1).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+            return self.out_proj(out * g), (state_S, state_z)
 
-        # 3. Fused C++ SIMD Associative Scan
+        # 4. Fused C++ SIMD Associative Scan
         if not x.is_cuda and not return_state:
             from affine_ai.core.cpp_ops import asdag_cpu_gla_scan
             y_scan = asdag_cpu_gla_scan(phi_q, phi_k, v, gamma) # [B, H, T, D]

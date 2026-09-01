@@ -102,8 +102,9 @@ def test_delta_loop_noise_bounded_vs_gla():
 
 def test_delta_hybrid_incremental_parity():
     cfg = TorosHybridConfig(
-        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2,
-        target_patch_size=8, time_mixer_rule="delta", dtype=torch.float32
+        dim=64, d_byte=32, n_encoder_layers=2, n_heads=2,
+        target_patch_size=8, time_mixer_rule="delta", dtype=torch.float32,
+        use_rls_heads=False, use_type_codebook=False, dynamic_patching=False, use_growth=False
     )
     torch.manual_seed(42)
     m = TorosHybridLanguageModel(cfg).eval()
@@ -116,8 +117,9 @@ def test_delta_hybrid_incremental_parity():
 
 def test_delta_hybrid_train_step():
     cfg = TorosHybridConfig(
-        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2,
-        target_patch_size=8, time_mixer_rule="delta", dtype=torch.float32
+        dim=64, d_byte=32, n_encoder_layers=2, n_heads=2,
+        target_patch_size=8, time_mixer_rule="delta", dtype=torch.float32,
+        use_rls_heads=False, use_type_codebook=False, dynamic_patching=False, use_growth=False
     )
     torch.manual_seed(42)
     m = TorosHybridLanguageModel(cfg)

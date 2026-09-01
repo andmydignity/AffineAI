@@ -8,6 +8,7 @@ from affine_ai import TorosHybridLanguageModel, TorosHybridConfig
 
 def _small_model(**cfg_kwargs):
     torch.manual_seed(42)
+    cfg_kwargs.setdefault("dynamic_patching", False)
     cfg = TorosHybridConfig(
         dim=64, d_byte=32, n_encoder_layers=2,
         n_heads=2, target_patch_size=8, dtype=torch.float32,

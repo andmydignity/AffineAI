@@ -49,7 +49,7 @@ class TorosHybridConfig:
     growth_threshold: float = 0.15
     use_bmr: bool = True
     use_info_gain: bool = True
-    dynamic_patching: bool = False
+    dynamic_patching: bool = True
     dynamic_boundary_weight: float = 0.1
     dtype: Any = torch.float32
 

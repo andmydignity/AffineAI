@@ -35,7 +35,8 @@ No test runner config; tests are plain pytest functions in `tests/`.
 ## Data & artifacts
 
 - Training scripts read raw `uint8` byte streams from `data/*.bin` (TinyStories, SmolTalk, FineWeb-EDU). `data/` is ~12 GB and lives only on disk — never commit or read it wholesale.
-- Prep/streaming scripts: `scripts/prepare_smoltalk.py`, `scripts/stream_fineweb_edu.py` (require HuggingFace `datasets`).
+- Prep/streaming scripts: `scripts/prepare_smoltalk.py`, `scripts/stream_fineweb_edu.py` (require HuggingFace `datasets`); `scripts/prepare_simplestories.py` converts the local SimpleStories parquet corpus (2.24 GB byte stream).
+- `AXIOM.md` catalogs salvageable ideas from the AXIOM paper (arXiv:2505.24784) — stick-breaking tree growth, RLS local heads, BMR pruning, info-gain data selection — with experiment sketches and a do-not-transfer list. Consult before designing growth/pruning/uncertainty machinery; anything adopted must pass the same A/B discipline as the JEPA ablations.
 - Entry-point training scripts live at repo root (`train_tinystories_700k_lpc_cpu.py`) and in `scripts/` (`train_toros_*.py`, `train_tinystories_*.py`); run them from repo root (they use relative `data/` paths).
 - `models/` and `checkpoints/` hold trained `.pt` / `.toros` artifacts. Use `save_toros_model` / `load_toros_model` (2-bit ternary packing, zstd) rather than `torch.save` for shippable checkpoints.
 - `benchmarks/README_session_results.md` documents prior experiment findings (quantization bugs, ablations) — consult it before re-running ablation studies.

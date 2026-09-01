@@ -929,11 +929,14 @@ class ASTDAGLayer(nn.Module):
                     leaf_prim = leaf_prim + x_p * w_perm_stack[:, p_idx].unsqueeze(0)
             else:
                 leaf_prim = b_stack.unsqueeze(0).expand(B, len(leaves), self.dim).clone()
-                for k_idx, leaf in enumerate(leaves):
-                    for p_idx in range(leaf.num_permutations):
-                        perm = leaf.perms[p_idx]
-                        x_p = r_in[:, perm] if p_idx != 0 else r_in
-                        leaf_prim[:, k_idx] = leaf_prim[:, k_idx] + x_p * w_perm_stack[k_idx, p_idx]
+                perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
+                K_num = len(leaves)
+                P_num = perms_stack.shape[1]
+                r_exp = r_in.unsqueeze(1).expand(-1, K_num, -1)
+                for p_idx in range(P_num):
+                    p_k = perms_stack[:, p_idx]
+                    x_p = torch.gather(r_exp, -1, p_k.unsqueeze(0).expand(B, -1, -1))
+                    leaf_prim = leaf_prim + x_p * w_perm_stack[:, p_idx].unsqueeze(0)
         elif self.rank is None:
             w_stack = torch.stack([
                 ternarize(
@@ -1077,11 +1080,14 @@ class ASTDAGLayer(nn.Module):
                     leaf_prim = leaf_prim + x_p * w_perm_stack[:, p_idx].unsqueeze(0)
             else:
                 leaf_prim = b_stack.unsqueeze(0).expand(B, len(leaves), self.dim).clone()
-                for k_idx, leaf in enumerate(leaves):
-                    for p_idx in range(leaf.num_permutations):
-                        perm = leaf.perms[p_idx]
-                        x_p = r_in[:, perm] if p_idx != 0 else r_in
-                        leaf_prim[:, k_idx] = leaf_prim[:, k_idx] + x_p * w_perm_stack[k_idx, p_idx]
+                perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
+                K_num = len(leaves)
+                P_num = perms_stack.shape[1]
+                r_exp = r_in.unsqueeze(1).expand(-1, K_num, -1)
+                for p_idx in range(P_num):
+                    p_k = perms_stack[:, p_idx]
+                    x_p = torch.gather(r_exp, -1, p_k.unsqueeze(0).expand(B, -1, -1))
+                    leaf_prim = leaf_prim + x_p * w_perm_stack[:, p_idx].unsqueeze(0)
         elif self.rank is None:
             w_stack = torch.stack([
                 ternarize(

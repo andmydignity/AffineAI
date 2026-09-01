@@ -30,7 +30,7 @@ class TorosHybridConfig:
     n_encoder_layers: int = 4
     n_heads: int = 4
     target_patch_size: int = 16
-    channel_mixer_type: str = "ternary_swiglu"
+    channel_mixer_type: str = "asdag_tree"
     time_mixer_rule: str = "gla"
     gen_loss_weight: float = 1.0
     # Stripped JEPA/System-2 fields kept for checkpoint compat (ignored):

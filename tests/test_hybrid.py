@@ -5,7 +5,7 @@ from affine_ai.models.hybrid import TorosHybridLanguageModel, TorosHybridConfig
 
 def test_hybrid_forward_and_joint_loss():
     config = TorosHybridConfig(
-        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2, target_patch_size=8
+        dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8
     )
     model = TorosHybridLanguageModel(config)
     
@@ -18,8 +18,7 @@ def test_hybrid_forward_and_joint_loss():
     assert loss is not None
     assert loss.item() > 0
     assert "loss_gen" in metrics
-    assert "loss_jepa" in metrics
-    assert metrics["loss_jepa"] == 0.0  # JEPA off by default: no jepa sub-metrics
+    assert "loss_jepa" not in metrics
 
 
 def test_hybrid_gradients_and_ema():
@@ -41,30 +40,20 @@ def test_hybrid_gradients_and_ema():
 
 def test_hybrid_stop_grad_target_and_sigreg():
     config = TorosHybridConfig(
-        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2, target_patch_size=8,
-        jepa_loss_weight=0.5
+        dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8,
     )
     model = TorosHybridLanguageModel(config)
 
-    # No EMA target encoder should exist
-    assert not hasattr(model, "target_encoder")
-    assert not hasattr(model.config, "ema_momentum")
+    assert not hasattr(model, "predictor")
+    assert not hasattr(model, "mask_token")
+    assert not hasattr(model, "_sigreg")
+    assert not hasattr(model, "local_heads")
 
     x = torch.randint(0, 256, (2, 16))
     y = torch.randint(0, 256, (2, 16))
     _, loss, m = model(x, targets=y)
-    assert m["loss_jepa"] > 0.0
-    assert "loss_sigreg" in m
-
-    # Collapsed embeddings: constant predictor output sorts to a point mass,
-    # far from the N(0,1) quantiles SIGReg matches against -> SIGReg must grow.
-    healthy_sigreg = m["loss_sigreg"]
-    with torch.no_grad():
-        for p in model.predictor.parameters():
-            p.zero_()
-    _, _, m2 = model(x, targets=y)
-    collapsed_sigreg = m2["loss_sigreg"]
-    assert collapsed_sigreg > healthy_sigreg
+    assert "loss_jepa" not in m
+    assert "loss_sigreg" not in m
 
 
 def test_hybrid_generation():
@@ -81,24 +70,18 @@ def test_hybrid_generation():
 
 def test_hybrid_native_lpc():
     config = TorosHybridConfig(
-        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1, n_heads=2, target_patch_size=8
+        dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8
     )
     model = TorosHybridLanguageModel(config)
+    assert not hasattr(model, "forward_lpc_step")
+    assert not hasattr(model, "local_heads")
     optimizers = model.get_default_optimizers(lr=1e-3)
-    
-    assert len(optimizers) == 3 # 2 encoder layers + 1 tail layer
-    
+    assert len(optimizers) == 3
     x = torch.randint(0, 256, (2, 32))
     y = torch.randint(0, 256, (2, 32))
-    
-    res = model.forward_lpc_step(x, y, optimizers)
-    
-    assert "loss" in res
-    assert "loss_gen" in res
-    assert "loss_jepa" in res
-    assert "layer_losses" in res
-    assert len(res["layer_losses"]) == 2
-    assert res["loss"] > 0.0
+    _, loss, m = model(x, targets=y)
+    loss.backward()
+    assert m["loss_gen"] > 0
 
 
 def test_hybrid_inference_export(tmp_path):

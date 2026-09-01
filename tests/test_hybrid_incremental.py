@@ -6,12 +6,11 @@ import torch
 from affine_ai import TorosHybridLanguageModel, TorosHybridConfig
 
 
-def _small_model(jepa_loss_weight: float = 0.0):
+def _small_model():
     torch.manual_seed(42)
     cfg = TorosHybridConfig(
-        dim=64, d_byte=32, n_encoder_layers=2, n_predictor_layers=1,
+        dim=64, d_byte=32, n_encoder_layers=2,
         n_heads=2, target_patch_size=8, dtype=torch.float32,
-        jepa_loss_weight=jepa_loss_weight
     )
     return TorosHybridLanguageModel(cfg).eval()
 
@@ -79,38 +78,37 @@ def test_generation_faster_than_full_forward_loop():
 
 
 def test_forward_compute_jepa_flag():
-    model = _small_model(jepa_loss_weight=0.5)
+    model = _small_model()
     x = torch.randint(1, 256, (1, 12))
     y = torch.randint(0, 256, (1, 12))
     with torch.no_grad():
         _, loss_full, m_full = model.forward(x, targets=y)
         _, loss_gen_only, m_gen = model.forward(x, targets=y, compute_jepa=False)
-    assert loss_gen_only.item() == pytest.approx(m_full["loss_gen"] * model.config.gen_loss_weight)
-    assert m_gen["loss_jepa"] == 0.0
-    assert m_full["loss_jepa"] != 0.0
+    assert "loss_jepa" not in m_full
+    assert "loss_jepa" not in m_gen
+    assert loss_full.item() == pytest.approx(m_full["loss_gen"])
 
 
 def test_forward_default_config_jepa_off():
-    """Default recipe is gen-loss-only; the JEPA branch must be skipped."""
+    """Stripped hybrid: JEPA off by default, no System-2 keys."""
     model = _small_model()
-    assert model.config.jepa_loss_weight == 0.0
     x = torch.randint(1, 256, (1, 12))
     y = torch.randint(0, 256, (1, 12))
     with torch.no_grad():
         _, loss, m = model.forward(x, targets=y)
-    assert m["loss_jepa"] == 0.0
+    assert "loss_jepa" not in m
     assert loss.item() == pytest.approx(m["loss_gen"])
 
 
 def test_lpc_step_runs_and_updates():
-    """forward_lpc_step with the fused C++ tail loss: finite loss, params change."""
     model = _small_model()
+    assert not hasattr(model, "forward_lpc_step")
+    assert not hasattr(model, "local_heads")
+    assert not hasattr(model, "predictor")
     model.train()
-    opts = model.get_default_optimizers(lr=1e-3)
     x = torch.randint(1, 256, (2, 24))
     y = torch.randint(0, 256, (2, 24))
-    before = model.byte_decoder.lm_head.weight.detach().clone()
-    metrics = model.forward_lpc_step(x, y, opts, target_shift=8)
-    after = model.byte_decoder.lm_head.weight.detach().clone()
-    assert metrics["loss"] == metrics["loss"]  # finite
-    assert not torch.equal(before, after)
+    _, loss, m = model(x, targets=y)
+    loss.backward()
+    assert m["loss_gen"] > 0
+    assert model.byte_decoder.lm_head.weight.grad is not None

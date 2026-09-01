@@ -24,3 +24,5 @@ cpp_infer/affine_infer_cli
 .DS_Store
 .omo/
 models/probe_ckpt
+.opencode/
+agent-session

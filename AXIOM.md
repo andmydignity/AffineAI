@@ -117,3 +117,36 @@ Same discipline as jepa_ab and unlikelihood_ab: implement behind a flag,
 A/B at matched budget on the standard 1k-step SimpleStories protocol,
 record in benchmarks/README_session_results.md, keep only on evidence.
 Negative results get documented with the same care.
+
+## Implementation status (2026-09-01)
+
+- Hybrid stripped: TorosHybrid is now gen-only (encoder + decoder + unlikelihood).
+  No predictor/local_heads/mask_token/SIGReg/masked-JEPA. JEPA lives standalone
+  in jepa.py. Old checkpoints load via strict=False; predictor is stripped from
+  exports and trainer handles missing local_heads gracefully.
+
+- Transfer 1 — Stick-breaking growth: `affine_ai/core/growth.py`
+  (StickBreakingGrowthController, windowed surprisal -> grow_mass). Pure
+  inference-side, no gradients. Behind threshold/alpha0; A/B vs grown_copy
+  on toy targets is the next step.
+
+- Transfer 2 — RLS heads: `affine_ai/core/rls_head.py` (RLSPredictiveHead,
+  shared P [d,d], forgetting lambda, ridge delta, uncertainty via h^T P h).
+  Drop-in parallel to LocalPredictiveHead. Tests cover convergence, ignore
+  handling, no-autograd pollution.
+
+- Transfer 3 — Type codebook: `affine_ai/core/type_codebook.py`
+  (LatentTypeCodebook, zero-init scale for function-preserving enrichment,
+  online mean update + stick-breaking birth). Active types tracked via
+  num_types buffer.
+
+- Transfer 4 — BMR pruning: same module (`bmr_merge()` on the codebook).
+  Closed-form evidence via distance threshold; handles embedding shift and
+  count merging. Tested on duplicate-type collapse.
+
+- Transfer 5 — Info-gain selection: `rank_windows_by_info_gain(head, windows)`
+  in type_codebook.py, using RLS posterior variance. Tested ranking validity.
+
+All five are implemented behind flags/default-off where they touch training;
+none are wired into the hybrid forward path by default. See tests
+`test_rls_head.py` / `test_axiom_transfers.py` for contracts.

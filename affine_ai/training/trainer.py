@@ -107,7 +107,8 @@ class ASDAGTrainer:
         # Fused / standard AdamW
         fused = (self.device == "cuda" and hasattr(optim.AdamW, "_fused"))
         if getattr(self.model, "hybrid", None) is not None:
-            if self.use_lpc:
+            has_local_lpc = self.use_lpc and hasattr(self.model.hybrid, 'local_heads')
+            if has_local_lpc:
                 self.hybrid_optimizers = self.model.hybrid.get_default_optimizers(
                     lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, muon_lr=self.muon_lr
                 )
@@ -227,7 +228,7 @@ class ASDAGTrainer:
         if getattr(self.model, "hybrid", None) is not None:
             lr = self.get_lr(step)
             lr_ratio = lr / max(1e-8, self.lr)
-            if self.use_lpc and self.hybrid_optimizers is not None:
+            if self.use_lpc and self.hybrid_optimizers is not None and hasattr(self.model.hybrid, 'forward_lpc_step'):
                 for opt in self.hybrid_optimizers:
                     if hasattr(opt, "muon_opt") and opt.muon_opt:
                         for pg in opt.muon_opt.param_groups:

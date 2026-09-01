@@ -49,6 +49,8 @@ class TorosHybridConfig:
     growth_threshold: float = 0.15
     use_bmr: bool = True
     use_info_gain: bool = True
+    dynamic_patching: bool = False
+    dynamic_boundary_weight: float = 0.1
     dtype: Any = torch.float32
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
@@ -209,9 +211,38 @@ class TorosHybridLanguageModel(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
         B, T = byte_ids.shape
         h_byte, boundary_logits = self.context_encoder.byte_encoder(byte_ids)
-        latent_patches, patch_assignments = self.context_encoder.patcher(
-            h_byte, boundary_logits, fixed_patch_size=self.config.target_patch_size
-        )
+        if getattr(self.config, 'dynamic_patching', False):
+            P = self.config.target_patch_size
+            M = (T + P - 1) // P
+            p = torch.sigmoid(boundary_logits)
+            pooled_list = []
+            assign_list = []
+            for b in range(B):
+                if M > 1:
+                    _, top_idx = torch.topk(p[b, :-1], k=M-1)
+                    cuts = sorted(top_idx.tolist() + [T-1])
+                else:
+                    cuts = [T-1]
+                pooled_b = []
+                assign_b = torch.zeros(T, dtype=torch.long, device=p.device)
+                start = 0
+                for patch_idx, end in enumerate(cuts):
+                    end = end + 1
+                    pooled_patch = h_byte[b, start:end].mean(dim=0, keepdim=True)
+                    proj = self.context_encoder.patcher.patch_proj(pooled_patch.to(self.context_encoder.patcher.patch_proj.weight.dtype))
+                    pooled_b.append(proj)
+                    assign_b[start:end] = patch_idx
+                    start = end
+                pooled_b = torch.cat(pooled_b, dim=0)
+                normed_b = self.context_encoder.patcher.patch_norm(pooled_b)
+                pooled_list.append(normed_b)
+                assign_list.append(assign_b)
+            latent_patches = torch.stack(pooled_list, dim=0)
+            patch_assignments = torch.stack(assign_list, dim=0)
+        else:
+            latent_patches, patch_assignments = self.context_encoder.patcher(
+                h_byte, torch.zeros_like(boundary_logits), fixed_patch_size=self.config.target_patch_size
+            )
         
         hiddens = []
         h_latent = latent_patches
@@ -267,6 +298,16 @@ class TorosHybridLanguageModel(nn.Module):
             if rls_loss is not None:
                 loss = loss + self.config.rls_weight * rls_loss
                 metrics["loss_rls"] = rls_loss.detach().item()
+            if getattr(self.config, 'dynamic_patching', False):
+                with torch.no_grad():
+                    per_byte_ce = F.cross_entropy(logits.view(-1, 256), targets.view(-1), reduction='none').view(B, T)
+                    boundary_target = torch.zeros_like(boundary_logits)
+                    for b in range(B):
+                        thresh = torch.quantile(per_byte_ce[b], 0.7)
+                        boundary_target[b] = (per_byte_ce[b] > thresh).float()
+                bce = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
+                loss = loss + self.config.dynamic_boundary_weight * bce
+                metrics["loss_boundary"] = bce.detach().item()
             metrics.update({
                 "loss_total": loss.item(),
                 "loss_gen": loss_gen.item(),

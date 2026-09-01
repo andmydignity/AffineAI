@@ -39,15 +39,16 @@ class TorosHybridConfig:
     unlikelihood_weight: float = 0.0
     unlikelihood_n: int = 4
     unlikelihood_window: int = 64
-    use_rls_heads: bool = False
+    use_rls_heads: bool = True
     rls_weight: float = 0.1
     rls_forgetting: float = 0.999
-    use_type_codebook: bool = False
+    use_type_codebook: bool = True
     type_codebook_max_types: int = 32
-    use_growth: bool = False
+    use_growth: bool = True
     growth_alpha0: float = 1.0
     growth_threshold: float = 0.15
-    use_info_gain: bool = False
+    use_bmr: bool = True
+    use_info_gain: bool = True
     dtype: Any = torch.float32
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)

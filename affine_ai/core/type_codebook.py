@@ -35,12 +35,9 @@ class LatentTypeCodebook(nn.Module):
         active = int(self.num_types.item())
         if active == 0:
             return latents, torch.zeros(B, M, dtype=torch.long, device=latents.device)
-        # distance to each active type mean
-        # latents [B*M, D], means [K, D] -> dist [B*M, K]
         flat = latents.reshape(-1, D)
-        dists = torch.cdist(flat, self.means[:active])
+        dists = torch.cdist(flat.float(), self.means[:active].float())
         ids = dists.argmin(dim=-1).view(B, M)
-        # enrichment: zero-init scale -> identity at start
         enrich = self.embedding(ids) * self.scale
         return latents + enrich, ids
 
@@ -51,7 +48,7 @@ class LatentTypeCodebook(nn.Module):
         active = int(self.num_types.item())
         if active == 0:
             return
-        dists = torch.cdist(flat, self.means[:active])
+        dists = torch.cdist(flat.float(), self.means[:active].float())
         min_dist, nearest = dists.min(dim=-1)
         # Birth: far latents spawn new type if room
         for i in range(flat.shape[0]):
@@ -61,11 +58,10 @@ class LatentTypeCodebook(nn.Module):
                 active += 1
                 self.num_types.fill_(active)
                 # recompute dists after birth (simple: continue)
-                dists = torch.cdist(flat, self.means[:active])
+                dists = torch.cdist(flat.float(), self.means[:active].float())
                 min_dist, nearest = dists.min(dim=-1)
             else:
                 k = int(nearest[i].item())
-                # EMA update
                 self.counts[k] += 1
                 n = self.counts[k].item()
                 lr = 1.0 / n
@@ -77,8 +73,7 @@ class LatentTypeCodebook(nn.Module):
         active = int(self.num_types.item())
         if active <= 1:
             return 0
-        # Find closest pair among active types
-        dists = torch.cdist(self.means[:active], self.means[:active])
+        dists = torch.cdist(self.means[:active].float(), self.means[:active].float())
         dists.fill_diagonal_(float("inf"))
         min_val, min_idx = dists.min(dim=-1)
         # global min

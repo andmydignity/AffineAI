@@ -6,11 +6,12 @@ import torch
 from affine_ai import TorosHybridLanguageModel, TorosHybridConfig
 
 
-def _small_model():
+def _small_model(**cfg_kwargs):
     torch.manual_seed(42)
     cfg = TorosHybridConfig(
         dim=64, d_byte=32, n_encoder_layers=2,
         n_heads=2, target_patch_size=8, dtype=torch.float32,
+        **cfg_kwargs,
     )
     return TorosHybridLanguageModel(cfg).eval()
 
@@ -78,7 +79,7 @@ def test_generation_faster_than_full_forward_loop():
 
 
 def test_forward_compute_jepa_flag():
-    model = _small_model()
+    model = _small_model(use_rls_heads=False, use_type_codebook=False)
     x = torch.randint(1, 256, (1, 12))
     y = torch.randint(0, 256, (1, 12))
     with torch.no_grad():
@@ -91,7 +92,7 @@ def test_forward_compute_jepa_flag():
 
 def test_forward_default_config_jepa_off():
     """Stripped hybrid: JEPA off by default, no System-2 keys."""
-    model = _small_model()
+    model = _small_model(use_rls_heads=False, use_type_codebook=False)
     x = torch.randint(1, 256, (1, 12))
     y = torch.randint(0, 256, (1, 12))
     with torch.no_grad():

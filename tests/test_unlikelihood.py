@@ -85,7 +85,7 @@ def test_unlikelihood_in_forward_metrics_and_grad():
 
 
 def test_unlikelihood_off_by_default():
-    cfg = TorosHybridConfig(dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8)
+    cfg = TorosHybridConfig(dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8, use_rls_heads=False, use_type_codebook=False)
     assert cfg.unlikelihood_weight == 0.0
     m = TorosHybridLanguageModel(cfg)
     m.train()
@@ -93,6 +93,5 @@ def test_unlikelihood_off_by_default():
     y = torch.randint(1, 256, (2, 64))
     _, loss, met = m(x, targets=y)
     assert "loss_unl" not in met
-    # loss identical to pure gen
     _, _, ref = m(x, targets=y)
     assert loss.item() == ref["loss_gen"]

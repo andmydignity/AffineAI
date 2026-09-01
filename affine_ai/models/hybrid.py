@@ -39,6 +39,15 @@ class TorosHybridConfig:
     unlikelihood_weight: float = 0.0
     unlikelihood_n: int = 4
     unlikelihood_window: int = 64
+    use_rls_heads: bool = False
+    rls_weight: float = 0.1
+    rls_forgetting: float = 0.999
+    use_type_codebook: bool = False
+    type_codebook_max_types: int = 32
+    use_growth: bool = False
+    growth_alpha0: float = 1.0
+    growth_threshold: float = 0.15
+    use_info_gain: bool = False
     dtype: Any = torch.float32
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
@@ -92,6 +101,32 @@ class TorosHybridLanguageModel(nn.Module):
         )
         self.sos_patch = nn.Parameter(torch.zeros(1, 1, self.config.dim))
         nn.init.normal_(self.sos_patch, mean=0.0, std=0.02)
+
+        if getattr(self.config, 'use_rls_heads', False):
+            from affine_ai.core.rls_head import RLSPredictiveHead
+            self.rls_heads = nn.ModuleList([
+                RLSPredictiveHead(
+                    d_model=self.config.dim,
+                    vocab_size=256,
+                    forgetting=getattr(self.config, 'rls_forgetting', 0.999),
+                )
+                for _ in range(self.config.n_encoder_layers)
+            ])
+        if getattr(self.config, 'use_type_codebook', False):
+            from affine_ai.core.type_codebook import LatentTypeCodebook
+            self.type_codebook = LatentTypeCodebook(
+                dim=self.config.dim,
+                max_types=getattr(self.config, 'type_codebook_max_types', 32),
+            )
+        if getattr(self.config, 'use_growth', False):
+            from affine_ai.core.growth import StickBreakingGrowthController
+            self.growth_controllers = [
+                StickBreakingGrowthController(
+                    alpha0=getattr(self.config, 'growth_alpha0', 1.0),
+                    threshold=getattr(self.config, 'growth_threshold', 0.15),
+                )
+                for _ in range(self.config.n_encoder_layers)
+            ]
         
         if self.config.dtype is not None and self.config.dtype != torch.float32:
             self.to(self.config.dtype)
@@ -177,10 +212,26 @@ class TorosHybridLanguageModel(nn.Module):
             h_byte, boundary_logits, fixed_patch_size=self.config.target_patch_size
         )
         
+        hiddens = []
         h_latent = latent_patches
         for block in self.context_encoder.blocks:
             h_latent = block(h_latent)
+            hiddens.append(h_latent)
         h_latent = self.context_encoder.norm_out(h_latent)
+        if getattr(self.config, 'use_type_codebook', False) and hasattr(self, 'type_codebook'):
+            h_latent, _ = self.type_codebook(h_latent)
+            if self.training:
+                self.type_codebook.update(h_latent.detach())
+                if getattr(self.config, 'use_bmr', False) and int(self.type_codebook.num_types.item()) > 1:
+                    self.type_codebook.bmr_merge()
+        if getattr(self.config, 'use_growth', False) and hasattr(self, 'growth_controllers'):
+            for i, block in enumerate(self.context_encoder.blocks):
+                cm = getattr(block, 'channel_mixer', None) or getattr(block, 'asdag', None)
+                if cm is not None and hasattr(cm, '_last_routing_probs') and getattr(cm, '_last_routing_probs', None) is not None:
+                    try:
+                        self.growth_controllers[i].update(cm._last_routing_probs)
+                    except Exception:
+                        pass
         
         causal_latent_patches = torch.cat([self.sos_patch.expand(B, 1, -1), h_latent[:, :-1]], dim=1)
         logits = self.byte_decoder(h_byte, causal_latent_patches, patch_assignments)
@@ -191,10 +242,30 @@ class TorosHybridLanguageModel(nn.Module):
         if targets is not None:
             loss_gen = F.cross_entropy(logits.view(-1, 256), targets.view(-1))
             loss_unl = self._unlikelihood_loss(logits, targets)
+            rls_loss = None
+            if getattr(self.config, 'use_rls_heads', False) and hasattr(self, 'rls_heads'):
+                rls_terms = []
+                for h, rls_head in zip(hiddens, self.rls_heads):
+                    Mh = h.shape[1]
+                    pt = targets[:, ::self.config.target_patch_size][:, :Mh]
+                    if pt.shape[1] < Mh:
+                        pad = torch.full((pt.shape[0], Mh - pt.shape[1]), -100, device=pt.device, dtype=pt.dtype)
+                        pt = torch.cat([pt, pad], dim=1)
+                    elif pt.shape[1] > Mh:
+                        pt = pt[:, :Mh]
+                    logits_rls, _ = rls_head(h)
+                    rls_terms.append(F.cross_entropy(logits_rls.view(-1, 256), pt.view(-1), ignore_index=-100))
+                    if self.training:
+                        rls_head.update(h.detach(), pt)
+                if rls_terms:
+                    rls_loss = torch.stack(rls_terms).mean()
             loss = loss_gen
             if self.config.unlikelihood_weight > 0.0:
                 loss = loss + self.config.unlikelihood_weight * loss_unl
                 metrics["loss_unl"] = loss_unl.detach().item()
+            if rls_loss is not None:
+                loss = loss + self.config.rls_weight * rls_loss
+                metrics["loss_rls"] = rls_loss.detach().item()
             metrics.update({
                 "loss_total": loss.item(),
                 "loss_gen": loss_gen.item(),
@@ -358,10 +429,16 @@ class TorosHybridLanguageModel(nn.Module):
         raw = self.state_dict()
         clean = {}
         for k, v in raw.items():
-            if k.startswith("target_encoder") or k.startswith("local_heads") or k.startswith("predictor") or k.startswith("mask_token"):
+            if k.startswith("target_encoder") or k.startswith("local_heads") or k.startswith("predictor") or k.startswith("mask_token") or k.startswith("rls_heads") or k.startswith("type_codebook") or k.startswith("growth_controllers"):
                 continue
             clean[k] = v
         return clean
+
+    def rank_candidates_by_info_gain(self, candidates: list) -> list:
+        if not getattr(self.config, 'use_rls_heads', False) or not hasattr(self, 'rls_heads'):
+            raise RuntimeError("use_rls_heads must be enabled for info-gain ranking")
+        from affine_ai.core.type_codebook import rank_windows_by_info_gain
+        return rank_windows_by_info_gain(self.rls_heads[0], candidates)
 
     def save_inference_checkpoint(self, save_path: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         clean_state = self.export_inference_state_dict()

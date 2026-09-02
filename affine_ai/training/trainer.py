@@ -152,8 +152,11 @@ class ASDAGTrainer:
         if high <= 0:
             raise ValueError(f"Dataset too small ({len(data)}) for seq_len {self.seq_len}")
         ix = torch.randint(0, high, (self.batch_size,))
-        x = torch.stack([data[i:i+self.seq_len] for i in ix]).to(self.device)
-        y = torch.stack([data[i+1:i+self.seq_len+1] for i in ix]).to(self.device)
+        offsets = torch.arange(self.seq_len, device=ix.device)
+        idx = ix.unsqueeze(1) + offsets.unsqueeze(0)
+        idx_next = idx + 1
+        x = data[idx].to(self.device)
+        y = data[idx_next].to(self.device)
         return x, y
 
     def get_lr(self, step: int) -> float:

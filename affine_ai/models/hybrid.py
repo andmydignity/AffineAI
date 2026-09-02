@@ -17,6 +17,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    _COMPILE = hasattr(torch, "compile")
+except Exception:
+    _COMPILE = False
+
 from affine_ai.core.ast_dag import ASDAGConfig
 from affine_ai.core.norm import RMSNorm
 from affine_ai.models.blt import ByteLocalEncoder, EntropyPatcher, ByteLocalDecoder
@@ -53,6 +58,7 @@ class TorosHybridConfig:
     dynamic_boundary_weight: float = 0.1
     use_mtp: bool = False
     num_mtp_heads: int = 2
+    compile_forward: bool = False
     mtp_lambda: float = 0.3
     dtype: Any = torch.float32
 
@@ -145,6 +151,11 @@ class TorosHybridLanguageModel(nn.Module):
         
         if self.config.dtype is not None and self.config.dtype != torch.float32:
             self.to(self.config.dtype)
+        if getattr(self.config, 'compile_forward', False) and _COMPILE:
+            try:
+                self.forward = torch.compile(self.forward, mode="max-autotune", dynamic=False)  # type: ignore[method-assign]
+            except Exception:
+                pass
 
     def get_default_optimizers(
         self,
@@ -233,28 +244,33 @@ class TorosHybridLanguageModel(nn.Module):
         B, T = byte_ids.shape
         h_byte, boundary_logits = self.context_encoder.byte_encoder(byte_ids)
         if getattr(self.config, 'dynamic_patching', False):
-            P = self.config.target_patch_size
-            M = (T + P - 1) // P
-            p = torch.sigmoid(boundary_logits)
-            if M > 1:
-                _, top_idx = torch.topk(p[:, :-1], k=M - 1, dim=1)
-                top_idx_sorted, _ = torch.sort(top_idx, dim=1)
-                cuts = torch.cat([top_idx_sorted, torch.full((B, 1), T - 1, device=p.device, dtype=top_idx.dtype)], dim=1)
+            if self.training:
+                latent_patches, patch_assignments = self.context_encoder.patcher(
+                    h_byte, torch.zeros_like(boundary_logits), fixed_patch_size=self.config.target_patch_size
+                )
             else:
-                cuts = torch.full((B, 1), T - 1, device=p.device, dtype=torch.long)
-            t_idx = torch.arange(T, device=p.device).view(1, 1, T).expand(B, M, T)
-            cuts_exp = cuts.unsqueeze(2).expand(B, M, T)
-            patch_assignments = (cuts_exp < t_idx).sum(dim=1).clamp(max=M - 1)
-            assign_exp = patch_assignments.unsqueeze(-1).expand(-1, -1, h_byte.shape[-1])
-            pooled = torch.zeros(B, M, h_byte.shape[-1], device=h_byte.device, dtype=torch.float32)
-            pooled.scatter_add_(1, assign_exp, h_byte.float())
-            counts = torch.zeros(B, M, 1, device=h_byte.device, dtype=torch.float32)
-            counts.scatter_add_(1, patch_assignments.unsqueeze(-1), torch.ones(B, T, 1, device=h_byte.device, dtype=torch.float32))
-            pooled = pooled / counts.clamp(min=1)
-            proj_dtype = self.context_encoder.patcher.patch_proj.weight.dtype
-            latent_patches = self.context_encoder.patcher.patch_norm(
-                self.context_encoder.patcher.patch_proj(pooled.to(proj_dtype))
-            )
+                P = self.config.target_patch_size
+                M = (T + P - 1) // P
+                p = torch.sigmoid(boundary_logits)
+                if M > 1:
+                    _, top_idx = torch.topk(p[:, :-1], k=M - 1, dim=1)
+                    top_idx_sorted, _ = torch.sort(top_idx, dim=1)
+                    cuts = torch.cat([top_idx_sorted, torch.full((B, 1), T - 1, device=p.device, dtype=top_idx.dtype)], dim=1)
+                else:
+                    cuts = torch.full((B, 1), T - 1, device=p.device, dtype=torch.long)
+                t_idx = torch.arange(T, device=p.device).view(1, 1, T).expand(B, M, T)
+                cuts_exp = cuts.unsqueeze(2).expand(B, M, T)
+                patch_assignments = (cuts_exp < t_idx).sum(dim=1).clamp(max=M - 1)
+                assign_exp = patch_assignments.unsqueeze(-1).expand(-1, -1, h_byte.shape[-1])
+                pooled = torch.zeros(B, M, h_byte.shape[-1], device=h_byte.device, dtype=torch.float32)
+                pooled.scatter_add_(1, assign_exp, h_byte.float())
+                counts = torch.zeros(B, M, 1, device=h_byte.device, dtype=torch.float32)
+                counts.scatter_add_(1, patch_assignments.unsqueeze(-1), torch.ones(B, T, 1, device=h_byte.device, dtype=torch.float32))
+                pooled = pooled / counts.clamp(min=1)
+                proj_dtype = self.context_encoder.patcher.patch_proj.weight.dtype
+                latent_patches = self.context_encoder.patcher.patch_norm(
+                    self.context_encoder.patcher.patch_proj(pooled.to(proj_dtype))
+                )
         else:
             latent_patches, patch_assignments = self.context_encoder.patcher(
                 h_byte, torch.zeros_like(boundary_logits), fixed_patch_size=self.config.target_patch_size
@@ -320,7 +336,7 @@ class TorosHybridLanguageModel(nn.Module):
             if rls_loss is not None:
                 loss = loss + self.config.rls_weight * rls_loss
                 metrics["loss_rls"] = rls_loss.detach().item()
-            if getattr(self.config, 'dynamic_patching', False):
+            if getattr(self.config, 'dynamic_patching', False) and not self.training:
                 with torch.no_grad():
                     per_byte_ce = F.cross_entropy(logits.reshape(-1, 256), targets.reshape(-1), reduction='none').view(B, T)
                     thresh = torch.quantile(per_byte_ce, 0.7, dim=1, keepdim=True)

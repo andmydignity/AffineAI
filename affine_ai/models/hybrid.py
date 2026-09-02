@@ -345,12 +345,35 @@ class TorosHybridLanguageModel(nn.Module):
         hist = gen_state["conv_hist"]
         K = enc.kernel_size
         h_pre_rows = torch.cat([hist, x_new], dim=1)
-        x_conv = F.conv1d(
-            h_pre_rows.transpose(1, 2), enc.conv.weight, enc.conv.bias,
-            padding=K - 1, groups=enc.conv.groups
-        ).transpose(1, 2)
-        x_conv = x_conv[:, hist.shape[1] : hist.shape[1] + T]              # [B, T, d_byte]
-        h_pre = x_new + x_conv
+        # Tier-1 fused depthwise conv for T==1 (sampling hot path): avoids
+        # F.conv1d + two transposes + padding alloc. Equivalent to causal
+        # depthwise conv with left-pad K-1 zeros; matches ByteLocalEncoder
+        # semantics where w[K-1] is most-recent.
+        if T == 1 and K <= 8 and h_pre_rows.shape[1] <= 512:
+            L = h_pre_rows.shape[1]
+            w = enc.conv.weight.squeeze(1)  # [d_byte, K]
+            if L >= K:
+                window = h_pre_rows[:, L - K :]  # [B, K, d_byte] oldest->newest
+            else:
+                pad_len = K - L
+                window = torch.cat(
+                    [h_pre_rows.new_zeros((B, pad_len, d_byte), dtype=h_pre_rows.dtype), h_pre_rows],
+                    dim=1,
+                )
+            # x_conv[b,d] = sum_k window[b,k,d] * w[d,k]
+            # Use float for bfloat16 stability, keep original dtype for output
+            x_conv_1 = torch.einsum("bkd,dk->bd", window.float(), w.float())
+            if enc.conv.bias is not None:
+                x_conv_1 = x_conv_1 + enc.conv.bias.float()
+            x_conv = x_conv_1.to(x_new.dtype).unsqueeze(1)  # [B, 1, d_byte]
+            h_pre = x_new + x_conv
+        else:
+            x_conv = F.conv1d(
+                h_pre_rows.transpose(1, 2), enc.conv.weight, enc.conv.bias,
+                padding=K - 1, groups=enc.conv.groups
+            ).transpose(1, 2)
+            x_conv = x_conv[:, hist.shape[1] : hist.shape[1] + T]              # [B, T, d_byte]
+            h_pre = x_new + x_conv
         rms = torch.rsqrt(h_pre.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5)
         h_norm = (h_pre.float() * rms) * enc.norm.scale.float()
         h_byte_new = F.silu(F.linear(h_norm, enc.proj.weight.float(), enc.proj.bias))
@@ -444,15 +467,20 @@ class TorosHybridLanguageModel(nn.Module):
         eos_byte: Optional[int] = 0,
         generator: Optional[torch.Generator] = None
     ) -> torch.Tensor:
-        curr = prompt_bytes.clone()
+        B = prompt_bytes.shape[0]
+        prompt_len = prompt_bytes.shape[1]
+        out = torch.empty(
+            B, prompt_len + max_new_bytes, dtype=prompt_bytes.dtype, device=prompt_bytes.device
+        )
+        out[:, :prompt_len] = prompt_bytes
 
-        gen_state = None
-        _, gen_state = self.forward_incremental(curr, gen_state=None, return_state=True)
+        _, gen_state = self.forward_incremental(out[:, :prompt_len], gen_state=None, return_state=True)
 
-        generated = 0
-        finished = torch.zeros(curr.size(0), 1, dtype=torch.bool, device=curr.device)
-        while generated < max_new_bytes:
-            logits, gen_state = self.forward_incremental(curr[:, -1:], gen_state, return_state=True)
+        pos = prompt_len
+        end = prompt_len + max_new_bytes
+        finished = torch.zeros(B, 1, dtype=torch.bool, device=prompt_bytes.device)
+        while pos < end:
+            logits, gen_state = self.forward_incremental(out[:, pos - 1 : pos], gen_state, return_state=True)
             last_logits = logits[:, -1, :]
 
             next_byte = self._sample_next_byte(last_logits, temperature, top_k, top_p, generator)
@@ -460,12 +488,12 @@ class TorosHybridLanguageModel(nn.Module):
                 next_byte = torch.where(finished, torch.full_like(next_byte, eos_byte), next_byte)
                 finished = finished | (next_byte == eos_byte)
 
-            curr = torch.cat([curr, next_byte], dim=1)
-            generated += 1
+            out[:, pos : pos + 1] = next_byte
+            pos += 1
             if eos_byte is not None and finished.all():
                 break
 
-        return curr
+        return out[:, :pos]
 
     def export_inference_state_dict(self) -> Dict[str, torch.Tensor]:
         raw = self.state_dict()

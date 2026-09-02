@@ -43,29 +43,43 @@ class LatentTypeCodebook(nn.Module):
 
     @torch.no_grad()
     def update(self, latents: torch.Tensor):
-        """Online update: EMA means, stick-breaking birth for far latents."""
         flat = latents.detach().reshape(-1, self.dim)
         active = int(self.num_types.item())
         if active == 0:
             return
         dists = torch.cdist(flat.float(), self.means[:active].float())
         min_dist, nearest = dists.min(dim=-1)
-        # Birth: far latents spawn new type if room
-        for i in range(flat.shape[0]):
-            if min_dist[i].item() > self.birth_threshold and active < self.max_types:
-                self.means[active] = flat[i]
+        birth_mask = (min_dist > self.birth_threshold) & (active < self.max_types)
+        if birth_mask.any():
+            birth_idx = torch.where(birth_mask)[0]
+            n_birth = min(int(birth_mask.sum().item()), self.max_types - active)
+            for j in range(n_birth):
+                idx = int(birth_idx[j].item())
+                self.means[active] = flat[idx]
                 self.counts[active] = 1.0
                 active += 1
-                self.num_types.fill_(active)
-                # recompute dists after birth (simple: continue)
+            self.num_types.fill_(active)
+            if n_birth > 0 and n_birth < flat.shape[0]:
                 dists = torch.cdist(flat.float(), self.means[:active].float())
                 min_dist, nearest = dists.min(dim=-1)
-            else:
-                k = int(nearest[i].item())
-                self.counts[k] += 1
-                n = self.counts[k].item()
-                lr = 1.0 / n
-                self.means[k] = (1 - lr) * self.means[k] + lr * flat[i]
+                birth_mask = torch.zeros_like(birth_mask)
+        mask = ~birth_mask
+        if mask.any():
+            flat_rem = flat[mask]
+            nearest_rem = nearest[mask]
+            for k in range(active):
+                sel = nearest_rem == k
+                if not sel.any():
+                    continue
+                cnt_add = int(sel.sum().item())
+                sum_k = flat_rem[sel].sum(dim=0)
+                old_c = float(self.counts[k].item())
+                new_c = old_c + cnt_add
+                if old_c == 0:
+                    self.means[k] = sum_k / cnt_add
+                else:
+                    self.means[k] = (self.means[k] * old_c + sum_k) / new_c
+                self.counts[k] = new_c
 
     @torch.no_grad()
     def bmr_merge(self) -> int:
@@ -90,21 +104,17 @@ class LatentTypeCodebook(nn.Module):
             return 0
         self.means[a] = (ca * self.means[a] + cb * self.means[b]) / (ca + cb)
         self.counts[a] = ca + cb
-        # Shift down types after b
-        for k in range(b, active - 1):
-            self.means[k] = self.means[k + 1]
-            self.counts[k] = self.counts[k + 1]
+        if b < active - 1:
+            self.means[b : active - 1] = self.means[b + 1 : active].clone()
+            self.counts[b : active - 1] = self.counts[b + 1 : active].clone()
         self.means[active - 1].zero_()
         self.counts[active - 1] = 0
         self.num_types.fill_(active - 1)
-        # Merge embeddings similarly (zero-init so merging is trivial, but keep consistent)
         with torch.no_grad():
             w = self.embedding.weight
-            # Move b's embedding into a's slot via average (zero-init -> still zero)
             w[a] = (w[a] * ca + w[b] * cb) / (ca + cb) if (ca + cb) > 0 else w[a]
-            # Shift
-            for k in range(b, active - 1):
-                w[k] = w[k + 1]
+            if b < active - 1:
+                w[b : active - 1] = w[b + 1 : active].clone()
             w[active - 1].zero_()
         return 1
 

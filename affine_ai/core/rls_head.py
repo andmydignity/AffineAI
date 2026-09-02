@@ -70,22 +70,18 @@ class RLSPredictiveHead(nn.Module):
         tgt = tgt[valid]
         N = h_n.shape[0]
         lam = self.forgetting
-        # Iterate rows (sequential dependency on P); chunk to bound python overhead
+        # Iterate rows (sequential dependency on P); keep on device, avoid .item() host sync
         for i in range(N):
-            x = h_n[i]  # [d]
-            y_idx = int(tgt[i].item())
-            # Gain k = P x / (lam + x^T P x)
-            Px = self.P @ x  # [d]
-            denom = lam + (x @ Px).item()
-            k = Px / denom  # [d]
-            # Prediction error (one-hot regression)
-            pred = self.weight.float() @ x  # [vocab]
+            x = h_n[i]
+            y_idx = tgt[i]
+            Px = self.P @ x
+            denom = lam + (x @ Px)
+            k = Px / denom
+            pred = self.weight.float() @ x
             y_onehot = torch.zeros_like(pred)
-            y_onehot[y_idx] = 1.0
-            err = y_onehot - pred  # [vocab]
-            # Rank-1 update of W
+            y_onehot.scatter_(0, y_idx.unsqueeze(0), 1.0)
+            err = y_onehot - pred
             self.weight.data.add_(torch.outer(err, k).to(self.weight.dtype))
-            # Joseph-lite update of P
             self.P.sub_(torch.outer(k, x @ self.P))
             self.P.div_(lam)
             self._updates += 1

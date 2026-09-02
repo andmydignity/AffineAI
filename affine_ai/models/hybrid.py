@@ -198,20 +198,27 @@ class TorosHybridLanguageModel(nn.Module):
         for k in range(1, n):
             prev[:, k:, n - 1 - k] = targets[:, :T - k]
 
-        repeat = torch.zeros(B, T, dtype=torch.bool, device=logits.device)
         valid_head = torch.arange(T, device=logits.device) >= n - 1
-        for dt in range(1, W):
-            src = torch.clamp(torch.arange(T, device=logits.device) - dt, min=0)
-            prev_shift = prev[:, src]
-            match = (prev_shift == prev).all(dim=-1) & valid_head
-            repeat |= match
+        if W > 1 and T > n:
+            Wm1 = W - 1
+            idx = torch.arange(T, device=logits.device).unsqueeze(0) - torch.arange(1, W, device=logits.device).unsqueeze(1)
+            idx = idx.clamp(min=0)
+            D = n - 1
+            idx_exp = idx.unsqueeze(0).unsqueeze(0).expand(B, D, -1, -1)
+            prev_t = prev.permute(0, 2, 1)
+            prev_t_exp = prev_t.unsqueeze(2).expand(-1, -1, Wm1, -1)
+            prev_shift = torch.gather(prev_t_exp, dim=3, index=idx_exp).permute(0, 2, 3, 1)
+            match = (prev_shift == prev.unsqueeze(1)).all(dim=-1)
+            repeat = match.any(dim=1) & valid_head
+        else:
+            repeat = torch.zeros(B, T, dtype=torch.bool, device=logits.device)
 
         repeat &= (prev[:, :, 0] >= 0)
 
-        logprobs = F.log_softmax(logits.view(-1, V).float(), dim=-1)
-        p_tgt = logprobs.gather(1, targets.view(-1).unsqueeze(1)).squeeze(1).exp()
+        logprobs = F.log_softmax(logits.reshape(-1, V).float(), dim=-1)
+        p_tgt = logprobs.gather(1, targets.reshape(-1).unsqueeze(1)).squeeze(1).exp()
         one_minus = (1.0 - p_tgt).clamp(min=1e-6)
-        ul = -one_minus.log().view(B, T) * repeat.float()
+        ul = -one_minus.log().reshape(B, T) * repeat.float()
         n_flag = repeat.sum()
         if n_flag == 0:
             return logits.new_zeros(())
@@ -229,30 +236,25 @@ class TorosHybridLanguageModel(nn.Module):
             P = self.config.target_patch_size
             M = (T + P - 1) // P
             p = torch.sigmoid(boundary_logits)
-            pooled_list = []
-            assign_list = []
-            for b in range(B):
-                if M > 1:
-                    _, top_idx = torch.topk(p[b, :-1], k=M-1)
-                    cuts = sorted(top_idx.tolist() + [T-1])
-                else:
-                    cuts = [T-1]
-                pooled_b = []
-                assign_b = torch.zeros(T, dtype=torch.long, device=p.device)
-                start = 0
-                for patch_idx, end in enumerate(cuts):
-                    end = end + 1
-                    pooled_patch = h_byte[b, start:end].mean(dim=0, keepdim=True)
-                    proj = self.context_encoder.patcher.patch_proj(pooled_patch.to(self.context_encoder.patcher.patch_proj.weight.dtype))
-                    pooled_b.append(proj)
-                    assign_b[start:end] = patch_idx
-                    start = end
-                pooled_b = torch.cat(pooled_b, dim=0)
-                normed_b = self.context_encoder.patcher.patch_norm(pooled_b)
-                pooled_list.append(normed_b)
-                assign_list.append(assign_b)
-            latent_patches = torch.stack(pooled_list, dim=0)
-            patch_assignments = torch.stack(assign_list, dim=0)
+            if M > 1:
+                _, top_idx = torch.topk(p[:, :-1], k=M - 1, dim=1)
+                top_idx_sorted, _ = torch.sort(top_idx, dim=1)
+                cuts = torch.cat([top_idx_sorted, torch.full((B, 1), T - 1, device=p.device, dtype=top_idx.dtype)], dim=1)
+            else:
+                cuts = torch.full((B, 1), T - 1, device=p.device, dtype=torch.long)
+            t_idx = torch.arange(T, device=p.device).view(1, 1, T).expand(B, M, T)
+            cuts_exp = cuts.unsqueeze(2).expand(B, M, T)
+            patch_assignments = (cuts_exp < t_idx).sum(dim=1).clamp(max=M - 1)
+            assign_exp = patch_assignments.unsqueeze(-1).expand(-1, -1, h_byte.shape[-1])
+            pooled = torch.zeros(B, M, h_byte.shape[-1], device=h_byte.device, dtype=torch.float32)
+            pooled.scatter_add_(1, assign_exp, h_byte.float())
+            counts = torch.zeros(B, M, 1, device=h_byte.device, dtype=torch.float32)
+            counts.scatter_add_(1, patch_assignments.unsqueeze(-1), torch.ones(B, T, 1, device=h_byte.device, dtype=torch.float32))
+            pooled = pooled / counts.clamp(min=1)
+            proj_dtype = self.context_encoder.patcher.patch_proj.weight.dtype
+            latent_patches = self.context_encoder.patcher.patch_norm(
+                self.context_encoder.patcher.patch_proj(pooled.to(proj_dtype))
+            )
         else:
             latent_patches, patch_assignments = self.context_encoder.patcher(
                 h_byte, torch.zeros_like(boundary_logits), fixed_patch_size=self.config.target_patch_size
@@ -320,11 +322,9 @@ class TorosHybridLanguageModel(nn.Module):
                 metrics["loss_rls"] = rls_loss.detach().item()
             if getattr(self.config, 'dynamic_patching', False):
                 with torch.no_grad():
-                    per_byte_ce = F.cross_entropy(logits.view(-1, 256), targets.view(-1), reduction='none').view(B, T)
-                    boundary_target = torch.zeros_like(boundary_logits)
-                    for b in range(B):
-                        thresh = torch.quantile(per_byte_ce[b], 0.7)
-                        boundary_target[b] = (per_byte_ce[b] > thresh).float()
+                    per_byte_ce = F.cross_entropy(logits.reshape(-1, 256), targets.reshape(-1), reduction='none').view(B, T)
+                    thresh = torch.quantile(per_byte_ce, 0.7, dim=1, keepdim=True)
+                    boundary_target = (per_byte_ce > thresh).float()
                 bce = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
                 loss = loss + self.config.dynamic_boundary_weight * bce
                 metrics["loss_boundary"] = bce.detach().item()

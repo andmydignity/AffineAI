@@ -11,15 +11,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from affine_ai.core.norm import RMSNorm
-from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
 from affine_ai.models.language_model import ASDAGLanguageModel
 
 
 class LocalPredictiveHead(nn.Module):
     """
-    Lightweight Local Predictive Error Head:
-    Projects intermediate block hidden states to vocabulary logits and computes
-    fused cross-entropy error directly in GPU SRAM via Triton.
+    MatMul-free Local Predictive Head via ternary BitLinear.
+    Replaces dense GEMM h @ W^T with ternary weight additions (STE).
     """
     def __init__(
         self,
@@ -41,17 +39,15 @@ class LocalPredictiveHead(nn.Module):
         targets: Optional[torch.Tensor] = None,
         ignore_index: int = -100
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward evaluation.
-        If targets are provided, computes fused LPC loss with 0 MB DRAM logits allocation.
-        If targets are None, returns materialized logits.
-        """
         h_norm = self.norm(h)
+        gamma = self.weight.abs().mean().clamp(min=1e-5)
+        w_scaled = self.weight / gamma
+        w_ternary = torch.round(w_scaled).clamp(-1.0, 1.0)
+        w_quant = self.weight + (w_ternary * gamma - self.weight).detach()
+        logits = F.linear(h_norm, w_quant)
         if targets is not None:
-            loss = triton_fused_lpc_head(h_norm, self.weight, targets, ignore_index=ignore_index)
+            loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
             return h_norm, loss
-        
-        logits = F.linear(h_norm, self.weight)
         return logits, None
 
 

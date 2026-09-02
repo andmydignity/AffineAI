@@ -63,7 +63,7 @@ def test_hybrid_generation():
     model = TorosHybridLanguageModel(config)
     
     prompt = torch.tensor([[ord('O'), ord('n'), ord('c'), ord('e')]], dtype=torch.long)
-    out = model.generate_with_latent_planning(prompt, max_new_bytes=10)
+    out = model.generate_with_latent_planning(prompt, max_new_bytes=10, temperature=0.0, eos_byte=None)
     
     assert out.shape[1] == 14
 

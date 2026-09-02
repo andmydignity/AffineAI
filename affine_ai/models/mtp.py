@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from affine_ai.core.bitlinear import BitLinear
 from affine_ai.core.norm import RMSNorm
 
 
@@ -31,9 +32,9 @@ class ASDAGMTPHead(nn.Module):
         super().__init__()
         self.k_offset = k_offset
         self.norm = RMSNorm(d_model)
-        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.proj = BitLinear(d_model, d_model, bias=False, dtype=dtype)
         self.norm_out = RMSNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head = BitLinear(d_model, vocab_size, bias=False, dtype=dtype)
         
         # Initialize weights
         nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)

@@ -34,10 +34,10 @@ class BitLinear(nn.Module):
                 from affine_ai.core.cpp_ops import asdag_cpu_bitlinear_ternary_int
                 gamma = self.weight.abs().mean().clamp(min=1e-5)
                 w_ternary = torch.round(self.weight / gamma).clamp(-1.0, 1.0)
-                orig_shape = x.shape
+                out_shape = x.shape[:-1] + (self.out_features,)
                 x_flat = x.reshape(-1, x.shape[-1])
                 out = asdag_cpu_bitlinear_ternary_int(x_flat, w_ternary, gamma.item(), self.bias)
-                return out.to(x.dtype).reshape(*orig_shape)
+                return out.to(x.dtype).reshape(out_shape)
             from affine_ai.core.cpp_ops import asdag_cpu_bitlinear
             return asdag_cpu_bitlinear(x, self.weight, self.bias)
 

@@ -47,7 +47,10 @@ class RLSPredictiveHead(nn.Module):
         ignore_index: int = -100,
     ):
         h_n = self.norm(h)
-        logits = F.linear(h_n.to(self.weight.dtype), self.weight)
+        gamma = self.weight.abs().mean().clamp(min=1e-5)
+        w_ternary = torch.round(self.weight / gamma).clamp(-1.0, 1.0)
+        w_quant = self.weight + (w_ternary * gamma - self.weight).detach()
+        logits = F.linear(h_n.to(self.weight.dtype), w_quant)
         if targets is None:
             return logits, None
         # Masked CE, ignore_index rows excluded from loss (but h shape unchanged)

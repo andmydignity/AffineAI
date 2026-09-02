@@ -65,6 +65,6 @@ def test_full_option_b_language_model():
     logits = model(x)
     assert logits.shape == (2, 16, 256)
 
-    # Test O(1) step generation
-    gen = model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=5)
+    # Test O(1) step generation (deterministic, no EOS early stop)
+    gen = model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=5, temperature=0.0, eos_byte=None)
     assert gen.shape == (1, 8)

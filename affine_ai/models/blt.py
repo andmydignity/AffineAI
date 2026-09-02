@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from affine_ai.core.ast_dag import ASDAGConfig
+from affine_ai.core.bitlinear import BitLinear
 from affine_ai.core.norm import RMSNorm
 from affine_ai.models.language_model import ASDAGBlock
 
@@ -42,8 +43,8 @@ class ByteLocalEncoder(nn.Module):
             groups=d_byte
         )
         self.norm = RMSNorm(d_byte)
-        self.proj = nn.Linear(d_byte, d_byte, bias=False)
-        self.boundary_predictor = nn.Linear(d_byte, 1, bias=True)
+        self.proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
+        self.boundary_predictor = BitLinear(d_byte, 1, bias=True, dtype=dtype)
         if dtype is not None and dtype != torch.float32:
             self.to(dtype)
 
@@ -105,7 +106,7 @@ class EntropyPatcher(nn.Module):
         self.min_patch_size = min_patch_size
         self.target_patch_size = target_patch_size
         
-        self.patch_proj = nn.Linear(d_byte, d_model, bias=False)
+        self.patch_proj = BitLinear(d_byte, d_model, bias=False, dtype=dtype)
         self.patch_norm = RMSNorm(d_model)
         if dtype is not None and dtype != torch.float32:
             self.to(dtype)
@@ -168,17 +169,17 @@ class ByteLocalDecoder(nn.Module):
         self.d_byte = d_byte
         self.d_model = d_model
         
-        self.patch_to_byte = nn.Linear(d_model, d_byte, bias=False)
-        self.fusion = nn.Linear(2 * d_byte, d_byte, bias=False)
+        self.patch_to_byte = BitLinear(d_model, d_byte, bias=False, dtype=dtype)
+        self.fusion = BitLinear(2 * d_byte, d_byte, bias=False, dtype=dtype)
         self.norm1 = RMSNorm(d_byte)
         
         # Layer 2: Residual Gated SwiGLU Block
-        self.gate_proj = nn.Linear(d_byte, d_byte, bias=False)
-        self.val_proj = nn.Linear(d_byte, d_byte, bias=False)
-        self.down_proj = nn.Linear(d_byte, d_byte, bias=False)
+        self.gate_proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
+        self.val_proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
+        self.down_proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
         self.norm2 = RMSNorm(d_byte)
         
-        self.lm_head = nn.Linear(d_byte, vocab_size, bias=False)
+        self.lm_head = BitLinear(d_byte, vocab_size, bias=False, dtype=dtype)
         if dtype is not None and dtype != torch.float32:
             self.to(dtype)
 

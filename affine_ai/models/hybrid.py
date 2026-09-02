@@ -51,6 +51,9 @@ class TorosHybridConfig:
     use_info_gain: bool = True
     dynamic_patching: bool = True
     dynamic_boundary_weight: float = 0.1
+    use_mtp: bool = False
+    num_mtp_heads: int = 2
+    mtp_lambda: float = 0.3
     dtype: Any = torch.float32
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
@@ -130,6 +133,15 @@ class TorosHybridLanguageModel(nn.Module):
                 )
                 for _ in range(self.config.n_encoder_layers)
             ]
+        if getattr(self.config, 'use_mtp', False):
+            from affine_ai.models.mtp import ASDAGMTPModule
+            self.mtp = ASDAGMTPModule(
+                d_model=self.config.d_byte,
+                vocab_size=256,
+                num_mtp_heads=getattr(self.config, 'num_mtp_heads', 2),
+                mtp_lambda=getattr(self.config, 'mtp_lambda', 0.3),
+                dtype=self.config.dtype,
+            )
         
         if self.config.dtype is not None and self.config.dtype != torch.float32:
             self.to(self.config.dtype)
@@ -165,6 +177,8 @@ class TorosHybridLanguageModel(nn.Module):
             optimizers.append(torch.optim.AdamW(layer_params, lr=lr, weight_decay=weight_decay))
 
         tail_params = list(self.byte_decoder.parameters()) + [self.sos_patch]
+        if hasattr(self, 'mtp'):
+            tail_params += list(self.mtp.parameters())
         optimizers.append(torch.optim.AdamW(tail_params, lr=lr, weight_decay=weight_decay))
         return optimizers
 
@@ -266,7 +280,13 @@ class TorosHybridLanguageModel(nn.Module):
                         pass
         
         causal_latent_patches = torch.cat([self.sos_patch.expand(B, 1, -1), h_latent[:, :-1]], dim=1)
-        logits = self.byte_decoder(h_byte, causal_latent_patches, patch_assignments)
+        h_decoded_for_mtp = None
+        if getattr(self.config, 'use_mtp', False) and hasattr(self, 'mtp'):
+            logits, h_decoded_for_mtp = self.byte_decoder(
+                h_byte, causal_latent_patches, patch_assignments, return_hidden=True
+            )
+        else:
+            logits = self.byte_decoder(h_byte, causal_latent_patches, patch_assignments)
         
         loss = None
         metrics = {}
@@ -308,6 +328,12 @@ class TorosHybridLanguageModel(nn.Module):
                 bce = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
                 loss = loss + self.config.dynamic_boundary_weight * bce
                 metrics["loss_boundary"] = bce.detach().item()
+            if getattr(self.config, 'use_mtp', False) and hasattr(self, 'mtp') and h_decoded_for_mtp is not None:
+                _, mtp_loss, mtp_dict = self.mtp(h_decoded_for_mtp, targets=targets)
+                if mtp_loss is not None:
+                    loss = loss + mtp_loss
+                    metrics.update({k: float(v) for k, v in mtp_dict.items()})
+                    metrics["loss_mtp"] = float(mtp_loss.detach().item())
             metrics.update({
                 "loss_total": loss.item(),
                 "loss_gen": loss_gen.item(),
@@ -321,7 +347,8 @@ class TorosHybridLanguageModel(nn.Module):
         self,
         byte_ids: torch.Tensor,
         gen_state: Optional[Dict[str, Any]] = None,
-        return_state: bool = False
+        return_state: bool = False,
+        return_hidden: bool = False
     ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
         B, T = byte_ids.shape
         assert T >= 1
@@ -423,6 +450,11 @@ class TorosHybridLanguageModel(nn.Module):
             else self.sos_patch.expand(B, 1, -1)
         )                                                                   # [B, M+1, dim]
         pa = j.clamp(max=grid.shape[1] - 1).unsqueeze(0).expand(B, T).contiguous()
+        if return_hidden:
+            logits, h_decoded = self.byte_decoder(h_byte_new, grid, pa, return_hidden=True)
+            if return_state:
+                return logits, h_decoded, gen_state
+            return logits, h_decoded, None
         logits = self.byte_decoder(h_byte_new, grid, pa)
         if return_state:
             return logits, gen_state
@@ -493,6 +525,113 @@ class TorosHybridLanguageModel(nn.Module):
             if eos_byte is not None and finished.all():
                 break
 
+        return out[:, :pos]
+
+    def _clone_gen_state(self, gen_state: Dict[str, Any]) -> Dict[str, Any]:
+        cloned: Dict[str, Any] = {}
+        for k, v in gen_state.items():
+            if isinstance(v, torch.Tensor):
+                cloned[k] = v.clone()
+            elif isinstance(v, list):
+                nl = []
+                for item in v:
+                    if isinstance(item, dict) and item is not None:
+                        nl.append({ik: iv.clone() if isinstance(iv, torch.Tensor) else iv for ik, iv in item.items()})
+                    elif isinstance(item, torch.Tensor):
+                        nl.append(item.clone())
+                    else:
+                        nl.append(item)
+                cloned[k] = nl
+            else:
+                cloned[k] = v
+        return cloned
+
+    @torch.no_grad()
+    def generate_speculative(
+        self,
+        prompt_bytes: torch.Tensor,
+        max_new_bytes: int = 250,
+        draft_k: int = 4,
+        temperature: float = 0.7,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = 0.9,
+        eos_byte: Optional[int] = 0,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        B = prompt_bytes.shape[0]
+        prompt_len = prompt_bytes.shape[1]
+        use_mtp = getattr(self.config, 'use_mtp', False) and hasattr(self, 'mtp')
+        if B != 1 or not use_mtp or draft_k <= 1:
+            return self.generate_with_latent_planning(
+                prompt_bytes, max_new_bytes, temperature=temperature, top_k=top_k, top_p=top_p, eos_byte=eos_byte, generator=generator
+            )
+        out = torch.empty(B, prompt_len + max_new_bytes, dtype=prompt_bytes.dtype, device=prompt_bytes.device)
+        out[:, :prompt_len] = prompt_bytes
+        logits, h_decoded, gen_state = self.forward_incremental(
+            out[:, :prompt_len], gen_state=None, return_state=True, return_hidden=True
+        )
+        cur_logits = logits[:, -1:, :]
+        cur_h = h_decoded[:, -1:, :]
+        pos = prompt_len
+        end = prompt_len + max_new_bytes
+        finished = torch.zeros(B, 1, dtype=torch.bool, device=prompt_bytes.device)
+        while pos < end:
+            remaining = end - pos
+            k = min(draft_k, remaining)
+            mtp_logits_list, _, _ = self.mtp(cur_h)
+            draft_tokens = []
+            first_tok = self._sample_next_byte(cur_logits[:, -1, :], temperature, top_k, top_p, generator)
+            draft_tokens.append(first_tok)
+            for i in range(min(k - 1, len(mtp_logits_list))):
+                tok = self._sample_next_byte(mtp_logits_list[i][:, -1, :], temperature, top_k, top_p, generator)
+                draft_tokens.append(tok)
+            while len(draft_tokens) < k:
+                tok = self._sample_next_byte(mtp_logits_list[-1][:, -1, :], temperature, top_k, top_p, generator)
+                draft_tokens.append(tok)
+            draft_batch = torch.cat(draft_tokens, dim=1)
+            verify_state = self._clone_gen_state(gen_state)
+            v_logits, v_h, verify_state = self.forward_incremental(
+                draft_batch, verify_state, return_state=True, return_hidden=True
+            )
+            if temperature <= 0:
+                accept_len = k
+                for i in range(k):
+                    target_tok = torch.argmax(v_logits[:, i, :], dim=-1, keepdim=True)
+                    if not torch.equal(draft_batch[:, i : i + 1], target_tok):
+                        accept_len = i + 1
+                        draft_batch[:, i : i + 1] = target_tok
+                        draft_batch = draft_batch[:, :accept_len]
+                        break
+                else:
+                    if k == draft_k and remaining > k:
+                        bonus = torch.argmax(v_logits[:, -1, :], dim=-1, keepdim=True)
+                        draft_batch = torch.cat([draft_batch, bonus], dim=1)
+                        accept_len = k + 1
+            else:
+                accept_len = 1
+                draft_batch = draft_batch[:, :1]
+            for idx in range(accept_len):
+                tok = draft_batch[:, idx : idx + 1]
+                if eos_byte is not None:
+                    tok = torch.where(finished, torch.full_like(tok, eos_byte), tok)
+                out[:, pos : pos + 1] = tok
+                finished = finished | (tok == eos_byte) if eos_byte is not None else finished
+                pos += 1
+                if eos_byte is not None and finished.all():
+                    break
+            if eos_byte is not None and finished.all():
+                break
+            if accept_len == k and verify_state is not None:
+                gen_state = verify_state
+                cur_logits, cur_h = v_logits[:, -1:, :], v_h[:, -1:, :]
+                logits, h_decoded = cur_logits, cur_h
+            else:
+                cur_logits, cur_h, gen_state = self.forward_incremental(
+                    draft_batch[:, :accept_len], gen_state, return_state=True, return_hidden=True
+                )
+                logits, h_decoded = cur_logits[:, -1:, :], cur_h[:, -1:, :]
+            if pos >= end:
+                break
         return out[:, :pos]
 
     def export_inference_state_dict(self) -> Dict[str, torch.Tensor]:

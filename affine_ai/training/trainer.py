@@ -107,9 +107,48 @@ class ASDAGTrainer:
         # Fused / standard AdamW
         fused = (self.device == "cuda" and hasattr(optim.AdamW, "_fused"))
         if getattr(self.model, "hybrid", None) is not None:
-            has_local_lpc = self.use_lpc and hasattr(self.model.hybrid, 'local_heads')
-            if has_local_lpc:
-                self.hybrid_optimizers = self.model.hybrid.get_default_optimizers(
+            hybrid = self.model.hybrid
+            can_lpc = self.use_lpc and hasattr(hybrid, 'enable_lpc') and hasattr(hybrid, 'get_default_lpc_optimizers')
+            has_legacy_local = self.use_lpc and getattr(hybrid, 'local_heads', None) is not None
+            if can_lpc:
+                try:
+                    try:
+                        hybrid.enable_lpc(device=self.device)
+                    except TypeError:
+                        hybrid.enable_lpc()
+                    has_local_lpc = getattr(hybrid, 'local_heads', None) is not None
+                except Exception:
+                    has_local_lpc = False
+                if has_local_lpc:
+                    lpc_kwargs = {}
+                    if hasattr(hybrid.get_default_lpc_optimizers, '__code__'):
+                        import inspect
+                        sig = inspect.signature(hybrid.get_default_lpc_optimizers)
+                        if 'muon_lr' in sig.parameters:
+                            lpc_kwargs['muon_lr'] = self.muon_lr
+                    try:
+                        self.hybrid_optimizers = hybrid.get_default_lpc_optimizers(
+                            lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, **lpc_kwargs
+                        )
+                    except TypeError:
+                        self.hybrid_optimizers = hybrid.get_default_lpc_optimizers(
+                            lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, muon_lr=self.muon_lr
+                        )
+                    self.lpc_model = None
+                    self.lpc_optimizers = None
+                    self.optimizer = None
+                else:
+                    self.hybrid_optimizers = None
+                    self.lpc_model = None
+                    self.lpc_optimizers = None
+                    self.optimizer = optim.AdamW(
+                        self.model.parameters(),
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        fused=fused
+                    )
+            elif has_legacy_local:
+                self.hybrid_optimizers = hybrid.get_default_optimizers(
                     lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, muon_lr=self.muon_lr
                 )
                 self.lpc_model = None
@@ -172,7 +211,7 @@ class ASDAGTrainer:
         for _ in range(self.eval_iters):
             x, y = self.get_batch("val")
             if getattr(self.model, "hybrid", None) is not None:
-                _, loss, _ = self.model.hybrid(x, targets=y)
+                _, loss, _ = self.model.hybrid(x, targets=y, return_logits=False)
                 losses.append(loss.item())
             else:
                 logits = self.model(
@@ -252,7 +291,7 @@ class ASDAGTrainer:
                     param_group["lr"] = lr
                 x, y = self.get_batch("train")
                 self.optimizer.zero_grad()
-                _, loss, _ = self.model.hybrid(x, targets=y)
+                _, loss, _ = self.model.hybrid(x, targets=y, return_logits=False)
                 loss.backward()
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)

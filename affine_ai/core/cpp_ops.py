@@ -912,15 +912,18 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
         w_down: torch.Tensor,
         w_lm: torch.Tensor,
         patch_assignments: torch.Tensor,
-        targets: torch.Tensor
+        targets: torch.Tensor,
+        norm1_scale: Optional[torch.Tensor] = None,
+        norm2_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         orig_dtype = h_byte.dtype
         ops = get_asdag_cpu_ops()
-        if ops and hasattr(ops, 'blt_2layer_decode_loss_fused') and not h_byte.is_cuda and torch.is_grad_enabled() and targets is not None:
-            loss, ghb, gp, gp2b, gfus, ggate, gval, gdown, glm = ops.blt_2layer_decode_loss_fused(
-                h_byte, causal_latent_patches, w_p2b, w_fusion, w_gate, w_val, w_down, w_lm, patch_assignments, targets
+        if ops and hasattr(ops, 'blt_2layer_decode_loss_fused') and not h_byte.is_cuda and targets is not None and norm1_scale is not None and norm2_scale is not None:
+            loss, ghb, gp, gp2b, gfus, ggate, gval, gdown, glm, gn1, gn2 = ops.blt_2layer_decode_loss_fused(
+                h_byte, causal_latent_patches, w_p2b, w_fusion, w_gate, w_val, w_down, w_lm, patch_assignments, targets,
+                norm1_scale, norm2_scale
             )
-            ctx.save_for_backward(ghb, gp, gp2b, gfus, ggate, gval, gdown, glm)
+            ctx.save_for_backward(ghb, gp, gp2b, gfus, ggate, gval, gdown, glm, gn1, gn2)
             ctx.is_fast_cpp = True
             return loss
 
@@ -1003,9 +1006,9 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         if getattr(ctx, 'is_fast_cpp', False):
-            ghb, gp, gp2b, gfus, ggate, gval, gdown, glm = ctx.saved_tensors
+            ghb, gp, gp2b, gfus, ggate, gval, gdown, glm, gn1, gn2 = ctx.saved_tensors
             scale = grad_output.item()
-            return ghb * scale, gp * scale, gp2b * scale, gfus * scale, ggate * scale, gval * scale, gdown * scale, glm * scale, None, None
+            return ghb * scale, gp * scale, gp2b * scale, gfus * scale, ggate * scale, gval * scale, gdown * scale, glm * scale, None, None, gn1 * scale, gn2 * scale
 
         if getattr(ctx, 'is_cuda_fast', False):
             cat_h, u1, sig1, s1, rms1, fused1, ug, uv, sig_g, hact, f2_pre, rms2, fused2, logits, w_fusion, w_gate, w_val, w_down, w_lm, w_p2b, causal_latent_patches, patch_assignments, targets = ctx.saved_tensors
@@ -1061,7 +1064,7 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
             g_p2b = torch.mm(g_ph_flat.t(), clp_flat)
             g_patches = torch.mm(g_ph_flat, w_p2b).reshape(B, M, d_model)
 
-            return g_hb, g_patches, g_p2b, g_fus, g_gate, g_val, g_down, g_lm, None, None
+            return g_hb, g_patches, g_p2b, g_fus, g_gate, g_val, g_down, g_lm, None, None, None, None
 
         h_byte, causal_latent_patches, w_p2b, w_fusion, w_gate, w_val, w_down, w_lm, patch_assignments, targets = ctx.saved_tensors
         orig_dtype = h_byte.dtype
@@ -1174,6 +1177,8 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
             (g_down * loss_scale).to(w_down.dtype),
             (g_lm * loss_scale).to(w_lm.dtype),
             None,
+            None,
+            None,
             None
         )
 
@@ -1218,11 +1223,14 @@ def asdag_cpu_blt_2layer_decoder_loss(
     w_down: torch.Tensor,
     w_lm: torch.Tensor,
     patch_assignments: torch.Tensor,
-    targets: torch.Tensor
+    targets: torch.Tensor,
+    norm1_scale: Optional[torch.Tensor] = None,
+    norm2_scale: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """2-Layer Fused C++ BLT Causal Decoder + Cross-Entropy Loss (Zero-Logits RAM)."""
     return ASDAGBLT2LayerDecoderLossAutogradFunction.apply(
-        h_byte, causal_latent_patches, w_p2b, w_fusion, w_gate, w_val, w_down, w_lm, patch_assignments, targets
+        h_byte, causal_latent_patches, w_p2b, w_fusion, w_gate, w_val, w_down, w_lm, patch_assignments, targets,
+        norm1_scale, norm2_scale
     )
 
 

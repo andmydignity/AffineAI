@@ -2312,7 +2312,7 @@ torch::Tensor asdag_blt_2layer_decode_fused_cpp(
 // ─────────────────────────────────────────────────────────────────────────────
 // 19e. 2-Layer Fused BLT Causal Decoder + Cross-Entropy Loss (Zero-Logits RAM)
 // ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_blt_2layer_decode_loss_fused_cpp(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_blt_2layer_decode_loss_fused_cpp(
     torch::Tensor h_byte,                // [B, T, d_byte]
     torch::Tensor causal_latent_patches, // [B, M, d_model]
     torch::Tensor patch_to_byte_weight,  // [d_byte, d_model]
@@ -2322,7 +2322,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor down_weight,           // [d_byte, d_byte]
     torch::Tensor lm_head_weight,        // [V, d_byte]
     torch::Tensor patch_assignments,     // [B, T] int64
-    torch::Tensor targets                // [B, T] int64
+    torch::Tensor targets,               // [B, T] int64
+    torch::Tensor norm1_scale,           // [d_byte]
+    torch::Tensor norm2_scale            // [d_byte]
 ) {
     auto orig_dtype = h_byte.scalar_type();
     h_byte = h_byte.contiguous().to(torch::kFloat32);
@@ -2335,6 +2337,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     lm_head_weight = lm_head_weight.contiguous().to(torch::kFloat32);
     patch_assignments = patch_assignments.contiguous().to(torch::kInt64);
     targets = targets.contiguous().to(torch::kInt64);
+    norm1_scale = norm1_scale.contiguous().to(torch::kFloat32);
+    norm2_scale = norm2_scale.contiguous().to(torch::kFloat32);
+    auto ternarize_w = [](torch::Tensor w) {
+        float gamma = w.abs().mean().item<float>();
+        if (gamma < 1e-5f) gamma = 1e-5f;
+        return torch::clamp(torch::round(w / gamma), -1.f, 1.f) * gamma;
+    };
+    auto w_p2b = ternarize_w(patch_to_byte_weight);
+    auto w_fus = ternarize_w(fusion_weight);
+    auto w_gate = ternarize_w(gate_weight);
+    auto w_val = ternarize_w(val_weight);
+    auto w_down = ternarize_w(down_weight);
+    auto w_lm = ternarize_w(lm_head_weight);
 
     int64_t B = h_byte.size(0);
     int64_t T = h_byte.size(1);
@@ -2346,27 +2361,27 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     // 1. Patch to byte context gathering
     auto clp_flat = causal_latent_patches.reshape({B * M, d_model});
-    auto ph_p = torch::mm(clp_flat, patch_to_byte_weight.t()).reshape({B, M, d_byte});
+    auto ph_p = torch::mm(clp_flat, w_p2b.t()).reshape({B, M, d_byte});
     auto pa_exp = patch_assignments.unsqueeze(-1).expand({B, T, d_byte});
     auto patch_h = torch::gather(ph_p, 1, pa_exp).reshape({N, d_byte});
 
     // 2. Fusion layer: cat_h -> u1 -> s1 -> fused1
     auto hb_flat = h_byte.reshape({N, d_byte});
     auto cat_h = torch::cat({hb_flat, patch_h}, -1);
-    auto u1 = torch::mm(cat_h, fusion_weight.t());
+    auto u1 = torch::mm(cat_h, w_fus.t());
     auto sig1 = torch::sigmoid(u1);
     auto s1 = u1 * sig1;
-    auto rms1 = torch::rsqrt(s1.pow(2).mean(-1, true) + 1e-5f);
-    auto fused1 = s1 * rms1;
+    auto rms1 = torch::rsqrt(s1.pow(2).mean(-1, true) + 1e-6f);
+    auto fused1 = s1 * rms1 * norm1_scale.unsqueeze(0);
 
     // 3. Layer 2 SwiGLU: fused1 -> ug, uv -> hact -> f2_pre -> fused2
-    auto ug = torch::mm(fused1, gate_weight.t());
-    auto uv = torch::mm(fused1, val_weight.t());
+    auto ug = torch::mm(fused1, w_gate.t());
+    auto uv = torch::mm(fused1, w_val.t());
     auto sig_g = torch::sigmoid(ug);
     auto hact = (ug * sig_g) * uv;
-    auto f2_pre = fused1 + torch::mm(hact, down_weight.t());
-    auto rms2 = torch::rsqrt(f2_pre.pow(2).mean(-1, true) + 1e-5f);
-    auto fused2 = f2_pre * rms2;
+    auto f2_pre = fused1 + torch::mm(hact, w_down.t());
+    auto rms2 = torch::rsqrt(f2_pre.pow(2).mean(-1, true) + 1e-6f);
+    auto fused2 = f2_pre * rms2 * norm2_scale.unsqueeze(0);
 
     // 4. Chunked Loss & Softmax Backprop (Zero-Logits RAM footprint)
     auto targets_flat = targets.reshape({N});
@@ -2385,7 +2400,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         auto f2_c = fused2.slice(0, c_start, c_end);
         auto tgt_c = targets_flat.slice(0, c_start, c_end);
 
-        auto logits_c = torch::mm(f2_c, lm_head_weight.t());
+        auto logits_c = torch::mm(f2_c, w_lm.t());
         auto max_l = std::get<0>(logits_c.max(-1, true));
         auto exp_l = torch::exp(logits_c - max_l);
         auto sum_exp = exp_l.sum(-1, true);
@@ -2399,16 +2414,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         d_logits_c.scatter_add_(1, tgt_exp, torch::full({cur_c, 1}, -scale, torch::kFloat32));
 
         grad_lm.addmm_(d_logits_c.t(), f2_c);
-        g_fused2.slice(0, c_start, c_end) = torch::mm(d_logits_c, lm_head_weight);
+        g_fused2.slice(0, c_start, c_end) = torch::mm(d_logits_c, w_lm);
     }
     total_loss[0] = float(loss_acc * scale);
 
     // 5. Backprop through Layer 2 RMSNorm & SwiGLU
-    auto sum_g_f2 = (g_fused2 * fused2).sum(-1, true);
-    auto g_f2_pre = rms2 * (g_fused2 - fused2 * (sum_g_f2 / float(d_byte)));
+    auto yn2 = f2_pre * rms2;
+    auto sum_g_f2 = (g_fused2 * yn2).sum(-1, true);
+    auto g_f2_pre = rms2 * norm2_scale.unsqueeze(0) * (g_fused2 - yn2 * (sum_g_f2 / float(d_byte)));
+    auto grad_n2 = (g_fused2 * yn2).sum(0);
 
     auto grad_down = torch::mm(g_f2_pre.t(), hact);
-    auto g_hact = torch::mm(g_f2_pre, down_weight);
+    auto g_hact = torch::mm(g_f2_pre, w_down);
 
     auto dsilu_g = sig_g * (1.0f + ug * (1.0f - sig_g));
     auto g_ug = g_hact * uv * dsilu_g;
@@ -2417,17 +2434,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto grad_gate = torch::mm(g_ug.t(), fused1);
     auto grad_val = torch::mm(g_uv.t(), fused1);
 
-    auto g_fused1 = g_f2_pre + torch::mm(g_ug, gate_weight) + torch::mm(g_uv, val_weight);
+    auto g_fused1 = g_f2_pre + torch::mm(g_ug, w_gate) + torch::mm(g_uv, w_val);
 
     // 6. Backprop through Layer 1 RMSNorm & Fusion
-    auto sum_g_f1 = (g_fused1 * fused1).sum(-1, true);
-    auto g_s1 = rms1 * (g_fused1 - fused1 * (sum_g_f1 / float(d_byte)));
+    auto yn1 = s1 * rms1;
+    auto sum_g_f1 = (g_fused1 * yn1).sum(-1, true);
+    auto g_s1 = rms1 * norm1_scale.unsqueeze(0) * (g_fused1 - yn1 * (sum_g_f1 / float(d_byte)));
+    auto grad_n1 = (g_fused1 * yn1).sum(0);
 
     auto dsilu1 = sig1 * (1.0f + u1 * (1.0f - sig1));
     auto g_u1 = g_s1 * dsilu1;
 
     auto grad_fusion = torch::mm(g_u1.t(), cat_h);
-    auto g_cat = torch::mm(g_u1, fusion_weight);
+    auto g_cat = torch::mm(g_u1, w_fus);
 
     auto grad_h_byte = g_cat.slice(1, 0, d_byte).reshape({B, T, d_byte});
     auto g_patch_h = g_cat.slice(1, d_byte, 2 * d_byte).reshape({B, T, d_byte});
@@ -2438,7 +2457,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     auto g_ph_flat = g_ph_p.reshape({B * M, d_byte});
     auto grad_p2b = torch::mm(g_ph_flat.t(), clp_flat);
-    auto grad_patches = torch::mm(g_ph_flat, patch_to_byte_weight).reshape({B, M, d_model});
+    auto grad_patches = torch::mm(g_ph_flat, w_p2b).reshape({B, M, d_model});
 
     return std::make_tuple(
         total_loss,
@@ -2449,7 +2468,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         grad_gate.to(orig_dtype),
         grad_val.to(orig_dtype),
         grad_down.to(orig_dtype),
-        grad_lm.to(orig_dtype)
+        grad_lm.to(orig_dtype),
+        grad_n1.to(orig_dtype),
+        grad_n2.to(orig_dtype)
     );
 }
 

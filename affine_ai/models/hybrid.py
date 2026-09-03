@@ -148,7 +148,6 @@ class TorosHybridLanguageModel(nn.Module):
                 mtp_lambda=getattr(self.config, 'mtp_lambda', 0.3),
                 dtype=self.config.dtype,
             )
-        
         if self.config.dtype is not None and self.config.dtype != torch.float32:
             self.to(self.config.dtype)
         if getattr(self.config, 'compile_forward', False) and _COMPILE:
@@ -192,6 +191,155 @@ class TorosHybridLanguageModel(nn.Module):
             tail_params += list(self.mtp.parameters())
         optimizers.append(torch.optim.AdamW(tail_params, lr=lr, weight_decay=weight_decay))
         return optimizers
+
+    def enable_lpc(self, dtype: Any = None, device: Optional[str] = None):
+        if getattr(self, 'local_heads', None) is not None and len(self.local_heads) == len(self.context_encoder.blocks):
+            return self.local_heads
+        from affine_ai.core.lpc import LocalPredictiveHead
+        d = dtype if dtype is not None else self.config.dtype
+        self.local_heads = nn.ModuleList([
+            LocalPredictiveHead(self.config.dim, 256, dtype=d)
+            for _ in range(len(self.context_encoder.blocks))
+        ])
+        if d is not None and d != torch.float32:
+            self.local_heads.to(d)
+        target_device = device
+        if target_device is None:
+            try:
+                target_device = next(self.parameters()).device
+            except StopIteration:
+                target_device = None
+        if target_device is not None:
+            try:
+                self.local_heads.to(target_device)
+            except Exception:
+                pass
+        return self.local_heads
+
+    def get_default_lpc_optimizers(
+        self,
+        lr: float = 1e-3,
+        weight_decay: float = 0.01,
+        use_muon: bool = False,
+        muon_lr: float = 0.02,
+        muon_momentum: float = 0.95,
+    ) -> List[Any]:
+        self.enable_lpc()
+        assert self.local_heads is not None
+        optimizers: List[Any] = []
+        if use_muon:
+            from affine_ai.optim.muon import HybridMuonAdamW
+            for i, block in enumerate(self.context_encoder.blocks):
+                mods = [block, self.local_heads[i]]
+                if i == 0:
+                    mods += [self.context_encoder.byte_encoder, self.context_encoder.patcher]
+                optimizers.append(HybridMuonAdamW(nn.ModuleList(mods), muon_lr=muon_lr, adamw_lr=lr, adamw_weight_decay=weight_decay))
+            tail_mods: List[nn.Module] = [self.context_encoder.norm_out, self.byte_decoder]
+            if hasattr(self, 'mtp'):
+                tail_mods.append(self.mtp)
+            optimizers.append(HybridMuonAdamW(nn.ModuleList(tail_mods), muon_lr=muon_lr, adamw_lr=lr, adamw_weight_decay=weight_decay))
+            return optimizers
+        for i, block in enumerate(self.context_encoder.blocks):
+            params = list(block.parameters()) + list(self.local_heads[i].parameters())
+            if i == 0:
+                params += list(self.context_encoder.byte_encoder.parameters())
+                params += list(self.context_encoder.patcher.parameters())
+            optimizers.append(torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay))
+        tail_params = list(self.context_encoder.norm_out.parameters()) + list(self.byte_decoder.parameters()) + [self.sos_patch]
+        if hasattr(self, 'mtp'):
+            tail_params += list(self.mtp.parameters())
+        optimizers.append(torch.optim.AdamW(tail_params, lr=lr, weight_decay=weight_decay))
+        return optimizers
+
+    def get_lpc_optimizers(self, *args, **kwargs) -> List[Any]:
+        return self.get_default_lpc_optimizers(*args, **kwargs)
+
+    def forward_lpc_step(
+        self,
+        byte_ids: torch.Tensor,
+        targets: torch.Tensor,
+        optimizers: List[Any],
+        grad_clip: float = 1.0,
+        ignore_index: int = -100,
+        stride: int = 1,
+    ) -> Dict[str, float]:
+        self.enable_lpc()
+        assert self.local_heads is not None
+        B, T = byte_ids.shape
+        P = self.config.target_patch_size
+        h_byte, boundary = self.context_encoder.byte_encoder(byte_ids)
+        latent_patches, patch_assignments = self.context_encoder.patcher(
+            h_byte, torch.zeros_like(boundary), fixed_patch_size=P
+        )
+        M = latent_patches.shape[1]
+        tp = targets[:, ::P]
+        if tp.shape[1] > M:
+            tp = tp[:, :M]
+        elif tp.shape[1] < M:
+            pad = torch.full((B, M - tp.shape[1]), ignore_index, device=tp.device, dtype=tp.dtype)
+            tp = torch.cat([tp, pad], dim=1)
+        sub_targets = tp[:, ::stride] if stride > 1 else tp
+        is_cuda = byte_ids.is_cuda
+        curr_h = latent_patches
+        layer_losses: List[float] = []
+        for idx, block in enumerate(self.context_encoder.blocks):
+            if idx == 0:
+                next_h = block(curr_h)
+            else:
+                curr_h = curr_h.detach()
+                curr_h_in = curr_h.requires_grad_(True)
+                next_h = block(curr_h_in)
+            h_sub = next_h[:, ::stride] if stride > 1 else next_h
+            _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
+            opt_i = optimizers[idx]
+            opt_i.zero_grad(set_to_none=is_cuda)
+            loss_i.backward()
+            if grad_clip > 0:
+                params = []
+                for pg in opt_i.param_groups:
+                    params.extend(pg['params'])
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            opt_i.step()
+            opt_i.zero_grad(set_to_none=is_cuda)
+            layer_losses.append(loss_i.item())
+            curr_h = next_h.detach() if idx == 0 else next_h
+        curr_h_det = curr_h.detach().requires_grad_(True)
+        final_h = self.context_encoder.norm_out(curr_h_det)
+        causal = torch.cat([self.sos_patch.expand(B, 1, -1), final_h[:, :-1]], dim=1)
+        h_byte_det = h_byte.detach()
+        use_fused = not h_byte_det.is_cuda and torch.is_grad_enabled()
+        if use_fused:
+            try:
+                from affine_ai.core.cpp_ops import asdag_cpu_blt_2layer_decoder_loss
+                loss_final = asdag_cpu_blt_2layer_decoder_loss(
+                    h_byte_det, causal,
+                    self.byte_decoder.patch_to_byte.weight,
+                    self.byte_decoder.fusion.weight,
+                    self.byte_decoder.gate_proj.weight,
+                    self.byte_decoder.val_proj.weight,
+                    self.byte_decoder.down_proj.weight,
+                    self.byte_decoder.lm_head.weight,
+                    patch_assignments, targets
+                )
+                if loss_final.dim() > 0:
+                    loss_final = loss_final.squeeze()
+            except Exception:
+                logits = self.byte_decoder(h_byte_det, causal, patch_assignments)
+                loss_final = F.cross_entropy(logits.view(-1, 256), targets.view(-1), ignore_index=ignore_index)
+        else:
+            logits = self.byte_decoder(h_byte_det, causal, patch_assignments)
+            loss_final = F.cross_entropy(logits.view(-1, 256), targets.view(-1), ignore_index=ignore_index)
+        opt_final = optimizers[-1]
+        opt_final.zero_grad(set_to_none=is_cuda)
+        loss_final.backward()
+        if grad_clip > 0:
+            params = []
+            for pg in opt_final.param_groups:
+                params.extend(pg['params'])
+            torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        opt_final.step()
+        opt_final.zero_grad(set_to_none=is_cuda)
+        return {"loss": loss_final.item(), "layer_losses": layer_losses, "mean_local_loss": sum(layer_losses)/len(layer_losses) if layer_losses else loss_final.item(), "loss_total": loss_final.item()}
 
     def update_target_encoder(self, *args, **kwargs):
         """Deprecated stub: JEPA target encoder removed. No-op for checkpoint compat."""
@@ -239,6 +387,7 @@ class TorosHybridLanguageModel(nn.Module):
         self,
         byte_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        return_logits: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
         B, T = byte_ids.shape
@@ -299,19 +448,42 @@ class TorosHybridLanguageModel(nn.Module):
         
         causal_latent_patches = torch.cat([self.sos_patch.expand(B, 1, -1), h_latent[:, :-1]], dim=1)
         h_decoded_for_mtp = None
+        use_fused_dec = (
+            targets is not None
+            and not return_logits
+            and not getattr(self.config, 'use_mtp', False)
+            and self.config.unlikelihood_weight <= 0.0
+            and not h_byte.is_cuda
+            and torch.is_grad_enabled()
+        )
         if getattr(self.config, 'use_mtp', False) and hasattr(self, 'mtp'):
             logits, h_decoded_for_mtp = self.byte_decoder(
                 h_byte, causal_latent_patches, patch_assignments, return_hidden=True
             )
+        elif use_fused_dec:
+            from affine_ai.core.cpp_ops import asdag_cpu_blt_2layer_decoder_loss
+            dec = self.byte_decoder
+            loss_gen = asdag_cpu_blt_2layer_decoder_loss(
+                h_byte, causal_latent_patches,
+                dec.patch_to_byte.weight, dec.fusion.weight,
+                dec.gate_proj.weight, dec.val_proj.weight,
+                dec.down_proj.weight, dec.lm_head.weight,
+                patch_assignments, targets,
+                dec.norm1.scale, dec.norm2.scale,
+            )
+            logits = None
         else:
             logits = self.byte_decoder(h_byte, causal_latent_patches, patch_assignments)
-        
+
         loss = None
         metrics = {}
 
         if targets is not None:
-            loss_gen = F.cross_entropy(logits.view(-1, 256), targets.view(-1))
-            loss_unl = self._unlikelihood_loss(logits, targets)
+            if use_fused_dec:
+                loss_unl = loss_gen.new_zeros(())
+            else:
+                loss_gen = F.cross_entropy(logits.view(-1, 256), targets.view(-1))
+                loss_unl = self._unlikelihood_loss(logits, targets)
             rls_loss = None
             if getattr(self.config, 'use_rls_heads', False) and hasattr(self, 'rls_heads'):
                 rls_terms = []

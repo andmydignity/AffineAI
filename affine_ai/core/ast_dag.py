@@ -874,23 +874,37 @@ class ASTDAGLayer(nn.Module):
         leaves = self.leaves
         self._sync_router()
 
-        if self.use_hierarchical_routing:
+        _fused_route = (self.use_hierarchical_routing and x_flat.is_cuda
+            and self.top_k is not None and self.top_k < self.router.num_leaves)
+        if _fused_route:
+            try:
+                from affine_ai.kernels.triton_router import triton_router_topk
+                top_indices, top_weights = triton_router_topk(
+                    x_flat, self.router.hyperplanes, self.router.biases,
+                    self.router.tree_depth, self.top_k, self.router.num_leaves)
+                routing_probs = torch.zeros(
+                    B, self.router.num_leaves, device=x_flat.device,
+                    dtype=top_weights.dtype).scatter_(-1, top_indices, top_weights)
+            except Exception:
+                _fused_route = False
+        if self.use_hierarchical_routing and not _fused_route:
             routing_probs, _ = self.router.route_tokens(x_flat)
-        else:
+        elif not self.use_hierarchical_routing:
             r_w = quantize_fp8_hybrid(self.router_weights) if self.use_fp8 else self.router_weights
             logits = F.linear(x_flat, r_w, self.router_biases)
             if self.use_fp8:
                 logits = quantize_fp8_hybrid(logits)
             routing_probs = F.softmax(logits, dim=-1)
 
-        top_indices = None
-        top_weights = None
-        if self.top_k is not None and self.top_k < routing_probs.shape[-1]:
+        if not _fused_route:
+            top_indices = None
+            top_weights = None
+        if not _fused_route and self.top_k is not None and self.top_k < routing_probs.shape[-1]:
             top_vals, top_indices = torch.topk(routing_probs, k=self.top_k, dim=-1)
             top_weights = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             sparse_probs = torch.zeros_like(routing_probs).scatter_(-1, top_indices, top_weights)
             routing_probs = sparse_probs
-        else:
+        elif not _fused_route:
             top_indices = torch.arange(routing_probs.shape[-1], device=routing_probs.device).unsqueeze(0).expand(B, -1)
             top_weights = routing_probs
 

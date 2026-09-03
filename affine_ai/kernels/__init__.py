@@ -2,38 +2,36 @@
 AffineAI Custom Hardware Acceleration Kernels (Triton & CUDA)
 """
 
+def _optional_import(module_name, symbol):
+    try:
+        import importlib
+        module = importlib.import_module(module_name)
+        return getattr(module, symbol)
+    except Exception:
+        return None
+
+
+triton_rms_norm = _optional_import("affine_ai.kernels.triton_rms_norm", "triton_rms_norm")
+triton_fused_linear_cross_entropy = _optional_import(
+    "affine_ai.kernels.triton_cross_entropy", "triton_fused_linear_cross_entropy")
 try:
-    from affine_ai.kernels.triton_rms_norm import triton_rms_norm
-    from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
     from affine_ai.kernels.triton_asdag import fused_asdag_forward_triton
-    from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
-    from affine_ai.kernels.triton_ternary import (
-        triton_ternary_linear,
-        triton_ternary_twin,
-        triton_row_amax,
-        triton_ternary_linear_fwd,
-        triton_fp32_linear,
-        triton_ternary_linear_gw,
-    )
-    from affine_ai.kernels.triton_tree import triton_tree_perm
-    from affine_ai.kernels.triton_gla import triton_monarch_chain, triton_fused_monarch_chain, triton_gla_decay
-    TRITON_AVAILABLE = True
 except Exception:
-    TRITON_AVAILABLE = False
     fused_asdag_forward_triton = None
-    triton_rms_norm = None
-    triton_fused_linear_cross_entropy = None
-    triton_fused_lpc_head = None
-    triton_ternary_linear = None
-    triton_ternary_twin = None
-    triton_row_amax = None
-    triton_ternary_linear_fwd = None
-    triton_fp32_linear = None
-    triton_ternary_linear_gw = None
-    triton_tree_perm = None
-    triton_monarch_chain = None
-    triton_fused_monarch_chain = None
-    triton_gla_decay = None
+triton_fused_lpc_head = _optional_import("affine_ai.kernels.triton_lpc", "triton_fused_lpc_head")
+triton_ternary_linear = _optional_import("affine_ai.kernels.triton_ternary", "triton_ternary_linear")
+triton_ternary_twin = _optional_import("affine_ai.kernels.triton_ternary", "triton_ternary_twin")
+triton_row_amax = _optional_import("affine_ai.kernels.triton_ternary", "triton_row_amax")
+triton_ternary_linear_fwd = _optional_import("affine_ai.kernels.triton_ternary", "triton_ternary_linear_fwd")
+triton_fp32_linear = _optional_import("affine_ai.kernels.triton_ternary", "triton_fp32_linear")
+triton_ternary_linear_gw = _optional_import("affine_ai.kernels.triton_ternary", "triton_ternary_linear_gw")
+triton_tree_perm = _optional_import("affine_ai.kernels.triton_tree", "triton_tree_perm")
+triton_monarch_chain = _optional_import("affine_ai.kernels.triton_gla", "triton_monarch_chain")
+triton_fused_monarch_chain = _optional_import("affine_ai.kernels.triton_gla", "triton_fused_monarch_chain")
+triton_gla_decay = _optional_import("affine_ai.kernels.triton_gla", "triton_gla_decay")
+triton_router_topk = _optional_import("affine_ai.kernels.triton_router", "triton_router_topk")
+
+TRITON_AVAILABLE = triton_rms_norm is not None
 
 __all__ = [
     "fused_asdag_forward_triton",
@@ -50,6 +48,7 @@ __all__ = [
     "triton_monarch_chain",
     "triton_fused_monarch_chain",
     "triton_gla_decay",
+    "triton_router_topk",
     "TRITON_AVAILABLE",
 ]
 

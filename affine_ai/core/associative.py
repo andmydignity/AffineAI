@@ -636,11 +636,16 @@ class NativeASDAGAssociativeMixer(nn.Module):
             y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
             return self.out_proj(y * g), None
 
-        log_gam = torch.log(gamma.clamp(min=1e-5))                           # [B, H, T]
-        cum_log_gam = torch.cumsum(log_gam, dim=-1)                          # [B, H, T]
-        decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(max=0.0) # [B, H, T, T]
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+        cum_log_gam = None
+        try:
+            from affine_ai.kernels.triton_gla import triton_gla_decay
+            decay_mat = triton_gla_decay(gamma)
+        except Exception:
+            log_gam = torch.log(gamma.clamp(min=1e-5))                       # [B, H, T]
+            cum_log_gam = torch.cumsum(log_gam, dim=-1)                      # [B, H, T]
+            decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(max=0.0) # [B, H, T, T]
+            causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+            decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
 
         scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat    # [B, H, T, T]
         num = torch.matmul(scores, v)                                        # [B, H, T, D]
@@ -649,6 +654,8 @@ class NativeASDAGAssociativeMixer(nn.Module):
 
         next_state = None
         if return_state:
+            if cum_log_gam is None:
+                cum_log_gam = torch.cumsum(torch.log(gamma.clamp(min=1e-5)), dim=-1)
             t_weights = torch.exp((cum_log_gam[:, :, -1:] - cum_log_gam).unsqueeze(-1).unsqueeze(-1))
             kv_terms = torch.matmul(phi_k.unsqueeze(-1), v.unsqueeze(-2))
             next_S = (kv_terms * t_weights).sum(dim=2)

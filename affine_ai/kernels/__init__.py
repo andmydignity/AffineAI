@@ -16,7 +16,7 @@ try:
         triton_ternary_linear_gw,
     )
     from affine_ai.kernels.triton_tree import triton_tree_perm
-    from affine_ai.kernels.triton_gla import triton_monarch_chain, triton_fused_monarch_chain
+    from affine_ai.kernels.triton_gla import triton_monarch_chain, triton_fused_monarch_chain, triton_gla_decay
     TRITON_AVAILABLE = True
 except Exception:
     TRITON_AVAILABLE = False
@@ -33,6 +33,7 @@ except Exception:
     triton_tree_perm = None
     triton_monarch_chain = None
     triton_fused_monarch_chain = None
+    triton_gla_decay = None
 
 __all__ = [
     "fused_asdag_forward_triton",
@@ -48,6 +49,7 @@ __all__ = [
     "triton_tree_perm",
     "triton_monarch_chain",
     "triton_fused_monarch_chain",
+    "triton_gla_decay",
     "TRITON_AVAILABLE",
 ]
 

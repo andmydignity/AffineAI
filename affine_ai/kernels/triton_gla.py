@@ -231,3 +231,83 @@ def triton_monarch_chain(x, diagonals, perms, inv_perms, bias):
 
 def triton_fused_monarch_chain(x, diagonals, perms, inv_perms, bias):
     return TritonFusedMonarchChainFunction.apply(x, diagonals, perms, inv_perms, bias)
+
+
+@triton.jit
+def _gla_decay_kernel(
+    Cum, Decay,
+    stride_cb, stride_ch, stride_ct,
+    stride_db, stride_dh, stride_di, stride_dj,
+    B, H, T,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    total = B * H * T * T
+    mask = offs < total
+    tmp = offs
+    j = tmp % T
+    tmp = tmp // T
+    i = tmp % T
+    tmp = tmp // T
+    h = tmp % H
+    b = tmp // H
+    ci = tl.load(
+        Cum + b * stride_cb + h * stride_ch + i * stride_ct,
+        mask=mask, other=0.0,
+    )
+    cj = tl.load(
+        Cum + b * stride_cb + h * stride_ch + j * stride_ct,
+        mask=mask, other=0.0,
+    )
+    diff = ci - cj
+    diff = tl.minimum(diff, 0.0)
+    m = j <= i
+    val = tl.exp(diff)
+    val = tl.where(m & mask, val, 0.0)
+    flat = ((b * H + h) * T + i) * T + j
+    tl.store(
+        Decay + flat,
+        val, mask=mask,
+    )
+
+
+def triton_gla_decay_fwd(cum_log_gam):
+    B, H, T = cum_log_gam.shape
+    out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=torch.float32)
+    BLOCK = 1024
+    grid = ((B * H * T * T + BLOCK - 1) // BLOCK,)
+    _gla_decay_kernel[grid](
+        cum_log_gam, out,
+        cum_log_gam.stride(0), cum_log_gam.stride(1), cum_log_gam.stride(2),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        B, H, T, BLOCK=BLOCK, num_warps=4)
+    return out
+
+
+class TritonGLADecayFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gamma):
+        log_gam = torch.log(gamma.float().clamp(min=1e-5))
+        cum = torch.cumsum(log_gam, dim=-1)
+        out = triton_gla_decay_fwd(cum.contiguous())
+        ctx.save_for_backward(gamma)
+        return out.to(gamma.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (gamma,) = ctx.saved_tensors
+        with torch.enable_grad():
+            gr = gamma.detach().requires_grad_(gamma.requires_grad)
+            log_gam = torch.log(gr.float().clamp(min=1e-5))
+            cum = torch.cumsum(log_gam, dim=-1)
+            T = cum.shape[-1]
+            decay_diff = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).clamp(max=0.0)
+            mask = torch.tril(torch.ones(T, T, device=cum.device, dtype=torch.bool))
+            out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+            torch.autograd.backward(out, grad_output.reshape(out.shape).float())
+        return gr.grad if gr.requires_grad else None
+
+
+def triton_gla_decay(gamma):
+    return TritonGLADecayFunction.apply(gamma)

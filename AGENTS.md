@@ -19,7 +19,7 @@ No test runner config; tests are plain pytest functions in `tests/`.
 - On compile failure the module silently falls back to pure PyTorch (`get_asdag_cpu_ops()` returns `False`) — most layers still work, but fused paths (`asdag_cpu_fused_monarch_gla`, `asdag_cpu_fused_asdag_block`) raise `RuntimeError` instead.
 - Importing `affine_ai.core.cpp_ops` sets OpenMP env vars (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`, ...) if unset — expected, don't override them ad hoc.
 - Launch training with `OMP_WAIT_POLICY=active` (≈15% faster: threads spin instead of sleeping between the many small parallel regions). Must be set before process start — setting it in-code is too late (libgomp reads it at init).
-- Throughput sweet spot is B8 on 8 physical cores (~140k tok/s); B16+ adds nothing without more cores.
+- Throughput sweet spot is B10-12 on 8 physical cores (~170k tok/s at dim96/d32); B16+ adds nothing without more cores. Mild oversubscription helps the memory-bound phases.
 - `cpp_infer/` is a separate standalone C++ bench/CLI tree (prebuilt binaries checked in); its `Makefile` references source files that no longer exist — build those benchmarks with `g++` directly, not `make`.
 
 ## Layout

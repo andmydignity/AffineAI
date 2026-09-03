@@ -632,7 +632,8 @@ torch::Tensor asdag_bitlinear_forward_cpp(
     torch::Tensor x,         // [B, in_dim]
     torch::Tensor w_ternary, // [out_dim, in_dim] {-1, 0, +1}
     float gamma,             // weight scale
-    torch::Tensor bias       // optional [out_dim]
+    torch::Tensor bias,      // optional [out_dim]
+    torch::Tensor preset_amax// optional [B] row amax, skips max pass
 ) {
     auto orig_dtype = x.scalar_type();
     x = x.contiguous().to(torch::kFloat32);
@@ -655,12 +656,19 @@ torch::Tensor asdag_bitlinear_forward_cpp(
     auto inv_scale_x = torch::empty({B}, torch::kFloat32);
     float* sx_ptr = scale_x.data_ptr<float>();
     float* isx_ptr = inv_scale_x.data_ptr<float>();
+    bool use_preset = preset_amax.defined() && preset_amax.numel() == B;
+    const float* pre_ptr = use_preset ? preset_amax.contiguous().to(torch::kFloat32).data_ptr<float>() : nullptr;
 #pragma omp parallel for num_threads(n_threads) schedule(static)
     for (int64_t b = 0; b < B; ++b) {
-        const float* xb = x_ptr + b * in_dim;
-        float max_val = 1e-5f;
-        for (int64_t i = 0; i < in_dim; ++i) {
-            max_val = std::max(max_val, std::abs(xb[i]));
+        float max_val;
+        if (use_preset) {
+            max_val = pre_ptr[b] < 1e-5f ? 1e-5f : pre_ptr[b];
+        } else {
+            const float* xb = x_ptr + b * in_dim;
+            max_val = 1e-5f;
+            for (int64_t i = 0; i < in_dim; ++i) {
+                max_val = std::max(max_val, std::abs(xb[i]));
+            }
         }
         sx_ptr[b] = 127.0f / max_val;
         isx_ptr[b] = 1.0f / sx_ptr[b];
@@ -718,7 +726,8 @@ torch::Tensor asdag_bitlinear_twin_forward_cpp(
     float gamma1,
     torch::Tensor w2_ternary,// [O, in_dim] {-1, 0, +1}
     float gamma2,
-    torch::Tensor bias       // optional [2*O]
+    torch::Tensor bias,      // optional [2*O]
+    torch::Tensor preset_amax// optional [B] row amax, skips max pass
 ) {
     auto orig_dtype = x.scalar_type();
     x = x.contiguous().to(torch::kFloat32);
@@ -743,12 +752,19 @@ torch::Tensor asdag_bitlinear_twin_forward_cpp(
     auto inv_scale_x = torch::empty({B}, torch::kFloat32);
     float* sx_ptr = scale_x.data_ptr<float>();
     float* isx_ptr = inv_scale_x.data_ptr<float>();
+    bool use_preset = preset_amax.defined() && preset_amax.numel() == B;
+    const float* pre_ptr = use_preset ? preset_amax.contiguous().to(torch::kFloat32).data_ptr<float>() : nullptr;
 #pragma omp parallel for num_threads(n_threads) schedule(static)
     for (int64_t b = 0; b < B; ++b) {
-        const float* xb = x_ptr + b * in_dim;
-        float max_val = 1e-5f;
-        for (int64_t i = 0; i < in_dim; ++i) {
-            max_val = std::max(max_val, std::abs(xb[i]));
+        float max_val;
+        if (use_preset) {
+            max_val = pre_ptr[b] < 1e-5f ? 1e-5f : pre_ptr[b];
+        } else {
+            const float* xb = x_ptr + b * in_dim;
+            max_val = 1e-5f;
+            for (int64_t i = 0; i < in_dim; ++i) {
+                max_val = std::max(max_val, std::abs(xb[i]));
+            }
         }
         sx_ptr[b] = 127.0f / max_val;
         isx_ptr[b] = 1.0f / sx_ptr[b];
@@ -2605,18 +2621,53 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     // 1. Patch to byte context gathering
     auto clp_flat = causal_latent_patches.reshape({B * M, d_model});
-    auto ph_p = asdag_bitlinear_forward_cpp(clp_flat, w_p2b, g_p2b, no_bias).reshape({B, M, d_byte});
+    auto ph_p = asdag_bitlinear_forward_cpp(clp_flat, w_p2b, g_p2b, no_bias, torch::tensor({})).reshape({B, M, d_byte});
     auto pa_exp = patch_assignments.unsqueeze(-1).expand({B, T, d_byte});
     auto patch_h = torch::gather(ph_p, 1, pa_exp).reshape({N, d_byte});
 
     // 2. Fusion layer: cat_h -> u1 -> s1 -> fused1
     auto hb_flat = h_byte.reshape({N, d_byte});
     auto cat_h = torch::cat({hb_flat, patch_h}, -1);
-    auto u1 = asdag_bitlinear_forward_cpp(cat_h, w_fus, g_fus, no_bias);
-    auto sig1 = torch::sigmoid(u1);
-    auto s1 = u1 * sig1;
-    auto rms1 = torch::rsqrt(s1.pow(2).mean(-1, true) + 1e-6f);
-    auto fused1 = s1 * rms1 * norm1_scale.unsqueeze(0);
+    auto u1 = asdag_bitlinear_forward_cpp(cat_h, w_fus, g_fus, no_bias, torch::tensor({}));
+    auto sig1 = torch::empty({N, d_byte}, torch::kFloat32);
+    auto s1 = torch::empty({N, d_byte}, torch::kFloat32);
+    auto rms1 = torch::empty({N, 1}, torch::kFloat32);
+    auto fused1 = torch::empty({N, d_byte}, torch::kFloat32);
+    auto amax_f1 = torch::empty({N}, torch::kFloat32);
+    {
+        const float* u1_ptr = u1.data_ptr<float>();
+        const float* n1_ptr = norm1_scale.data_ptr<float>();
+        float* sig1_ptr = sig1.data_ptr<float>();
+        float* s1_ptr = s1.data_ptr<float>();
+        float* rms1_ptr = rms1.data_ptr<float>();
+        float* f1_ptr = fused1.data_ptr<float>();
+        float* amax_ptr = amax_f1.data_ptr<float>();
+        int nt1 = asdag::get_physical_cores();
+#pragma omp parallel for num_threads(nt1) schedule(static)
+        for (int64_t n = 0; n < N; ++n) {
+            const float* u = u1_ptr + n * d_byte;
+            float* sg = sig1_ptr + n * d_byte;
+            float* s = s1_ptr + n * d_byte;
+            float* fo = f1_ptr + n * d_byte;
+            for (int64_t c = 0; c < d_byte; ++c) {
+                float sg_v = 1.f / (1.f + expf(-u[c]));
+                sg[c] = sg_v;
+                s[c] = u[c] * sg_v;
+            }
+            float acc = 0.f;
+            for (int64_t c = 0; c < d_byte; ++c) acc += s[c] * s[c];
+            float rms = 1.f / std::sqrt(acc / (float)d_byte + 1e-6f);
+            rms1_ptr[n] = rms;
+            float am = 0.f;
+            for (int64_t c = 0; c < d_byte; ++c) {
+                float v = s[c] * rms * n1_ptr[c];
+                fo[c] = v;
+                float a = std::fabs(v);
+                if (a > am) am = a;
+            }
+            amax_ptr[n] = am;
+        }
+    }
 
     // 3. Layer 2 SwiGLU: fused1 -> ug, uv -> hact -> f2_pre -> fused2
     // Twin gate+val: single activation quant instead of two.
@@ -2625,14 +2676,65 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     float gg2 = val_weight.abs().mean().item<float>();
     if (gg2 < 1e-5f) gg2 = 1e-5f;
     auto gv = asdag_bitlinear_twin_forward_cpp(
-        fused1, w_gate, gg1, w_val, gg2, torch::tensor({}));
+        fused1, w_gate, gg1, w_val, gg2, torch::tensor({}), amax_f1);
     auto ug = gv.slice(1, 0, gv.size(1) / 2);
     auto uv = gv.slice(1, gv.size(1) / 2);
-    auto sig_g = torch::sigmoid(ug);
-    auto hact = (ug * sig_g) * uv;
-    auto f2_pre = fused1 + asdag_bitlinear_forward_cpp(hact, w_down, g_down, no_bias);
-    auto rms2 = torch::rsqrt(f2_pre.pow(2).mean(-1, true) + 1e-6f);
-    auto fused2 = f2_pre * rms2 * norm2_scale.unsqueeze(0);
+    auto sig_g = torch::empty({N, d_byte}, torch::kFloat32);
+    auto hact = torch::empty({N, d_byte}, torch::kFloat32);
+    auto amax_h = torch::empty({N}, torch::kFloat32);
+    {
+        const float* gv_ptr = gv.data_ptr<float>();
+        float* sg_ptr = sig_g.data_ptr<float>();
+        float* ha_ptr = hact.data_ptr<float>();
+        float* amax_ptr = amax_h.data_ptr<float>();
+        int nt2 = asdag::get_physical_cores();
+#pragma omp parallel for num_threads(nt2) schedule(static)
+        for (int64_t n = 0; n < N; ++n) {
+            const float* g = gv_ptr + n * 2 * d_byte;
+            const float* v = gv_ptr + n * 2 * d_byte + d_byte;
+            float* sg = sg_ptr + n * d_byte;
+            float* ha = ha_ptr + n * d_byte;
+            float am = 0.f;
+            for (int64_t c = 0; c < d_byte; ++c) {
+                float sg_v = 1.f / (1.f + expf(-g[c]));
+                sg[c] = sg_v;
+                float h = g[c] * sg_v * v[c];
+                ha[c] = h;
+                float a = std::fabs(h);
+                if (a > am) am = a;
+            }
+            amax_ptr[n] = am;
+        }
+    }
+    auto f2_pre = fused1 + asdag_bitlinear_forward_cpp(hact, w_down, g_down, no_bias, amax_h);
+    auto rms2 = torch::empty({N, 1}, torch::kFloat32);
+    auto fused2 = torch::empty({N, d_byte}, torch::kFloat32);
+    auto amax_f2 = torch::empty({N}, torch::kFloat32);
+    {
+        const float* f2_ptr = f2_pre.data_ptr<float>();
+        const float* n2_ptr = norm2_scale.data_ptr<float>();
+        float* rms2_ptr = rms2.data_ptr<float>();
+        float* fo_ptr = fused2.data_ptr<float>();
+        float* amax_ptr = amax_f2.data_ptr<float>();
+        int nt3 = asdag::get_physical_cores();
+#pragma omp parallel for num_threads(nt3) schedule(static)
+        for (int64_t n = 0; n < N; ++n) {
+            const float* f = f2_ptr + n * d_byte;
+            float* fo = fo_ptr + n * d_byte;
+            float acc = 0.f;
+            for (int64_t c = 0; c < d_byte; ++c) acc += f[c] * f[c];
+            float rms = 1.f / std::sqrt(acc / (float)d_byte + 1e-6f);
+            rms2_ptr[n] = rms;
+            float am = 0.f;
+            for (int64_t c = 0; c < d_byte; ++c) {
+                float v = f[c] * rms * n2_ptr[c];
+                fo[c] = v;
+                float a = std::fabs(v);
+                if (a > am) am = a;
+            }
+            amax_ptr[n] = am;
+        }
+    }
 
     // 4. Chunked Loss & Softmax Backprop (Zero-Logits RAM footprint)
     auto targets_flat = targets.reshape({N});
@@ -2651,7 +2753,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         auto f2_c = fused2.slice(0, c_start, c_end);
         auto tgt_c = targets_flat.slice(0, c_start, c_end);
 
-        auto logits_c = asdag_bitlinear_forward_cpp(f2_c, w_lm, g_lm, no_bias);
+        auto amax_c = amax_f2.slice(0, c_start, c_end);
+        auto logits_c = asdag_bitlinear_forward_cpp(f2_c, w_lm, g_lm, no_bias, amax_c);
         auto max_l = std::get<0>(logits_c.max(-1, true));
         auto exp_l = torch::exp(logits_c - max_l);
         auto sum_exp = exp_l.sum(-1, true);
@@ -5234,6 +5337,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> asdag_lpc_head_forward_b
 
 } // namespace asdag_cpu
 
+namespace py = pybind11;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_tree_perm_forward", &asdag_cpu::asdag_sparse_tree_perm_forward_cpp, "ASDAG CPU SIMD-Block N:M Sparse Tree Forward (AVX2/AVX-512)");
     m.def("sparse_tree_perm_backward", &asdag_cpu::asdag_sparse_tree_perm_backward_cpp, "ASDAG CPU SIMD-Block N:M Sparse Tree Backward (AVX2/AVX-512)");
@@ -5244,9 +5348,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("monarch_reg_forward", &asdag_cpu::asdag_monarch_reg_forward_cpp, "ASDAG CPU Register-Fused Multi-Stage Monarch Forward");
     m.def("fused_monarch_chain_forward", &asdag_cpu::asdag_fused_monarch_chain_forward_cpp, "ASDAG CPU Fused Monarch Chain Forward (AVX2/AVX-512)");
     m.def("fused_monarch_chain_backward", &asdag_cpu::asdag_fused_monarch_chain_backward_cpp, "ASDAG CPU Fused Monarch Chain Backward (AVX2/AVX-512)");
-    m.def("bitlinear_forward", &asdag_cpu::asdag_bitlinear_forward_cpp, "ASDAG CPU BitLinear Ternary Forward (AVX2/AVX-512)");
+    m.def("bitlinear_forward", [](torch::Tensor x, torch::Tensor w, float gamma, torch::Tensor bias, torch::Tensor preset) {
+        return asdag_cpu::asdag_bitlinear_forward_cpp(x, w, gamma, bias, preset);
+    }, py::arg("x"), py::arg("w_ternary"), py::arg("gamma"), py::arg("bias"), py::arg("preset_amax") = torch::Tensor(),
+    "ASDAG CPU BitLinear Ternary Forward (AVX2/AVX-512)");
     m.def("bitlinear_backward", &asdag_cpu::asdag_bitlinear_backward_cpp, "ASDAG CPU BitLinear Ternary Backward (AVX2/AVX-512)");
-    m.def("bitlinear_twin_forward", &asdag_cpu::asdag_bitlinear_twin_forward_cpp, "ASDAG CPU BitLinear Twin Forward (AVX2/AVX-512)");
+    m.def("bitlinear_twin_forward", [](torch::Tensor x, torch::Tensor w1, float g1, torch::Tensor w2, float g2, torch::Tensor bias, torch::Tensor preset) {
+        return asdag_cpu::asdag_bitlinear_twin_forward_cpp(x, w1, g1, w2, g2, bias, preset);
+    }, py::arg("x"), py::arg("w1_ternary"), py::arg("gamma1"), py::arg("w2_ternary"), py::arg("gamma2"), py::arg("bias"), py::arg("preset_amax") = torch::Tensor(),
+    "ASDAG CPU BitLinear Twin Forward (AVX2/AVX-512)");
     m.def("bitlinear_twin_backward", &asdag_cpu::asdag_bitlinear_twin_backward_cpp, "ASDAG CPU BitLinear Twin Backward (AVX2/AVX-512)");
     m.def("bitlinear_ternary_int_forward", &asdag_cpu::asdag_bitlinear_ternary_int_forward_cpp, "ASDAG CPU 1-Cycle Pure Integer Ternary Add/Sub BitLinear Forward");
     m.def("bitlinear_swiglu_forward", &asdag_cpu::asdag_bitlinear_swiglu_forward_cpp, "ASDAG CPU Fused BitLinear SwiGLU Forward");

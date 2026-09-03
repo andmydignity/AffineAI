@@ -274,7 +274,7 @@ class ASDAGBitLinearAutogradFunction(torch.autograd.Function):
         ops = get_asdag_cpu_ops()
         if ops and hasattr(ops, 'bitlinear_forward') and not x.is_cuda:
             b = bias if has_bias else torch.tensor([])
-            out = ops.bitlinear_forward(x_flat, w_ternary, gamma.item(), b)
+            out = ops.bitlinear_forward(x_flat, w_ternary, gamma.item(), b, torch.tensor([]))
             ctx.save_for_backward(x_flat, w_ternary)
             ctx.gamma = gamma.item()
             ctx.has_bias = has_bias
@@ -365,7 +365,7 @@ class ASDAGBitLinearTwinAutogradFunction(torch.autograd.Function):
 
         ops = get_asdag_cpu_ops()
         if ops and hasattr(ops, 'bitlinear_twin_forward') and not x.is_cuda:
-            out = ops.bitlinear_twin_forward(x_flat, w1t, g1, w2t, g2, b)
+            out = ops.bitlinear_twin_forward(x_flat, w1t, g1, w2t, g2, b, torch.tensor([]))
             ctx.save_for_backward(x_flat, w1t, w2t)
             ctx.g1, ctx.g2, ctx.has_bias = g1, g2, has_bias
             return out.to(x.dtype).reshape(*orig_shape[:-1], 2 * out_dim)

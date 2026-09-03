@@ -213,8 +213,15 @@ class ByteLocalDecoder(nn.Module):
         # Stage 1: Fusion + SiLU
         fused = self.norm1(F.silu(self.fusion(torch.cat([h_byte.to(patch_h.dtype), patch_h], dim=-1))))
         
-        # Stage 2: Residual Gated SwiGLU
-        h2 = F.silu(self.gate_proj(fused)) * self.val_proj(fused)
+        # Stage 2: Residual Gated SwiGLU (twin gate+val in one kernel)
+        if not h_byte.is_cuda:
+            from affine_ai.core.cpp_ops import asdag_cpu_bitlinear_twin
+            gate_out, val_out = asdag_cpu_bitlinear_twin(
+                fused, self.gate_proj.weight, None, self.val_proj.weight, None
+            ).chunk(2, dim=-1)
+            h2 = F.silu(gate_out) * val_out
+        else:
+            h2 = F.silu(self.gate_proj(fused)) * self.val_proj(fused)
         fused2 = self.norm2(fused + self.down_proj(h2))
         
         logits = self.lm_head(fused2.to(self.lm_head.weight.dtype))

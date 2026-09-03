@@ -712,6 +712,233 @@ torch::Tensor asdag_bitlinear_forward_cpp(
     return out.to(orig_dtype);
 }
 
+torch::Tensor asdag_bitlinear_twin_forward_cpp(
+    torch::Tensor x,         // [B, in_dim]
+    torch::Tensor w1_ternary,// [O, in_dim] {-1, 0, +1}
+    float gamma1,
+    torch::Tensor w2_ternary,// [O, in_dim] {-1, 0, +1}
+    float gamma2,
+    torch::Tensor bias       // optional [2*O]
+) {
+    auto orig_dtype = x.scalar_type();
+    x = x.contiguous().to(torch::kFloat32);
+    w1_ternary = w1_ternary.contiguous().to(torch::kFloat32);
+    w2_ternary = w2_ternary.contiguous().to(torch::kFloat32);
+
+    int64_t B = x.size(0);
+    int64_t in_dim = x.size(1);
+    int64_t O = w1_ternary.size(0);
+
+    auto out = torch::empty({B, 2 * O}, x.options());
+
+    const float* x_ptr = x.data_ptr<float>();
+    const float* w1_ptr = w1_ternary.data_ptr<float>();
+    const float* w2_ptr = w2_ternary.data_ptr<float>();
+    const float* b_ptr = bias.defined() ? bias.contiguous().to(torch::kFloat32).data_ptr<float>() : nullptr;
+    float* out_ptr = out.data_ptr<float>();
+
+    int n_threads = asdag::get_physical_cores();
+
+    auto scale_x = torch::empty({B}, torch::kFloat32);
+    auto inv_scale_x = torch::empty({B}, torch::kFloat32);
+    float* sx_ptr = scale_x.data_ptr<float>();
+    float* isx_ptr = inv_scale_x.data_ptr<float>();
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        const float* xb = x_ptr + b * in_dim;
+        float max_val = 1e-5f;
+        for (int64_t i = 0; i < in_dim; ++i) {
+            max_val = std::max(max_val, std::abs(xb[i]));
+        }
+        sx_ptr[b] = 127.0f / max_val;
+        isx_ptr[b] = 1.0f / sx_ptr[b];
+    }
+#pragma omp parallel for collapse(2) num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t o = 0; o < 2 * O; ++o) {
+            const float* xb = x_ptr + b * in_dim;
+            bool first = o < O;
+            const float* wo = first ? (w1_ptr + o * in_dim) : (w2_ptr + (o - O) * in_dim);
+            float gam = first ? gamma1 : gamma2;
+            float sxx = sx_ptr[b];
+            float inv_sxx = isx_ptr[b];
+
+            float acc = 0.0f;
+            int64_t i = 0;
+#if defined(ASDAG_SIMD_AVX512)
+            __m512 acc_v = _mm512_setzero_ps();
+            __m512 sx_v = _mm512_set1_ps(sxx);
+            for (; i + 16 <= in_dim; i += 16) {
+                __m512 xv = _mm512_loadu_ps(xb + i);
+                __m512 wv = _mm512_loadu_ps(wo + i);
+                __m512 xq = _mm512_roundscale_ps(_mm512_mul_ps(xv, sx_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                acc_v = _mm512_fmadd_ps(xq, wv, acc_v);
+            }
+            acc += _mm512_reduce_add_ps(acc_v);
+#elif defined(ASDAG_SIMD_AVX2)
+            __m256 acc_v = _mm256_setzero_ps();
+            __m256 sx_v = _mm256_set1_ps(sxx);
+            for (; i + 8 <= in_dim; i += 8) {
+                __m256 xv = _mm256_loadu_ps(xb + i);
+                __m256 wv = _mm256_loadu_ps(wo + i);
+                __m256 xq = _mm256_round_ps(_mm256_mul_ps(xv, sx_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                acc_v = _mm256_fmadd_ps(xq, wv, acc_v);
+            }
+            float tmp[8];
+            _mm256_storeu_ps(tmp, acc_v);
+            for (int k = 0; k < 8; ++k) acc += tmp[k];
+#endif
+            for (; i < in_dim; ++i) {
+                float xq = std::round(xb[i] * sxx);
+                acc += xq * wo[i];
+            }
+
+            float y_val = acc * inv_sxx * gam;
+            if (b_ptr) y_val += b_ptr[o];
+            out_ptr[b * 2 * O + o] = y_val;
+        }
+    }
+
+    return out.to(orig_dtype);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> asdag_bitlinear_twin_backward_cpp(
+    torch::Tensor grad_output, // [B, 2*O]
+    torch::Tensor x,           // [B, in_dim]
+    torch::Tensor w1_ternary,  // [O, in_dim]
+    float gamma1,
+    torch::Tensor w2_ternary,  // [O, in_dim]
+    float gamma2,
+    bool has_bias
+) {
+    auto orig_dtype = grad_output.scalar_type();
+    grad_output = grad_output.contiguous().to(torch::kFloat32);
+    x = x.contiguous().to(torch::kFloat32);
+    w1_ternary = w1_ternary.contiguous().to(torch::kFloat32);
+    w2_ternary = w2_ternary.contiguous().to(torch::kFloat32);
+
+    int64_t B = x.size(0);
+    int64_t in_dim = x.size(1);
+    int64_t O = w1_ternary.size(0);
+
+    auto grad_x = torch::empty({B, in_dim}, x.options());
+    auto grad_w1 = torch::zeros({O, in_dim}, x.options());
+    auto grad_w2 = torch::zeros({O, in_dim}, x.options());
+    auto grad_bias = has_bias ? torch::zeros({2 * O}, x.options()) : torch::tensor({}, x.options());
+
+    const float* go_ptr = grad_output.data_ptr<float>();
+    const float* x_ptr = x.data_ptr<float>();
+    const float* w1_ptr = w1_ternary.data_ptr<float>();
+    const float* w2_ptr = w2_ternary.data_ptr<float>();
+
+    float* gx_ptr = grad_x.data_ptr<float>();
+    float* gw1_ptr = grad_w1.data_ptr<float>();
+    float* gw2_ptr = grad_w2.data_ptr<float>();
+    float* gb_ptr = has_bias ? grad_bias.data_ptr<float>() : nullptr;
+
+    int n_threads = asdag::get_physical_cores();
+
+    auto x_quant = torch::empty({B, in_dim}, torch::kFloat32);
+    float* xq_ptr = x_quant.data_ptr<float>();
+
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        const float* xb = x_ptr + b * in_dim;
+        float* xqb = xq_ptr + b * in_dim;
+
+        float max_val = 1e-5f;
+        for (int64_t i = 0; i < in_dim; ++i) max_val = std::max(max_val, std::abs(xb[i]));
+        float scale_x = 127.0f / max_val;
+        float inv_scale_x = 1.0f / scale_x;
+
+        int64_t i = 0;
+#if defined(ASDAG_SIMD_AVX512)
+        __m512 sx_v = _mm512_set1_ps(scale_x);
+        __m512 isx_v = _mm512_set1_ps(inv_scale_x);
+        for (; i + 16 <= in_dim; i += 16) {
+            __m512 xv = _mm512_loadu_ps(xb + i);
+            __m512 qv = _mm512_roundscale_ps(_mm512_mul_ps(xv, sx_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm512_storeu_ps(xqb + i, _mm512_mul_ps(qv, isx_v));
+        }
+#elif defined(ASDAG_SIMD_AVX2)
+        __m256 sx_v = _mm256_set1_ps(scale_x);
+        __m256 isx_v = _mm256_set1_ps(inv_scale_x);
+        for (; i + 8 <= in_dim; i += 8) {
+            __m256 xv = _mm256_loadu_ps(xb + i);
+            __m256 qv = _mm256_round_ps(_mm256_mul_ps(xv, sx_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm256_storeu_ps(xqb + i, _mm256_mul_ps(qv, isx_v));
+        }
+#endif
+        for (; i < in_dim; ++i) {
+            xqb[i] = std::round(xb[i] * scale_x) * inv_scale_x;
+        }
+    }
+
+    std::vector<std::vector<float>> t_gw1(n_threads, std::vector<float>((size_t)O * in_dim, 0.f));
+    std::vector<std::vector<float>> t_gw2(n_threads, std::vector<float>((size_t)O * in_dim, 0.f));
+    std::vector<std::vector<float>> t_gb(n_threads, has_bias ? std::vector<float>(2 * (size_t)O, 0.f) : std::vector<float>());
+#pragma omp parallel num_threads(n_threads)
+    {
+        int tid = omp_get_thread_num();
+        asdag::pin_thread_to_physical_core(tid);
+#pragma omp for schedule(static)
+        for (int64_t b = 0; b < B; ++b) {
+            const float* gob = go_ptr + b * 2 * O;
+            const float* xqb = xq_ptr + b * in_dim;
+            float* gxb = gx_ptr + b * in_dim;
+            std::memset(gxb, 0, in_dim * sizeof(float));
+
+            for (int64_t o = 0; o < 2 * O; ++o) {
+                bool first = o < O;
+                int64_t oo = first ? o : o - O;
+                float go_scaled = gob[o] * (first ? gamma1 : gamma2);
+                const float* wo = first ? (w1_ptr + oo * in_dim) : (w2_ptr + oo * in_dim);
+                float* gw = first ? t_gw1[tid].data() : t_gw2[tid].data();
+
+                int64_t i = 0;
+#if defined(ASDAG_SIMD_AVX512)
+                __m512 go_vec = _mm512_set1_ps(go_scaled);
+                for (; i + 16 <= in_dim; i += 16) {
+                    __m512 w_vec = _mm512_loadu_ps(wo + i);
+                    __m512 gx_vec = _mm512_loadu_ps(gxb + i);
+                    _mm512_storeu_ps(gxb + i, _mm512_fmadd_ps(go_vec, w_vec, gx_vec));
+                }
+#elif defined(ASDAG_SIMD_AVX2)
+                __m256 go_vec = _mm256_set1_ps(go_scaled);
+                for (; i + 8 <= in_dim; i += 8) {
+                    __m256 w_vec = _mm256_loadu_ps(wo + i);
+                    __m256 gx_vec = _mm256_loadu_ps(gxb + i);
+                    _mm256_storeu_ps(gxb + i, _mm256_fmadd_ps(go_vec, w_vec, gx_vec));
+                }
+#endif
+                for (; i < in_dim; ++i) gxb[i] += go_scaled * wo[i];
+                float* gow = gw + oo * in_dim;
+                for (int64_t k = 0; k < in_dim; ++k) gow[k] += gob[o] * xqb[k];
+                if (has_bias) t_gb[tid][o] += gob[o];
+            }
+        }
+    }
+    for (int t = 0; t < n_threads; ++t) {
+        float* a = gw1_ptr;
+        float* b = gw2_ptr;
+        const float* x1 = t_gw1[t].data();
+        const float* x2 = t_gw2[t].data();
+        for (int64_t i = 0; i < (int64_t)O * in_dim; ++i) { a[i] += x1[i]; b[i] += x2[i]; }
+        if (has_bias) {
+            float* g = gb_ptr;
+            const float* xg = t_gb[t].data();
+            for (int64_t i = 0; i < 2 * O; ++i) g[i] += xg[i];
+        }
+    }
+
+    return std::make_tuple(
+        grad_x.to(orig_dtype),
+        grad_w1.to(orig_dtype),
+        grad_w2.to(orig_dtype),
+        grad_bias.to(orig_dtype)
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 10. C++ Monarch Permutation Chain Backward (AVX2 / AVX-512 SIMD)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2350,7 +2577,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto ternarize_w = [](torch::Tensor w) {
         float gamma = w.abs().mean().item<float>();
         if (gamma < 1e-5f) gamma = 1e-5f;
-        return torch::clamp(torch::round(w / gamma), -1.f, 1.f) * gamma;
+        return torch::clamp(torch::round(w / gamma), -1.f, 1.f);
     };
     auto w_p2b = ternarize_w(patch_to_byte_weight);
     auto w_fus = ternarize_w(fusion_weight);
@@ -2358,6 +2585,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto w_val = ternarize_w(val_weight);
     auto w_down = ternarize_w(down_weight);
     auto w_lm = ternarize_w(lm_head_weight);
+    auto gamma_of = [](torch::Tensor w) {
+        float g = w.abs().mean().item<float>();
+        return g < 1e-5f ? 1e-5f : g;
+    };
+    float g_p2b = gamma_of(patch_to_byte_weight);
+    float g_fus = gamma_of(fusion_weight);
+    float g_down = gamma_of(down_weight);
+    float g_lm = gamma_of(lm_head_weight);
+    auto no_bias = torch::tensor({});
 
     int64_t B = h_byte.size(0);
     int64_t T = h_byte.size(1);
@@ -2369,25 +2605,32 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     // 1. Patch to byte context gathering
     auto clp_flat = causal_latent_patches.reshape({B * M, d_model});
-    auto ph_p = torch::mm(clp_flat, w_p2b.t()).reshape({B, M, d_byte});
+    auto ph_p = asdag_bitlinear_forward_cpp(clp_flat, w_p2b, g_p2b, no_bias).reshape({B, M, d_byte});
     auto pa_exp = patch_assignments.unsqueeze(-1).expand({B, T, d_byte});
     auto patch_h = torch::gather(ph_p, 1, pa_exp).reshape({N, d_byte});
 
     // 2. Fusion layer: cat_h -> u1 -> s1 -> fused1
     auto hb_flat = h_byte.reshape({N, d_byte});
     auto cat_h = torch::cat({hb_flat, patch_h}, -1);
-    auto u1 = torch::mm(cat_h, w_fus.t());
+    auto u1 = asdag_bitlinear_forward_cpp(cat_h, w_fus, g_fus, no_bias);
     auto sig1 = torch::sigmoid(u1);
     auto s1 = u1 * sig1;
     auto rms1 = torch::rsqrt(s1.pow(2).mean(-1, true) + 1e-6f);
     auto fused1 = s1 * rms1 * norm1_scale.unsqueeze(0);
 
     // 3. Layer 2 SwiGLU: fused1 -> ug, uv -> hact -> f2_pre -> fused2
-    auto ug = torch::mm(fused1, w_gate.t());
-    auto uv = torch::mm(fused1, w_val.t());
+    // Twin gate+val: single activation quant instead of two.
+    float gg1 = gate_weight.abs().mean().item<float>();
+    if (gg1 < 1e-5f) gg1 = 1e-5f;
+    float gg2 = val_weight.abs().mean().item<float>();
+    if (gg2 < 1e-5f) gg2 = 1e-5f;
+    auto gv = asdag_bitlinear_twin_forward_cpp(
+        fused1, w_gate, gg1, w_val, gg2, torch::tensor({}));
+    auto ug = gv.slice(1, 0, gv.size(1) / 2);
+    auto uv = gv.slice(1, gv.size(1) / 2);
     auto sig_g = torch::sigmoid(ug);
     auto hact = (ug * sig_g) * uv;
-    auto f2_pre = fused1 + torch::mm(hact, w_down.t());
+    auto f2_pre = fused1 + asdag_bitlinear_forward_cpp(hact, w_down, g_down, no_bias);
     auto rms2 = torch::rsqrt(f2_pre.pow(2).mean(-1, true) + 1e-6f);
     auto fused2 = f2_pre * rms2 * norm2_scale.unsqueeze(0);
 
@@ -2408,7 +2651,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         auto f2_c = fused2.slice(0, c_start, c_end);
         auto tgt_c = targets_flat.slice(0, c_start, c_end);
 
-        auto logits_c = torch::mm(f2_c, w_lm.t());
+        auto logits_c = asdag_bitlinear_forward_cpp(f2_c, w_lm, g_lm, no_bias);
         auto max_l = std::get<0>(logits_c.max(-1, true));
         auto exp_l = torch::exp(logits_c - max_l);
         auto sum_exp = exp_l.sum(-1, true);
@@ -2421,8 +2664,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         auto d_logits_c = probs_c * scale;
         d_logits_c.scatter_add_(1, tgt_exp, torch::full({cur_c, 1}, -scale, torch::kFloat32));
 
-        grad_lm.addmm_(d_logits_c.t(), f2_c);
-        g_fused2.slice(0, c_start, c_end) = torch::mm(d_logits_c, w_lm);
+        auto [g_f2c, g_lm_c, g_lm_b] = asdag_bitlinear_backward_cpp(
+            d_logits_c, f2_c, w_lm, g_lm, false
+        );
+        (void)g_lm_b;
+        grad_lm += g_lm_c;
+        g_fused2.slice(0, c_start, c_end) = g_f2c;
     }
     total_loss[0] = float(loss_acc * scale);
 
@@ -2432,17 +2679,25 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto g_f2_pre = rms2 * norm2_scale.unsqueeze(0) * (g_fused2 - yn2 * (sum_g_f2 / float(d_byte)));
     auto grad_n2 = (g_fused2 * yn2).sum(0);
 
-    auto grad_down = torch::mm(g_f2_pre.t(), hact);
-    auto g_hact = torch::mm(g_f2_pre, w_down);
+    auto [g_hact, grad_down, grad_down_b] = asdag_bitlinear_backward_cpp(
+        g_f2_pre, hact, w_down, g_down, false
+    );
+    (void)grad_down_b;
 
     auto dsilu_g = sig_g * (1.0f + ug * (1.0f - sig_g));
     auto g_ug = g_hact * uv * dsilu_g;
     auto g_uv = g_hact * (ug * sig_g);
 
-    auto grad_gate = torch::mm(g_ug.t(), fused1);
-    auto grad_val = torch::mm(g_uv.t(), fused1);
-
-    auto g_fused1 = g_f2_pre + torch::mm(g_ug, w_gate) + torch::mm(g_uv, w_val);
+    float hg1 = gate_weight.abs().mean().item<float>();
+    if (hg1 < 1e-5f) hg1 = 1e-5f;
+    float hg2 = val_weight.abs().mean().item<float>();
+    if (hg2 < 1e-5f) hg2 = 1e-5f;
+    auto g_gv = torch::cat({g_ug, g_uv}, 1);
+    auto [g_fused1_add, grad_gate, grad_val, grad_gv_bias] = asdag_bitlinear_twin_backward_cpp(
+        g_gv, fused1, w_gate, hg1, w_val, hg2, false
+    );
+    (void)grad_gv_bias;
+    auto g_fused1 = g_f2_pre + g_fused1_add;
 
     // 6. Backprop through Layer 1 RMSNorm & Fusion
     auto yn1 = s1 * rms1;
@@ -2453,8 +2708,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto dsilu1 = sig1 * (1.0f + u1 * (1.0f - sig1));
     auto g_u1 = g_s1 * dsilu1;
 
-    auto grad_fusion = torch::mm(g_u1.t(), cat_h);
-    auto g_cat = torch::mm(g_u1, w_fus);
+    auto [g_cat, grad_fusion, grad_fusion_b] = asdag_bitlinear_backward_cpp(
+        g_u1, cat_h, w_fus, g_fus, false
+    );
+    (void)grad_fusion_b;
 
     auto grad_h_byte = g_cat.slice(1, 0, d_byte).reshape({B, T, d_byte});
     auto g_patch_h = g_cat.slice(1, d_byte, 2 * d_byte).reshape({B, T, d_byte});
@@ -2464,8 +2721,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     g_ph_p.scatter_add_(1, pa_exp, g_patch_h);
 
     auto g_ph_flat = g_ph_p.reshape({B * M, d_byte});
-    auto grad_p2b = torch::mm(g_ph_flat.t(), clp_flat);
-    auto grad_patches = torch::mm(g_ph_flat, w_p2b).reshape({B, M, d_model});
+    auto [g_clp_flat, grad_p2b, grad_p2b_b] = asdag_bitlinear_backward_cpp(
+        g_ph_flat, clp_flat, w_p2b, g_p2b, false
+    );
+    (void)grad_p2b_b;
+    auto grad_patches = g_clp_flat.reshape({B, M, d_model});
 
     return std::make_tuple(
         total_loss,
@@ -4986,6 +5246,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_monarch_chain_backward", &asdag_cpu::asdag_fused_monarch_chain_backward_cpp, "ASDAG CPU Fused Monarch Chain Backward (AVX2/AVX-512)");
     m.def("bitlinear_forward", &asdag_cpu::asdag_bitlinear_forward_cpp, "ASDAG CPU BitLinear Ternary Forward (AVX2/AVX-512)");
     m.def("bitlinear_backward", &asdag_cpu::asdag_bitlinear_backward_cpp, "ASDAG CPU BitLinear Ternary Backward (AVX2/AVX-512)");
+    m.def("bitlinear_twin_forward", &asdag_cpu::asdag_bitlinear_twin_forward_cpp, "ASDAG CPU BitLinear Twin Forward (AVX2/AVX-512)");
+    m.def("bitlinear_twin_backward", &asdag_cpu::asdag_bitlinear_twin_backward_cpp, "ASDAG CPU BitLinear Twin Backward (AVX2/AVX-512)");
     m.def("bitlinear_ternary_int_forward", &asdag_cpu::asdag_bitlinear_ternary_int_forward_cpp, "ASDAG CPU 1-Cycle Pure Integer Ternary Add/Sub BitLinear Forward");
     m.def("bitlinear_swiglu_forward", &asdag_cpu::asdag_bitlinear_swiglu_forward_cpp, "ASDAG CPU Fused BitLinear SwiGLU Forward");
     m.def("bitlinear_swiglu_backward_recompute", &asdag_cpu::asdag_bitlinear_swiglu_backward_recompute_cpp, "ASDAG CPU Zero-RAM Rematerialization SwiGLU Backward");

@@ -346,6 +346,70 @@ def asdag_cpu_bitlinear(
     return ASDAGBitLinearAutogradFunction.apply(x, weight, bias)
 
 
+class ASDAGBitLinearTwinAutogradFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w1, b1, w2, b2):
+        orig_shape = x.shape
+        in_dim = w1.size(1)
+        out_dim = w1.size(0)
+        x_flat = x.reshape(-1, in_dim)
+
+        def tern(w):
+            gamma = w.abs().mean().clamp(min=1e-5)
+            return torch.round(w / gamma).clamp(-1.0, 1.0), gamma.item()
+
+        w1t, g1 = tern(w1)
+        w2t, g2 = tern(w2)
+        has_bias = b1 is not None and b2 is not None
+        b = torch.cat([b1, b2], dim=0) if has_bias else torch.tensor([])
+
+        ops = get_asdag_cpu_ops()
+        if ops and hasattr(ops, 'bitlinear_twin_forward') and not x.is_cuda:
+            out = ops.bitlinear_twin_forward(x_flat, w1t, g1, w2t, g2, b)
+            ctx.save_for_backward(x_flat, w1t, w2t)
+            ctx.g1, ctx.g2, ctx.has_bias = g1, g2, has_bias
+            return out.to(x.dtype).reshape(*orig_shape[:-1], 2 * out_dim)
+
+        x_amax = x_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        x_q = torch.round(x_flat / x_amax * 127.0).clamp(-128.0, 127.0) / 127.0 * x_amax
+        o1 = F.linear(x_q, w1t * g1, b1)
+        o2 = F.linear(x_q, w2t * g2, b2)
+        ctx.save_for_backward(x_flat, w1t, w2t)
+        ctx.g1, ctx.g2, ctx.has_bias = g1, g2, has_bias
+        return torch.cat([o1, o2], dim=-1).to(x.dtype).reshape(*orig_shape[:-1], 2 * out_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_flat, w1t, w2t = ctx.saved_tensors
+        g1, g2, has_bias = ctx.g1, ctx.g2, ctx.has_bias
+        out_dim = w1t.size(0)
+        go_flat = grad_output.reshape(-1, 2 * out_dim)
+
+        ops = get_asdag_cpu_ops()
+        if ops and hasattr(ops, 'bitlinear_twin_backward') and not grad_output.is_cuda:
+            gx, gw1, gw2, gb = ops.bitlinear_twin_backward(go_flat, x_flat, w1t, g1, w2t, g2, has_bias)
+            grad_b = gb.to(grad_output.dtype) if has_bias else None
+            return (gx.to(grad_output.dtype).reshape(grad_output.shape[:-1] + (w1t.size(1),)),
+                    gw1.to(w1t.dtype), grad_b[:out_dim].to(w1t.dtype) if has_bias else None,
+                    gw2.to(w2t.dtype), grad_b[out_dim:].to(w2t.dtype) if has_bias else None)
+
+        go1, go2 = go_flat.split(out_dim, dim=-1)
+        gx = F.linear(go1, (w1t * g1).t()) + F.linear(go2, (w2t * g2).t())
+        return (gx.to(grad_output.dtype).reshape(grad_output.shape[:-1] + (w1t.size(1),)),
+                (go1.t() @ x_flat).to(w1t.dtype), (go1.sum(0)).to(w1t.dtype) if has_bias else None,
+                (go2.t() @ x_flat).to(w2t.dtype), (go2.sum(0)).to(w2t.dtype) if has_bias else None)
+
+
+def asdag_cpu_bitlinear_twin(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    b1: Optional[torch.Tensor],
+    w2: torch.Tensor,
+    b2: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return ASDAGBitLinearTwinAutogradFunction.apply(x, w1, b1, w2, b2)
+
+
 class ASDAGGLAScanAutogradFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:

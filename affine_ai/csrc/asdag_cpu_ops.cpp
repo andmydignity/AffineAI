@@ -651,25 +651,33 @@ torch::Tensor asdag_bitlinear_forward_cpp(
 
     int n_threads = asdag::get_physical_cores();
 
+    auto scale_x = torch::empty({B}, torch::kFloat32);
+    auto inv_scale_x = torch::empty({B}, torch::kFloat32);
+    float* sx_ptr = scale_x.data_ptr<float>();
+    float* isx_ptr = inv_scale_x.data_ptr<float>();
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        const float* xb = x_ptr + b * in_dim;
+        float max_val = 1e-5f;
+        for (int64_t i = 0; i < in_dim; ++i) {
+            max_val = std::max(max_val, std::abs(xb[i]));
+        }
+        sx_ptr[b] = 127.0f / max_val;
+        isx_ptr[b] = 1.0f / sx_ptr[b];
+    }
 #pragma omp parallel for collapse(2) num_threads(n_threads) schedule(static)
     for (int64_t b = 0; b < B; ++b) {
         for (int64_t o = 0; o < out_dim; ++o) {
             const float* xb = x_ptr + b * in_dim;
             const float* wo = w_ptr + o * in_dim;
-
-            // Activation quant scale: max(|x|)
-            float max_val = 1e-5f;
-            for (int64_t i = 0; i < in_dim; ++i) {
-                max_val = std::max(max_val, std::abs(xb[i]));
-            }
-            float scale_x = 127.0f / max_val;
-            float inv_scale_x = 1.0f / scale_x;
+            float sxx = sx_ptr[b];
+            float inv_sxx = isx_ptr[b];
 
             float acc = 0.0f;
             int64_t i = 0;
 #if defined(ASDAG_SIMD_AVX512)
             __m512 acc_v = _mm512_setzero_ps();
-            __m512 sx_v = _mm512_set1_ps(scale_x);
+            __m512 sx_v = _mm512_set1_ps(sxx);
             for (; i + 16 <= in_dim; i += 16) {
                 __m512 xv = _mm512_loadu_ps(xb + i);
                 __m512 wv = _mm512_loadu_ps(wo + i);
@@ -679,7 +687,7 @@ torch::Tensor asdag_bitlinear_forward_cpp(
             acc += _mm512_reduce_add_ps(acc_v);
 #elif defined(ASDAG_SIMD_AVX2)
             __m256 acc_v = _mm256_setzero_ps();
-            __m256 sx_v = _mm256_set1_ps(scale_x);
+            __m256 sx_v = _mm256_set1_ps(sxx);
             for (; i + 8 <= in_dim; i += 8) {
                 __m256 xv = _mm256_loadu_ps(xb + i);
                 __m256 wv = _mm256_loadu_ps(wo + i);
@@ -691,11 +699,11 @@ torch::Tensor asdag_bitlinear_forward_cpp(
             for (int k = 0; k < 8; ++k) acc += tmp[k];
 #endif
             for (; i < in_dim; ++i) {
-                float xq = std::round(xb[i] * scale_x);
+                float xq = std::round(xb[i] * sxx);
                 acc += xq * wo[i];
             }
 
-            float y_val = acc * inv_scale_x * gamma;
+            float y_val = acc * inv_sxx * gamma;
             if (b_ptr) y_val += b_ptr[o];
             out_ptr[b * out_dim + o] = y_val;
         }

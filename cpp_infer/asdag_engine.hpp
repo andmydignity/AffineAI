@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <cstdio>
 #include <string>
 #include <iostream>
 #include <fstream>
@@ -67,17 +68,60 @@ namespace asdag {
 // ─────────────────────────────────────────────────────────────────────────────
 // Physical core pinning (bypasses SMT siblings)
 // ─────────────────────────────────────────────────────────────────────────────
+inline const std::vector<int>& physical_cpu_list() {
+    static std::vector<int> cpus = [] {
+        std::vector<int> out;
+#if defined(__linux__)
+        auto parse_first = [](const char* path) {
+            int first = -1;
+            FILE* f = std::fopen(path, "r");
+            if (f) {
+                int a = -1, b = -1;
+                char buf[256] = {0};
+                if (std::fgets(buf, sizeof(buf), f)) {
+                    if (std::sscanf(buf, "%d-%d", &a, &b) == 2) first = std::min(a, b);
+                    else if (std::sscanf(buf, "%d", &a) == 1) first = a;
+                }
+                std::fclose(f);
+            }
+            return first;
+        };
+        int total = (int)std::thread::hardware_concurrency();
+        if (total > 0) {
+            std::vector<int> seen;
+            for (int cpu = 0; cpu < total; ++cpu) {
+                char path[128];
+                std::snprintf(path, sizeof(path),
+                    "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+                int first = parse_first(path);
+                if (first < 0) { out.clear(); break; }
+                bool known = false;
+                for (int s : seen) if (s == first) { known = true; break; }
+                if (!known) { seen.push_back(first); out.push_back(cpu); }
+            }
+        }
+#endif
+        if (out.empty()) {
+            int total = (int)std::thread::hardware_concurrency();
+            int n = (total >= 8) ? (total / 2) : std::max(1, total);
+            for (int i = 0; i < n; ++i) out.push_back((i * 2) % std::max(1, total));
+        }
+        return out;
+    }();
+    return cpus;
+}
+
 inline int get_physical_cores() {
-    int total = (int)std::thread::hardware_concurrency();
-    return (total >= 8) ? (total / 2) : std::max(1, total);
+    return (int)physical_cpu_list().size();
 }
 
 inline void pin_thread_to_physical_core(int thread_id) {
 #if defined(__linux__)
+    const std::vector<int>& cpus = physical_cpu_list();
+    if (cpus.empty()) return;
     cpu_set_t cs;
     CPU_ZERO(&cs);
-    int cpu_id = (thread_id * 2) % (int)std::thread::hardware_concurrency();
-    CPU_SET(cpu_id, &cs);
+    CPU_SET(cpus[thread_id % (int)cpus.size()], &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cs);
 #endif
 }

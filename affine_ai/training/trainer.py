@@ -27,8 +27,24 @@ from affine_ai.core.loss import ChunkedCrossEntropyLoss
 
 
 def get_cpu_physical_cores() -> int:
-    """Returns number of physical CPU cores (bypassing SMT hyperthreading)."""
+    """Returns number of physical CPU cores (bypassing SMT hyperthreading).
+
+    Detects real SMT pairing via sysfs; falls back to the total//2 heuristic
+    only when topology is unreadable (non-Linux). On non-SMT machines
+    (e.g. ARM) this returns the full core count instead of halving it.
+    """
     count = os.cpu_count() or 1
+    try:
+        seen = set()
+        for cpu in range(count):
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+                first = f.read().strip().split(",")[0].split("-")[0]
+                if first not in seen:
+                    seen.add(first)
+        if seen:
+            return len(seen)
+    except OSError:
+        pass
     return count // 2 if count >= 8 else max(1, count)
 
 

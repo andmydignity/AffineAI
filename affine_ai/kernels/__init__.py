@@ -7,6 +7,14 @@ try:
     from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
     from affine_ai.kernels.triton_asdag import fused_asdag_forward_triton
     from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
+    from affine_ai.kernels.triton_ternary import (
+        triton_ternary_linear,
+        triton_ternary_twin,
+        triton_row_amax,
+        triton_ternary_linear_fwd,
+        triton_fp32_linear,
+        triton_ternary_linear_gw,
+    )
     TRITON_AVAILABLE = True
 except Exception:
     TRITON_AVAILABLE = False
@@ -14,12 +22,24 @@ except Exception:
     triton_rms_norm = None
     triton_fused_linear_cross_entropy = None
     triton_fused_lpc_head = None
+    triton_ternary_linear = None
+    triton_ternary_twin = None
+    triton_row_amax = None
+    triton_ternary_linear_fwd = None
+    triton_fp32_linear = None
+    triton_ternary_linear_gw = None
 
 __all__ = [
     "fused_asdag_forward_triton",
     "triton_rms_norm",
     "triton_fused_linear_cross_entropy",
     "triton_fused_lpc_head",
+    "triton_ternary_linear",
+    "triton_ternary_twin",
+    "triton_row_amax",
+    "triton_ternary_linear_fwd",
+    "triton_fp32_linear",
+    "triton_ternary_linear_gw",
     "TRITON_AVAILABLE",
 ]
 

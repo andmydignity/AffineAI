@@ -41,6 +41,12 @@ class BitLinear(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_bitlinear
             return asdag_cpu_bitlinear(x, self.weight, self.bias)
 
+        try:
+            from affine_ai.kernels.triton_ternary import triton_ternary_linear
+            return triton_ternary_linear(x, self.weight, self.bias).to(x.dtype)
+        except Exception:
+            pass
+
         orig_dtype = x.dtype
         x_in = x.to(self.weight.dtype)
 

@@ -1306,21 +1306,24 @@ class ASDAGEntropyPatcherAutogradFunction(torch.autograd.Function):
         h_r = h_byte.view(B, M, P_size, D_byte)
         w_r = F.softmax(boundary_logits.view(B, M, P_size), dim=-1).unsqueeze(-1)
         pe = (h_r * w_r).sum(dim=2)
-        pe_proj = F.linear(pe.to(w_proj.dtype), w_proj).float()
-        rms = torch.rsqrt(pe_proj.pow(2).mean(dim=-1, keepdim=True) + 1e-5)
+        gamma = w_proj.detach().abs().mean().clamp(min=1e-5)
+        w_q = (torch.round(w_proj / gamma).clamp(-1.0, 1.0) * gamma).to(w_proj.dtype)
+        w_ste = w_proj + (w_q - w_proj).detach()
+        pe_proj = F.linear(pe.to(w_proj.dtype), w_ste).float()
+        rms = torch.rsqrt(pe_proj.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
         out = pe_proj * rms * norm_scale.float()
-        ctx.save_for_backward(h_r, w_r, pe, pe_proj, rms, norm_scale, w_proj)
+        ctx.save_for_backward(h_r, w_r, pe, pe_proj, rms, norm_scale, w_q)
         ctx.P_size = P_size
         return out.to(h_byte.dtype)
         
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        h_r, w_r, pe, pe_proj, rms, norm_scale, w_proj = ctx.saved_tensors
+        h_r, w_r, pe, pe_proj, rms, norm_scale, w_q = ctx.saved_tensors
         B, M, P_size, D_byte = h_r.shape
-        d_model = w_proj.shape[0]
+        d_model = w_q.shape[0]
         grad_out = grad_out.float()
         norm_scale = norm_scale.float()
-        w_proj_f = w_proj.float()
+        w_proj_f = w_q.float()
         
         # RMSNorm bwd
         gy = grad_out * norm_scale
@@ -1341,7 +1344,7 @@ class ASDAGEntropyPatcherAutogradFunction(torch.autograd.Function):
         g_logits_r = w_r * (g_w_r - sum_w_gw)
         g_boundary_logits = g_logits_r.squeeze(-1).reshape(B, -1)
         
-        return g_h_byte.to(h_r.dtype), g_boundary_logits.to(h_r.dtype), g_w_proj.to(w_proj.dtype), g_scale.to(norm_scale.dtype), None
+        return g_h_byte.to(h_r.dtype), g_boundary_logits.to(h_r.dtype), g_w_proj.to(w_q.dtype), g_scale.to(norm_scale.dtype), None
 
 
 class ASDAGByteEncoderAutogradFunction(torch.autograd.Function):

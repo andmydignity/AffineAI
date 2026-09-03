@@ -221,7 +221,14 @@ class ByteLocalDecoder(nn.Module):
             ).chunk(2, dim=-1)
             h2 = F.silu(gate_out) * val_out
         else:
-            h2 = F.silu(self.gate_proj(fused)) * self.val_proj(fused)
+            try:
+                from affine_ai.kernels.triton_ternary import triton_ternary_twin
+                gate_out, val_out = triton_ternary_twin(
+                    fused, self.gate_proj.weight, None, self.val_proj.weight, None
+                ).chunk(2, dim=-1)
+                h2 = F.silu(gate_out) * val_out
+            except Exception:
+                h2 = F.silu(self.gate_proj(fused)) * self.val_proj(fused)
         fused2 = self.norm2(fused + self.down_proj(h2))
         
         logits = self.lm_head(fused2.to(self.lm_head.weight.dtype))

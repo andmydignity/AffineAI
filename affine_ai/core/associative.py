@@ -127,6 +127,11 @@ class MonarchPermutationChain(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_monarch_chain
             return asdag_cpu_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
+        try:
+            from affine_ai.kernels.triton_gla import triton_monarch_chain
+            return triton_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+        except Exception:
+            pass
         from affine_ai.kernels.triton_monarch import triton_monarch_chain
         return triton_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
@@ -172,6 +177,11 @@ class FusedMonarchChain(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_monarch_chain
             return asdag_cpu_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
+        try:
+            from affine_ai.kernels.triton_gla import triton_fused_monarch_chain
+            return triton_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+        except Exception:
+            pass
         from affine_ai.kernels.triton_monarch import triton_fused_monarch_chain
         return triton_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 

@@ -90,6 +90,61 @@ class ASDAGBlock(nn.Module):
                 reset_mask
             )
 
+        # Fused tree-block kernel diverges from the reference path; keep off.
+        if False and (not x.is_cuda and not return_state and state is None
+            and self.channel_mixer_type == "asdag_tree"
+            and x.shape[-1] >= 64
+            and getattr(self.time_mixer, 'proj_type', '') == "monarch"
+            and getattr(self.time_mixer, 'rule', 'gla') == "gla"):
+            from affine_ai.core.cpp_ops import asdag_cpu_fused_asdag_tree_block
+            from affine_ai.core.ast_dag import ternarize
+            tm = self.time_mixer
+            leaves = self.asdag.leaves
+            w_perm_stack = torch.stack([
+                ternarize(leaf.latent_w_perm, self.asdag.threshold_frac, scale=leaf.scale_perm if self.asdag.learnable_scale else None)
+                for leaf in leaves
+            ], dim=0)
+            b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
+            perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
+            inv_perms_stack = torch.stack([leaf.inv_perms for leaf in leaves], dim=0)
+            B, T, C = x.shape
+            x_flat = x.reshape(-1, C)
+            if self.asdag.use_hierarchical_routing:
+                routing_probs, _ = self.asdag.router.route_tokens(x_flat)
+            else:
+                r_w = self.asdag.router_weights
+                logits = torch.nn.functional.linear(x_flat, r_w, self.asdag.router_biases)
+                routing_probs = torch.nn.functional.softmax(logits, dim=-1)
+            top_k = self.asdag.top_k if self.asdag.top_k is not None else routing_probs.shape[-1]
+            if top_k < routing_probs.shape[-1]:
+                top_vals, top_indices = torch.topk(routing_probs, k=top_k, dim=-1)
+                top_weights = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            else:
+                top_indices = torch.arange(routing_probs.shape[-1], device=x.device).unsqueeze(0).expand(x_flat.shape[0], -1)
+                top_weights = routing_probs
+            top_indices = top_indices.reshape(B, T, -1)
+            top_weights = top_weights.reshape(B, T, -1)
+            return asdag_cpu_fused_asdag_tree_block(
+                x,
+                self.norm1.scale,
+                tm.qkvg_proj.diagonals,
+                tm.qkvg_proj.perms,
+                tm.qkvg_proj.inv_perms,
+                tm.qkvg_proj.bias,
+                tm.q_norm.scale,
+                tm.k_norm.scale,
+                tm.gate_decay.weight,
+                tm.gate_decay.bias,
+                tm.out_proj.diagonals,
+                tm.out_proj.perms,
+                tm.out_proj.inv_perms,
+                tm.out_proj.bias,
+                self.norm2.scale,
+                w_perm_stack, perms_stack, inv_perms_stack, b_stack,
+                top_indices, top_weights,
+                reset_mask
+            )
+
         # 1. Time Mixer (Monarch GLA State Space)
         time_out, next_state = self.time_mixer(
             self.norm1(x),

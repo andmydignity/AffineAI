@@ -628,6 +628,115 @@ def asdag_cpu_fused_asdag_block(
     )
 
 
+class ASDAGFusedTreeBlockAutogradFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        norm1_scale: torch.Tensor,
+        qkvg_diagonals: torch.Tensor,
+        qkvg_perms: torch.Tensor,
+        qkvg_inv_perms: torch.Tensor,
+        qkvg_bias: torch.Tensor,
+        q_norm_scale: torch.Tensor,
+        k_norm_scale: torch.Tensor,
+        w_decay: torch.Tensor,
+        b_decay: torch.Tensor,
+        out_diagonals: torch.Tensor,
+        out_perms: torch.Tensor,
+        out_inv_perms: torch.Tensor,
+        out_bias: torch.Tensor,
+        norm2_scale: torch.Tensor,
+        w_perm: torch.Tensor,
+        perms: torch.Tensor,
+        inv_perms: torch.Tensor,
+        bias: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_weights: torch.Tensor,
+        reset_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        ops = get_asdag_cpu_ops()
+        rm = reset_mask if reset_mask is not None else torch.empty((0,))
+        if ops and hasattr(ops, 'fused_asdag_tree_block_forward') and not x.is_cuda:
+            out_y, x_norm1, x1, x_norm2, qkvg_raw, phi_q, phi_k, gamma_all, S_all, z_all, y_mod, active_leaf = ops.fused_asdag_tree_block_forward(
+                x, norm1_scale, qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias,
+                q_norm_scale, k_norm_scale, w_decay, b_decay,
+                out_diagonals, out_perms, out_inv_perms, out_bias,
+                norm2_scale, w_perm, perms, inv_perms, bias, top_indices, top_weights, rm
+            )
+            ctx.save_for_backward(
+                x, norm1_scale, x_norm1, x1, norm2_scale, x_norm2,
+                qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias, qkvg_raw,
+                phi_q, phi_k, gamma_all, S_all, z_all, y_mod,
+                q_norm_scale, k_norm_scale, w_decay, b_decay,
+                out_diagonals, out_perms, out_inv_perms, out_bias,
+                w_perm, perms, inv_perms, bias, top_indices, top_weights, active_leaf, rm
+            )
+            return out_y.to(x.dtype)
+        raise RuntimeError("Fused Tree Block requires C++ CPU extension.")
+
+    @staticmethod
+    def backward(ctx, grad_y: torch.Tensor):
+        saved = ctx.saved_tensors
+        x, norm1_scale, x_norm1, x1, norm2_scale, x_norm2 = saved[0:6]
+        qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias, qkvg_raw = saved[6:11]
+        phi_q, phi_k, gamma_all, S_all, z_all, y_mod = saved[11:17]
+        q_norm_scale, k_norm_scale, w_decay, b_decay = saved[17:21]
+        out_diagonals, out_perms, out_inv_perms, out_bias = saved[21:25]
+        w_perm, perms, inv_perms, bias, top_indices, top_weights, active_leaf, rm = saved[25:33]
+        ops = get_asdag_cpu_ops()
+        grad_x, grad_n1, g_qkvg_d, g_qkvg_b, g_qs, g_ks, g_wd_gla, g_bd, g_od, g_ob, grad_n2, g_w_perm, g_bias_tree, g_topw = ops.fused_asdag_tree_block_backward(
+            grad_y, x, norm1_scale, x_norm1, x1, norm2_scale, x_norm2,
+            qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias, qkvg_raw,
+            phi_q, phi_k, gamma_all, S_all, z_all, y_mod,
+            q_norm_scale, k_norm_scale, w_decay, b_decay,
+            out_diagonals, out_perms, out_inv_perms, out_bias,
+            w_perm, perms, inv_perms, bias, top_indices, top_weights, active_leaf, rm
+        )
+        return (
+            grad_x.to(grad_y.dtype),
+            grad_n1.to(norm1_scale.dtype),
+            g_qkvg_d.to(qkvg_diagonals.dtype), None, None, g_qkvg_b.to(qkvg_bias.dtype),
+            g_qs.to(q_norm_scale.dtype), g_ks.to(k_norm_scale.dtype),
+            g_wd_gla.to(w_decay.dtype), g_bd.to(b_decay.dtype),
+            g_od.to(out_diagonals.dtype), None, None, g_ob.to(out_bias.dtype),
+            grad_n2.to(norm2_scale.dtype),
+            g_w_perm.to(w_perm.dtype), None, None, g_bias_tree.to(bias.dtype), None, None, None
+        )
+
+
+def asdag_cpu_fused_asdag_tree_block(
+    x: torch.Tensor,
+    norm1_scale: torch.Tensor,
+    qkvg_diagonals: torch.Tensor,
+    qkvg_perms: torch.Tensor,
+    qkvg_inv_perms: torch.Tensor,
+    qkvg_bias: torch.Tensor,
+    q_norm_scale: torch.Tensor,
+    k_norm_scale: torch.Tensor,
+    w_decay: torch.Tensor,
+    b_decay: torch.Tensor,
+    out_diagonals: torch.Tensor,
+    out_perms: torch.Tensor,
+    out_inv_perms: torch.Tensor,
+    out_bias: torch.Tensor,
+    norm2_scale: torch.Tensor,
+    w_perm: torch.Tensor,
+    perms: torch.Tensor,
+    inv_perms: torch.Tensor,
+    bias: torch.Tensor,
+    top_indices: torch.Tensor,
+    top_weights: torch.Tensor,
+    reset_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return ASDAGFusedTreeBlockAutogradFunction.apply(
+        x, norm1_scale, qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias,
+        q_norm_scale, k_norm_scale, w_decay, b_decay,
+        out_diagonals, out_perms, out_inv_perms, out_bias,
+        norm2_scale, w_perm, perms, inv_perms, bias, top_indices, top_weights, reset_mask
+    )
+
+
 class ASDAGSparseTreePermAutogradFunction(torch.autograd.Function):
     @staticmethod
     def forward(

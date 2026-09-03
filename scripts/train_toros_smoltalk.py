@@ -38,7 +38,7 @@ def main():
     )
 
     model = TorosHybridLanguageModel(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.01)
+    optimizers = model.get_default_optimizers(lr=3e-3, weight_decay=0.01, use_muon=True, muon_lr=0.02)
     total_params = sum(p.numel() for p in model.parameters())
 
     print(f"Model Architecture    : Toros-Hybrid (System 2 JEPA L=6 + System 1 BLT Decoder)")
@@ -93,11 +93,13 @@ def main():
         y = torch.from_numpy(np.stack([train_data[i + 1 : i + seq_len + 1] for i in ix])).long().to(device)
 
         t_step_0 = time.time()
-        optimizer.zero_grad()
+        for _o in optimizers:
+            _o.zero_grad()
         logits, loss, metrics = model(x, targets=y, target_shift=target_shift)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        for _o in optimizers:
+            _o.step()
         t_step = time.time() - t_step_0
 
         if step % eval_interval == 0 or step == 1:

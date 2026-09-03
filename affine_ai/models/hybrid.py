@@ -160,7 +160,7 @@ class TorosHybridLanguageModel(nn.Module):
         self,
         lr: float = 1e-3,
         weight_decay: float = 0.01,
-        use_muon: bool = False,
+        use_muon: bool = True,
         muon_lr: float = 0.02
     ) -> List[Any]:
         optimizers = []
@@ -220,7 +220,7 @@ class TorosHybridLanguageModel(nn.Module):
         self,
         lr: float = 1e-3,
         weight_decay: float = 0.01,
-        use_muon: bool = False,
+        use_muon: bool = True,
         muon_lr: float = 0.02,
         muon_momentum: float = 0.95,
     ) -> List[Any]:

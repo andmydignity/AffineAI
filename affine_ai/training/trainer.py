@@ -12,6 +12,7 @@ Encapsulates all ASDAG optimizations out of the box:
 - Hardware-aligned batch dispatch
 """
 
+import gc
 import os
 import math
 import time
@@ -370,15 +371,24 @@ class ASDAGTrainer:
         best_val_loss = float("inf")
         start_time = time.time()
 
-        for step in range(self.max_steps):
-            loss_val = self.train_step(step)
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        try:
+            for step in range(self.max_steps):
+                loss_val = self.train_step(step)
+                if step % 500 == 499:
+                    gc.collect()
 
-            if step % self.eval_interval == 0 or step == self.max_steps - 1:
-                eval_metrics = self.evaluate()
-                if eval_metrics["val_loss"] < best_val_loss:
-                    best_val_loss = eval_metrics["val_loss"]
-                    if save_path:
-                        torch.save(self.model.state_dict(), save_path)
+                if step % self.eval_interval == 0 or step == self.max_steps - 1:
+                    eval_metrics = self.evaluate()
+                    if eval_metrics["val_loss"] < best_val_loss:
+                        best_val_loss = eval_metrics["val_loss"]
+                        if save_path:
+                            torch.save(self.model.state_dict(), save_path)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
         total_time = time.time() - start_time
         return {

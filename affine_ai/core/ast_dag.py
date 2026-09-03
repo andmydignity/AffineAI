@@ -925,6 +925,28 @@ class ASTDAGLayer(nn.Module):
                 )
                 return composite_out.reshape(*orig_shape)
 
+            if r_in.is_cuda and not has_secondary and first_leaf.activation == "relu6":
+                try:
+                    from affine_ai.kernels.triton_tree import triton_tree_perm
+                    composite_out = triton_tree_perm(
+                        r_in, w_perm_stack, b_stack, perms_stack, top_indices, top_weights
+                    )
+                    if record_cache is None:
+                        record_cache = self.training
+                    if record_cache:
+                        self._last_routing_probs = routing_probs.detach()
+                        self._last_x_flat = x_flat.detach()
+                        self._last_stacked_leaf_outs = None
+                        self._last_out = composite_out.detach()
+                    else:
+                        self._last_routing_probs = None
+                        self._last_x_flat = None
+                        self._last_stacked_leaf_outs = None
+                        self._last_out = None
+                    return composite_out.reshape(*orig_shape)
+                except Exception:
+                    pass
+
             if r_in.is_cuda:
                 K_num = len(leaves)
                 P_num = first_leaf.num_permutations

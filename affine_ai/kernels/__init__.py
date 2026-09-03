@@ -15,6 +15,7 @@ try:
         triton_fp32_linear,
         triton_ternary_linear_gw,
     )
+    from affine_ai.kernels.triton_tree import triton_tree_perm
     TRITON_AVAILABLE = True
 except Exception:
     TRITON_AVAILABLE = False
@@ -28,6 +29,7 @@ except Exception:
     triton_ternary_linear_fwd = None
     triton_fp32_linear = None
     triton_ternary_linear_gw = None
+    triton_tree_perm = None
 
 __all__ = [
     "fused_asdag_forward_triton",
@@ -40,6 +42,7 @@ __all__ = [
     "triton_ternary_linear_fwd",
     "triton_fp32_linear",
     "triton_ternary_linear_gw",
+    "triton_tree_perm",
     "TRITON_AVAILABLE",
 ]
 

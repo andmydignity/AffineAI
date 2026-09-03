@@ -1362,6 +1362,16 @@ std::tuple<torch::Tensor, torch::Tensor> asdag_sparse_tree_perm_forward_cpp(
             int32_t k = top_idx_ptr[b * N + n];
             float prob_k = top_w_ptr[b * N + n];
             float* leaf_out_bn = lo_ptr + (b * N + n) * dim;
+            if (n + 1 < N) {
+                int32_t k_next = top_idx_ptr[b * N + n + 1];
+                __builtin_prefetch(w_ptr + k_next * (P * dim), 0, 1);
+                __builtin_prefetch(p_ptr + k_next * (P * dim), 0, 1);
+                __builtin_prefetch(b_ptr + k_next * dim, 0, 1);
+            }
+            if (prob_k < 1e-7f) {
+                std::memset(leaf_out_bn, 0, dim * sizeof(float));
+                continue;
+            }
 
             // Load bias for leaf k
             const float* bk = b_ptr + k * dim;
@@ -2213,6 +2223,7 @@ torch::Tensor asdag_blt_2layer_decode_fused_cpp(
 
 #pragma omp parallel num_threads(n_threads)
     {
+        const bool is64 = (d_byte == 64);
         std::vector<float> cat_buf(2 * d_byte);
         std::vector<float> fused1(d_byte);
         std::vector<float> hact_buf(d_byte);
@@ -2235,8 +2246,10 @@ torch::Tensor asdag_blt_2layer_decode_fused_cpp(
                 float sum_sq1 = 0.0f;
                 for (int64_t i = 0; i < d_byte; ++i) {
                     const float* w_row = fus_ptr + i * (2 * d_byte);
-                    float dot = (d_byte == 64) ? dot_avx2_128(w_row, cat_buf.data()) : 0.0f;
-                    if (d_byte != 64) {
+                    float dot = 0.0f;
+                    if (is64) {
+                        dot = dot_avx2_128(w_row, cat_buf.data());
+                    } else {
                         for (int64_t k = 0; k < 2 * d_byte; ++k) dot += w_row[k] * cat_buf[k];
                     }
                     float s1 = dot / (1.0f + std::exp(-dot));
@@ -2249,9 +2262,11 @@ torch::Tensor asdag_blt_2layer_decode_fused_cpp(
                 for (int64_t i = 0; i < d_byte; ++i) {
                     const float* g_row = gate_ptr + i * d_byte;
                     const float* v_row = val_ptr + i * d_byte;
-                    float dot_g = (d_byte == 64) ? dot_avx2_64(g_row, fused1.data()) : 0.0f;
-                    float dot_v = (d_byte == 64) ? dot_avx2_64(v_row, fused1.data()) : 0.0f;
-                    if (d_byte != 64) {
+                    float dot_g = 0.0f, dot_v = 0.0f;
+                    if (is64) {
+                        dot_g = dot_avx2_64(g_row, fused1.data());
+                        dot_v = dot_avx2_64(v_row, fused1.data());
+                    } else {
                         for (int64_t k = 0; k < d_byte; ++k) {
                             dot_g += g_row[k] * fused1[k];
                             dot_v += v_row[k] * fused1[k];
@@ -2264,8 +2279,10 @@ torch::Tensor asdag_blt_2layer_decode_fused_cpp(
                 float sum_sq2 = 0.0f;
                 for (int64_t i = 0; i < d_byte; ++i) {
                     const float* w_row = down_ptr + i * d_byte;
-                    float dot = (d_byte == 64) ? dot_avx2_64(w_row, hact_buf.data()) : 0.0f;
-                    if (d_byte != 64) {
+                    float dot = 0.0f;
+                    if (is64) {
+                        dot = dot_avx2_64(w_row, hact_buf.data());
+                    } else {
                         for (int64_t k = 0; k < d_byte; ++k) dot += w_row[k] * hact_buf[k];
                     }
                     float pre2 = fused1[i] + dot;
@@ -2277,8 +2294,10 @@ torch::Tensor asdag_blt_2layer_decode_fused_cpp(
 
                 for (int64_t v = 0; v < V; ++v) {
                     const float* w_row = lm_ptr + v * d_byte;
-                    float dot = (d_byte == 64) ? dot_avx2_64(w_row, fused2.data()) : 0.0f;
-                    if (d_byte != 64) {
+                    float dot = 0.0f;
+                    if (is64) {
+                        dot = dot_avx2_64(w_row, fused2.data());
+                    } else {
                         for (int64_t k = 0; k < d_byte; ++k) dot += w_row[k] * fused2[k];
                     }
                     out_logits[v] = dot;
@@ -4174,6 +4193,661 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 27. Fused ASDAG Tree Block (RMSNorm1 + Monarch GLA + RMSNorm2 + Sparse Tree) - Hierarchical
+// Helpers mirror ast_dag.py: _Log4ShiftSTE, _FP8HybridSTE (E4M3 fwd / E5M2 bwd
+// grad), ternary_ste, HierarchicalSignRouter.route_tokens, ASTDAGNode perm
+// root. All elementwise ops are float32; rounding uses ties-to-even.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace asdag_fused_tree {
+inline float shift4_fwd(float v, float scale) {
+    float nx = v / scale;
+    float s = (nx > 0.f) ? 1.f : ((nx < 0.f) ? -1.f : 0.f);
+    float ax = std::fabs(nx);
+    float axc = ax < 0.000030517578125f ? 0.000030517578125f : ax;
+    float p = rintf(-log2f(axc));
+    if (p < 0.f) p = 0.f;
+    if (p > 7.f) p = 7.f;
+    float q = (ax < 0.000043213918264f) ? 0.f : s * exp2f(-p);
+    return q * scale;
+}
+inline bool shift4_pass(float v, float scale) {
+    return std::fabs(v / scale) <= 1.5f;
+}
+inline float e4m3_round(float v) {
+    if (!std::isfinite(v)) return v;
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    if ((u & 0x7FFFFFFFu) == 0) return v;
+    float sgn = (u & 0x80000000u) ? -1.f : 1.f;
+    float af = std::fabs(v);
+    int32_t e2 = (int32_t)ilogbf(af);
+    int32_t ef = e2 + 7;
+    if (ef > 15) return std::numeric_limits<float>::quiet_NaN();
+    if (ef == 15) {
+        uint32_t m;
+        std::memcpy(&m, &af, 4);
+        m &= 0x7FFFFFu;
+        uint32_t hi = m >> 20, lo = m & 0xFFFFFu;
+        uint32_t q = hi + ((lo > 0x80000u) || (lo == 0x80000u && (hi & 1u)));
+        if (q >= 8u) return std::numeric_limits<float>::quiet_NaN();
+        if (q == 7u) return std::numeric_limits<float>::quiet_NaN();
+        uint32_t bits = ((uint32_t)(15 + 120) << 23) | (q << 20);
+        float o;
+        std::memcpy(&o, &bits, 4);
+        return sgn * o;
+    }
+    if (ef >= 1) {
+        uint32_t m;
+        std::memcpy(&m, &af, 4);
+        m &= 0x7FFFFFu;
+        uint32_t hi = m >> 20, lo = m & 0xFFFFFu;
+        uint32_t q = hi + ((lo > 0x80000u) || (lo == 0x80000u && (hi & 1u)));
+        if (q >= 8u) {
+            q = 0;
+            ef += 1;
+            if (ef > 15) return std::numeric_limits<float>::quiet_NaN();
+        }
+        uint32_t bits = ((uint32_t)(ef + 120) << 23) | (q << 20);
+        float o;
+        std::memcpy(&o, &bits, 4);
+        return sgn * o;
+    }
+    float qs = rintf(af * 512.f);
+    if (qs >= 8.f) return sgn * 0.015625f;
+    return sgn * qs * 0.001953125f;
+}
+inline float e5m2_round(float v) {
+    if (!std::isfinite(v)) return v;
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    if ((u & 0x7FFFFFFFu) == 0) return v;
+    float sgn = (u & 0x80000000u) ? -1.f : 1.f;
+    float af = std::fabs(v);
+    int32_t e2 = (int32_t)ilogbf(af);
+    int32_t ef = e2 + 16;
+    if (ef >= 31) return sgn * std::numeric_limits<float>::infinity();
+    if (ef >= 1) {
+        uint32_t m;
+        std::memcpy(&m, &af, 4);
+        m &= 0x7FFFFFu;
+        uint32_t hi = m >> 21, lo = m & 0x1FFFFFu;
+        uint32_t q = hi + ((lo > 0x100000u) || (lo == 0x100000u && (hi & 1u)));
+        if (q >= 4u) { q = 0; ef += 1; if (ef >= 31) return sgn * std::numeric_limits<float>::infinity(); }
+        uint32_t bits = ((uint32_t)(ef + 112) << 23) | (q << 21);
+        float o;
+        std::memcpy(&o, &bits, 4);
+        return sgn * o;
+    }
+    float qs = rintf(af * 65536.f);
+    if (qs >= 4.f) return sgn * 0.00006103515625f;
+    return sgn * qs * 0.0000152587890625f;
+}
+inline float ternary_delta(const float* d, int64_t n, float frac) {
+    double s = 0.0;
+    for (int64_t i = 0; i < n; ++i) s += std::fabs((double)d[i]);
+    return (float)(frac * s / (double)n);
+}
+inline float ternary_alpha_active(const float* d, const float* wq, int64_t n) {
+    double s = 0.0;
+    int64_t c = 0;
+    for (int64_t i = 0; i < n; ++i) if (wq[i] != 0.f) { s += std::fabs((double)d[i]); ++c; }
+    if (c == 0) return 0.f;
+    return (float)(s / (double)c);
+}
+inline float sigmoid2(float z) {
+    return 1.f / (1.f + expf(-2.f * z));
+}
+}  // namespace asdag_fused_tree
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+asdag_fused_asdag_tree_block_forward_cpp(
+    torch::Tensor x,
+    torch::Tensor norm1_scale,
+    torch::Tensor qkvg_diagonals,
+    torch::Tensor qkvg_perms,
+    torch::Tensor qkvg_inv_perms,
+    torch::Tensor qkvg_bias,
+    torch::Tensor q_norm_scale,
+    torch::Tensor k_norm_scale,
+    torch::Tensor w_decay,
+    torch::Tensor b_decay,
+    torch::Tensor out_diagonals,
+    torch::Tensor out_perms,
+    torch::Tensor out_inv_perms,
+    torch::Tensor out_bias,
+    torch::Tensor norm2_scale,
+    torch::Tensor w_perm,
+    torch::Tensor perms,
+    torch::Tensor inv_perms,
+    torch::Tensor bias,
+    torch::Tensor root_latent_w,
+    torch::Tensor root_scale,
+    torch::Tensor root_bias,
+    torch::Tensor root_perms,
+    torch::Tensor hyperplanes,
+    torch::Tensor router_biases,
+    torch::Tensor reset_mask
+) {
+    auto orig_dtype = x.scalar_type();
+    x = x.contiguous().to(torch::kFloat32);
+    norm1_scale = norm1_scale.contiguous().to(torch::kFloat32);
+    norm2_scale = norm2_scale.contiguous().to(torch::kFloat32);
+    int64_t B = x.size(0);
+    int64_t T = x.size(1);
+    int64_t C = x.size(2);
+    auto x_norm1 = torch::empty({B, T, C}, torch::kFloat32);
+    auto x1 = torch::empty({B, T, C}, torch::kFloat32);
+    auto x_norm2 = torch::empty({B, T, C}, torch::kFloat32);
+    auto out = torch::empty({B, T, C}, torch::kFloat32);
+    const float* x_ptr = x.data_ptr<float>();
+    const float* n1_ptr = norm1_scale.data_ptr<float>();
+    const float* n2_ptr = norm2_scale.data_ptr<float>();
+    float* xn1_ptr = x_norm1.data_ptr<float>();
+    float* x1_ptr = x1.data_ptr<float>();
+    float* xn2_ptr = x_norm2.data_ptr<float>();
+    float* out_ptr = out.data_ptr<float>();
+    int n_threads = asdag::get_physical_cores();
+#pragma omp parallel for collapse(2) num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t t = 0; t < T; ++t) {
+            const float* xb = x_ptr + (b * T + t) * C;
+            float* xn1 = xn1_ptr + (b * T + t) * C;
+            float sum_sq = 0.0f;
+            for (int64_t c = 0; c < C; ++c) sum_sq += xb[c] * xb[c];
+            float rms = 1.0f / std::sqrt((sum_sq / (float)C) + 1e-6f);
+            for (int64_t c = 0; c < C; ++c) xn1[c] = xb[c] * rms * n1_ptr[c];
+        }
+    }
+    auto [y_mixer, qkvg_raw, phi_q, phi_k, gamma_all, S_all, z_all, y_mod] = asdag_fused_monarch_gla_forward_cpp(
+        x_norm1, qkvg_diagonals, qkvg_perms, qkvg_bias,
+        q_norm_scale, k_norm_scale, w_decay, b_decay,
+        out_diagonals, out_perms, out_bias, reset_mask
+    );
+    const float* ym_ptr = y_mixer.data_ptr<float>();
+#pragma omp parallel for collapse(2) num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t t = 0; t < T; ++t) {
+            const float* xb = x_ptr + (b * T + t) * C;
+            const float* ymb = ym_ptr + (b * T + t) * C;
+            float* x1b = x1_ptr + (b * T + t) * C;
+            float* xn2 = xn2_ptr + (b * T + t) * C;
+            float sum_sq = 0.0f;
+            for (int64_t c = 0; c < C; ++c) { float v = xb[c] + ymb[c]; x1b[c] = v; sum_sq += v * v; }
+            float rms = 1.0f / std::sqrt((sum_sq / (float)C) + 1e-6f);
+            for (int64_t c = 0; c < C; ++c) xn2[c] = x1b[c] * rms * n2_ptr[c];
+        }
+    }
+    using namespace asdag_fused_tree;
+    auto x_norm2_c = x_norm2.contiguous().to(torch::kFloat32);
+    root_latent_w = root_latent_w.contiguous().to(torch::kFloat32);
+    root_scale = root_scale.contiguous().to(torch::kFloat32);
+    root_bias = root_bias.contiguous().to(torch::kFloat32);
+    root_perms = root_perms.contiguous().to(torch::kInt32);
+    hyperplanes = hyperplanes.contiguous().to(torch::kFloat32);
+    router_biases = router_biases.contiguous().to(torch::kFloat32);
+    int64_t N = B * T;
+    int64_t I = hyperplanes.size(0);
+    int64_t K = w_perm.size(0);
+    int64_t RP = root_latent_w.size(0);
+    int depth = 1;
+    while ((((int64_t)1) << depth) - 1 < I) ++depth;
+    const float* hyp_ptr = hyperplanes.data_ptr<float>();
+    const float* rb_ptr = router_biases.data_ptr<float>();
+    const float* rlat_ptr = root_latent_w.data_ptr<float>();
+    const float* rsc_ptr = root_scale.data_ptr<float>();
+    const float* rbi_ptr = root_bias.data_ptr<float>();
+    const int32_t* rpm_ptr = root_perms.data_ptr<int32_t>();
+    std::vector<float> w_route(I * C);
+    {
+        float delta = ternary_delta(hyp_ptr, I * C, 0.7f);
+        std::vector<float> sgn(I * C);
+        for (int64_t i = 0; i < I * C; ++i) {
+            float v = hyp_ptr[i];
+            sgn[i] = (v > delta) ? 1.f : ((v < -delta) ? -1.f : 0.f);
+        }
+        float alpha = ternary_alpha_active(hyp_ptr, sgn.data(), I * C);
+        for (int64_t i = 0; i < I * C; ++i) w_route[i] = sgn[i] * alpha;
+    }
+    std::vector<float> w_root(RP * C);
+    std::vector<float> w_root_sgn(RP * C);
+    {
+        float delta = ternary_delta(rlat_ptr, RP * C, 0.7f);
+        for (int64_t i = 0; i < RP * C; ++i) {
+            float v = rlat_ptr[i];
+            float s = (v > delta) ? 1.f : ((v < -delta) ? -1.f : 0.f);
+            w_root_sgn[i] = s;
+            w_root[i] = s * rsc_ptr[(i / C) % RP];
+        }
+    }
+    auto r_in_flat = torch::empty({N, C}, torch::kFloat32);
+    auto xq_save = torch::empty({N, C}, torch::kFloat32);
+    auto root_out_save = torch::empty({N, C}, torch::kFloat32);
+    auto root_preact = torch::empty({N, C}, torch::kFloat32);
+    auto node_p = torch::empty({N, I}, torch::kFloat32);
+    auto top_idx = torch::empty({N, 2}, torch::kInt32);
+    auto top_w = torch::empty({N, 2}, torch::kFloat32);
+    auto top_vals = torch::empty({N, 2}, torch::kFloat32);
+    auto sc0 = torch::empty({N}, torch::kFloat32);
+    auto scf = torch::empty({N}, torch::kFloat32);
+    auto sc1 = torch::empty({N}, torch::kFloat32);
+    const float* xn2c_ptr = x_norm2_c.data_ptr<float>();
+    float* rin_ptr = r_in_flat.data_ptr<float>();
+    float* xq_ptr = xq_save.data_ptr<float>();
+    float* ro_ptr = root_out_save.data_ptr<float>();
+    float* rp_ptr = root_preact.data_ptr<float>();
+    float* np_ptr = node_p.data_ptr<float>();
+    int32_t* ti_ptr = top_idx.data_ptr<int32_t>();
+    float* tw_ptr = top_w.data_ptr<float>();
+    float* tv_ptr = top_vals.data_ptr<float>();
+    float* s0_ptr = sc0.data_ptr<float>();
+    float* sf_ptr = scf.data_ptr<float>();
+    float* s1_ptr = sc1.data_ptr<float>();
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        const float* xn = xn2c_ptr + n * C;
+        float* xq = xq_ptr + n * C;
+        float* ro = ro_ptr + n * C;
+        float* pre = rp_ptr + n * C;
+        float* rin = rin_ptr + n * C;
+        float am = 0.f;
+        for (int64_t c = 0; c < C; ++c) { float a = std::fabs(xn[c]); if (a > am) am = a; }
+        float scale0 = am < 1e-8f ? 1e-8f : am;
+        s0_ptr[n] = scale0;
+        for (int64_t c = 0; c < C; ++c) xq[c] = shift4_fwd(xn[c], scale0);
+        float am1 = 0.f;
+        for (int64_t c = 0; c < C; ++c) { float a = std::fabs(xq[c]); if (a > am1) am1 = a; }
+        float fs = 240.f / (am1 < 1e-6f ? 1e-6f : am1);
+        sf_ptr[n] = fs;
+        for (int64_t c = 0; c < C; ++c) xq[c] = e4m3_round(xq[c] * fs) / fs;
+        for (int64_t c = 0; c < C; ++c) {
+            float h = rbi_ptr[c];
+            for (int64_t p = 0; p < RP; ++p) h += w_root[p * C + c] * xq[rpm_ptr[p * C + c]];
+            pre[c] = h;
+            ro[c] = h < 0.f ? 0.f : (h > 6.f ? 6.f : h);
+        }
+        float amx = 0.f;
+        for (int64_t c = 0; c < C; ++c) { float a = std::fabs(ro[c]); if (a > amx) amx = a; }
+        float scale1 = amx < 1e-8f ? 1e-8f : amx;
+        s1_ptr[n] = scale1;
+        for (int64_t c = 0; c < C; ++c) rin[c] = shift4_fwd(ro[c], scale1);
+        float logits[32];
+        for (int64_t i = 0; i < I; ++i) {
+            float s = rb_ptr[i];
+            const float* w = &w_route[i * C];
+            for (int64_t c = 0; c < C; ++c) s += w[c] * xn[c];
+            logits[i] = s;
+        }
+        float* ndp = np_ptr + n * I;
+        float cur[32], nxt[32];
+        float pr0 = sigmoid2(logits[0]);
+        ndp[0] = pr0;
+        cur[0] = 1.f - pr0;
+        cur[1] = pr0;
+        int64_t cur_n = 2;
+        for (int d = 1; d < depth; ++d) {
+            int64_t start = (((int64_t)1) << d) - 1;
+            int64_t idx = 0;
+            for (int64_t j = 0; j < cur_n; ++j) {
+                float sr = sigmoid2(logits[start + j]);
+                ndp[start + j] = sr;
+                nxt[idx++] = cur[j] * (1.f - sr);
+                nxt[idx++] = cur[j] * sr;
+            }
+            cur_n *= 2;
+            for (int64_t j = 0; j < cur_n; ++j) cur[j] = nxt[j];
+        }
+        float ssum = 0.f;
+        for (int64_t k = 0; k < K; ++k) ssum += cur[k];
+        if (ssum < 1e-8f) ssum = 1e-8f;
+        int64_t i1 = 0, i2 = 1;
+        float v1 = -1.f, v2 = -1.f;
+        for (int64_t k = 0; k < K; ++k) {
+            float v = cur[k] / ssum;
+            if (v > v1) { v2 = v1; i2 = i1; v1 = v; i1 = k; }
+            else if (v > v2) { v2 = v; i2 = k; }
+        }
+        float s = v1 + v2;
+        if (s < 1e-8f) s = 1e-8f;
+        ti_ptr[n * 2] = (int32_t)i1;
+        ti_ptr[n * 2 + 1] = (int32_t)i2;
+        tv_ptr[n * 2] = v1;
+        tv_ptr[n * 2 + 1] = v2;
+        tw_ptr[n * 2] = v1 / s;
+        tw_ptr[n * 2 + 1] = v2 / s;
+    }
+    auto [y_channel_flat, active_leaf_outs] = asdag_sparse_tree_perm_forward_cpp(
+        r_in_flat, w_perm, perms, bias, top_idx, top_w
+    );
+    const float* yc_ptr = y_channel_flat.data_ptr<float>();
+#pragma omp parallel for collapse(2) num_threads(n_threads) schedule(static)
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t t = 0; t < T; ++t) {
+            const float* x1b = x1_ptr + (b * T + t) * C;
+            const float* ycb = yc_ptr + (b * T + t) * C;
+            float* outb = out_ptr + (b * T + t) * C;
+            for (int64_t c = 0; c < C; ++c) outb[c] = x1b[c] + ycb[c];
+        }
+    }
+    return std::make_tuple(out.to(orig_dtype), x_norm1, x1, x_norm2, qkvg_raw, phi_q, phi_k, gamma_all, S_all, z_all, y_mod, active_leaf_outs,
+        r_in_flat, xq_save, root_out_save, root_preact, node_p, top_idx, top_w, top_vals, sc0, scf, sc1);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+asdag_fused_asdag_tree_block_backward_cpp(
+    torch::Tensor grad_y,
+    torch::Tensor x,
+    torch::Tensor norm1_scale,
+    torch::Tensor x_norm1,
+    torch::Tensor x1,
+    torch::Tensor norm2_scale,
+    torch::Tensor x_norm2,
+    torch::Tensor qkvg_diagonals,
+    torch::Tensor qkvg_perms,
+    torch::Tensor qkvg_inv_perms,
+    torch::Tensor qkvg_bias,
+    torch::Tensor qkvg_raw,
+    torch::Tensor phi_q,
+    torch::Tensor phi_k,
+    torch::Tensor gamma_all,
+    torch::Tensor S_all,
+    torch::Tensor z_all,
+    torch::Tensor y_mod,
+    torch::Tensor q_norm_scale,
+    torch::Tensor k_norm_scale,
+    torch::Tensor w_decay,
+    torch::Tensor b_decay,
+    torch::Tensor out_diagonals,
+    torch::Tensor out_perms,
+    torch::Tensor out_inv_perms,
+    torch::Tensor out_bias,
+    torch::Tensor w_perm,
+    torch::Tensor perms,
+    torch::Tensor inv_perms,
+    torch::Tensor bias,
+    torch::Tensor root_latent_w,
+    torch::Tensor root_scale,
+    torch::Tensor root_bias,
+    torch::Tensor root_perms,
+    torch::Tensor hyperplanes,
+    torch::Tensor router_biases,
+    torch::Tensor r_in_flat,
+    torch::Tensor xq_save,
+    torch::Tensor root_out_save,
+    torch::Tensor root_preact,
+    torch::Tensor node_p,
+    torch::Tensor top_idx,
+    torch::Tensor top_vals,
+    torch::Tensor active_leaf_outs,
+    torch::Tensor sc0,
+    torch::Tensor sc1,
+    torch::Tensor reset_mask
+) {
+    grad_y = grad_y.contiguous().to(torch::kFloat32);
+    x = x.contiguous().to(torch::kFloat32);
+    norm1_scale = norm1_scale.contiguous().to(torch::kFloat32);
+    x_norm1 = x_norm1.contiguous().to(torch::kFloat32);
+    x1 = x1.contiguous().to(torch::kFloat32);
+    norm2_scale = norm2_scale.contiguous().to(torch::kFloat32);
+    x_norm2 = x_norm2.contiguous().to(torch::kFloat32);
+    int64_t B = x.size(0);
+    int64_t T = x.size(1);
+    int64_t C = x.size(2);
+    using namespace asdag_fused_tree;
+    root_latent_w = root_latent_w.contiguous().to(torch::kFloat32);
+    root_scale = root_scale.contiguous().to(torch::kFloat32);
+    root_bias = root_bias.contiguous().to(torch::kFloat32);
+    root_perms = root_perms.contiguous().to(torch::kInt32);
+    hyperplanes = hyperplanes.contiguous().to(torch::kFloat32);
+    router_biases = router_biases.contiguous().to(torch::kFloat32);
+    int64_t N = B * T;
+    int64_t I = hyperplanes.size(0);
+    int64_t RP = root_latent_w.size(0);
+    int depth = 1;
+    while ((((int64_t)1) << depth) - 1 < I) ++depth;
+    int n_threads = asdag::get_physical_cores();
+    auto gy_flat = grad_y.reshape({B * T, C});
+    auto top_w_re = torch::empty({N, 2}, torch::kFloat32);
+    {
+        const float* tv = top_vals.data_ptr<float>();
+        float* tw = top_w_re.data_ptr<float>();
+        for (int64_t n = 0; n < N; ++n) {
+            float s = tv[n * 2] + tv[n * 2 + 1];
+            if (s < 1e-8f) s = 1e-8f;
+            tw[n * 2] = tv[n * 2] / s;
+            tw[n * 2 + 1] = tv[n * 2 + 1] / s;
+        }
+    }
+    auto active_flat = active_leaf_outs.reshape({B * T, 2, C});
+    auto [g_rin_flat, g_w_perm, g_bias_tree, g_topw] = asdag_sparse_tree_perm_backward_cpp(
+        gy_flat, r_in_flat, w_perm, perms, inv_perms, bias, top_idx, top_w_re, active_flat
+    );
+    const float* rlat_ptr = root_latent_w.data_ptr<float>();
+    const float* rsc_ptr = root_scale.data_ptr<float>();
+    const int32_t* rpm_ptr = root_perms.data_ptr<int32_t>();
+    const float* hyp_ptr = hyperplanes.data_ptr<float>();
+    std::vector<float> w_root(RP * C), w_root_sgn(RP * C), w_route(I * C);
+    {
+        float delta = ternary_delta(rlat_ptr, RP * C, 0.7f);
+        for (int64_t i = 0; i < RP * C; ++i) {
+            float v = rlat_ptr[i];
+            float s = (v > delta) ? 1.f : ((v < -delta) ? -1.f : 0.f);
+            w_root_sgn[i] = s;
+            w_root[i] = s * rsc_ptr[(i / C) % RP];
+        }
+        float deltah = ternary_delta(hyp_ptr, I * C, 0.7f);
+        std::vector<float> sg(I * C);
+        for (int64_t i = 0; i < I * C; ++i) {
+            float v = hyp_ptr[i];
+            sg[i] = (v > deltah) ? 1.f : ((v < -deltah) ? -1.f : 0.f);
+        }
+        float alpha = ternary_alpha_active(hyp_ptr, sg.data(), I * C);
+        for (int64_t i = 0; i < I * C; ++i) w_route[i] = sg[i] * alpha;
+    }
+    auto x_norm2_c = x_norm2.contiguous().to(torch::kFloat32);
+    const float* xn2c_ptr = x_norm2_c.data_ptr<float>();
+    const float* grin_ptr = g_rin_flat.data_ptr<float>();
+    const float* gtw_ptr = g_topw.data_ptr<float>();
+    const float* xq_ptr = xq_save.data_ptr<float>();
+    const float* ro_ptr = root_out_save.data_ptr<float>();
+    const float* pre_ptr = root_preact.data_ptr<float>();
+    const float* ndp_ptr = node_p.data_ptr<float>();
+    const int32_t* ti_ptr = top_idx.data_ptr<int32_t>();
+    const float* tv_ptr = top_vals.data_ptr<float>();
+    const float* s0_ptr = sc0.data_ptr<float>();
+    const float* s1_ptr = sc1.data_ptr<float>();
+    auto g_root_path = torch::zeros({N, C}, torch::kFloat32);
+    auto g_route_path = torch::zeros({N, C}, torch::kFloat32);
+    float* grp_ptr = g_root_path.data_ptr<float>();
+    float* grt_ptr = g_route_path.data_ptr<float>();
+    std::vector<std::vector<float>> t_gw(n_threads, std::vector<float>(RP * C, 0.f));
+    std::vector<std::vector<float>> t_gs(n_threads, std::vector<float>(RP, 0.f));
+    std::vector<std::vector<float>> t_gb(n_threads, std::vector<float>(C, 0.f));
+    std::vector<std::vector<float>> t_gh(n_threads, std::vector<float>(I * C, 0.f));
+    std::vector<std::vector<float>> t_grb(n_threads, std::vector<float>(I, 0.f));
+#pragma omp parallel num_threads(n_threads)
+    {
+        int tid = omp_get_thread_num();
+        asdag::pin_thread_to_physical_core(tid);
+        std::vector<float> gxq(C), dl(I), dn(16), dnp(16), lv(32);
+#pragma omp for schedule(static)
+        for (int64_t n = 0; n < N; ++n) {
+            const float* grin = grin_ptr + n * C;
+            const float* xq = xq_ptr + n * C;
+            const float* ro = ro_ptr + n * C;
+            const float* pre = pre_ptr + n * C;
+            const float* xn = xn2c_ptr + n * C;
+            float s1 = s1_ptr[n];
+            float s0 = s0_ptr[n];
+            for (int64_t c = 0; c < C; ++c) gxq[c] = 0.f;
+            for (int64_t c = 0; c < C; ++c) {
+                float gro = (std::fabs(ro[c] / s1) <= 1.5f) ? grin[c] : 0.f;
+                float gh = (pre[c] > 0.f && pre[c] < 6.f) ? gro : 0.f;
+                t_gb[tid][c] += gh;
+                for (int64_t p = 0; p < RP; ++p) {
+                    float g = gh * xq[rpm_ptr[p * C + c]];
+                    t_gw[tid][p * C + c] += g;
+                    t_gs[tid][p] += w_root_sgn[p * C + c] * g;
+                    gxq[rpm_ptr[p * C + c]] += gh * w_root[p * C + c];
+                }
+            }
+            float* grp = grp_ptr + n * C;
+            for (int64_t c = 0; c < C; ++c) {
+                float g = e5m2_round(gxq[c]);
+                grp[c] = (std::fabs(xn[c] / s0) <= 1.5f) ? g : 0.f;
+            }
+            float v0 = tv_ptr[n * 2], v1 = tv_ptr[n * 2 + 1];
+            float s = v0 + v1;
+            if (s < 1e-8f) s = 1e-8f;
+            float g0 = gtw_ptr[n * 2], g1 = gtw_ptr[n * 2 + 1];
+            float dot = g0 * v0 + g1 * v1;
+            float dv0 = (g0 * s - dot) / (s * s);
+            float dv1 = (g1 * s - dot) / (s * s);
+            for (int64_t k = 0; k < 16; ++k) dn[k] = 0.f;
+            dn[ti_ptr[n * 2]] += dv0;
+            dn[ti_ptr[n * 2 + 1]] += dv1;
+            const float* ndp = ndp_ptr + n * I;
+            lv[0] = 1.f - ndp[0];
+            lv[1] = ndp[0];
+            int64_t off = 0;
+            for (int d = 1; d < depth; ++d) {
+                int64_t start = (((int64_t)1) << d) - 1;
+                int64_t idx = 0;
+                for (int64_t j = 0; j < (((int64_t)1) << d); ++j) {
+                    float sr = ndp[start + j];
+                    lv[off + 2 + idx++] = lv[off + j] * (1.f - sr);
+                    lv[off + 2 + idx++] = lv[off + j] * sr;
+                }
+                off += 2;
+            }
+            for (int d = depth - 1; d >= 1; --d) {
+                int64_t start = (((int64_t)1) << d) - 1;
+                int64_t npar = ((int64_t)1) << d;
+                int64_t poff = off - 2;
+                for (int64_t j = 0; j < npar; ++j) dnp[j] = 0.f;
+                for (int64_t j = 0; j < npar; ++j) {
+                    float sr = ndp[start + j];
+                    float sl = 1.f - sr;
+                    float pv = lv[poff + j];
+                    dnp[j] = dn[2 * j] * sl + dn[2 * j + 1] * sr;
+                    dl[start + j] = (dn[2 * j + 1] - dn[2 * j]) * pv * 2.f * sr * (1.f - sr);
+                }
+                for (int64_t j = 0; j < npar; ++j) dn[j] = dnp[j];
+                off = poff;
+            }
+            float sr0 = ndp[0];
+            dl[0] = (dn[1] - dn[0]) * 2.f * sr0 * (1.f - sr0);
+            float* grt = grt_ptr + n * C;
+            for (int64_t i = 0; i < I; ++i) {
+                float dli = dl[i];
+                t_grb[tid][i] += dli;
+                const float* w = &w_route[i * C];
+                float* gh = t_gh[tid].data() + i * C;
+                for (int64_t c = 0; c < C; ++c) {
+                    gh[c] += dli * xn[c];
+                    grt[c] += dli * w[c];
+                }
+            }
+        }
+    }
+    auto grad_xn2 = (g_root_path + g_route_path).reshape({B, T, C});
+    auto g_root_w = torch::zeros({RP, C}, torch::kFloat32);
+    auto g_root_scale = torch::zeros({RP, 1}, torch::kFloat32);
+    auto g_root_b = torch::zeros({C}, torch::kFloat32);
+    auto g_hyper = torch::zeros({I, C}, torch::kFloat32);
+    auto g_router_b = torch::zeros({I}, torch::kFloat32);
+    {
+        float* a = g_root_w.data_ptr<float>();
+        float* b = g_root_scale.data_ptr<float>();
+        float* c = g_root_b.data_ptr<float>();
+        float* d = g_hyper.data_ptr<float>();
+        float* e = g_router_b.data_ptr<float>();
+        for (int t = 0; t < n_threads; ++t) {
+            const float* x1 = t_gw[t].data();
+            const float* x2 = t_gs[t].data();
+            const float* x3 = t_gb[t].data();
+            const float* x4 = t_gh[t].data();
+            const float* x5 = t_grb[t].data();
+            for (int64_t i = 0; i < RP * C; ++i) a[i] += x1[i];
+            for (int64_t i = 0; i < RP; ++i) b[i] += x2[i];
+            for (int64_t i = 0; i < C; ++i) c[i] += x3[i];
+            for (int64_t i = 0; i < I * C; ++i) d[i] += x4[i];
+            for (int64_t i = 0; i < I; ++i) e[i] += x5[i];
+        }
+    }
+    auto grad_x1 = grad_y.clone();
+    auto grad_norm2_scale = torch::zeros({C}, torch::kFloat32);
+    const float* gx2_ptr = grad_xn2.data_ptr<float>();
+    const float* x1_ptr = x1.data_ptr<float>();
+    const float* n2_ptr = norm2_scale.data_ptr<float>();
+    float* gx1_ptr = grad_x1.data_ptr<float>();
+    float* gn2_ptr = grad_norm2_scale.data_ptr<float>();
+    std::vector<std::vector<float>> thread_gn2(n_threads, std::vector<float>(C, 0.0f));
+#pragma omp parallel num_threads(n_threads)
+    {
+        int tid = omp_get_thread_num();
+        asdag::pin_thread_to_physical_core(tid);
+        float* local_gn2 = thread_gn2[tid].data();
+#pragma omp for collapse(2) schedule(static)
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t t = 0; t < T; ++t) {
+                const float* gx2 = gx2_ptr + (b * T + t) * C;
+                const float* x1b = x1_ptr + (b * T + t) * C;
+                float* gx1b = gx1_ptr + (b * T + t) * C;
+                float sum_gx2_x1 = 0.0f, sum_x1_sq = 0.0f;
+                for (int64_t c = 0; c < C; ++c) { sum_gx2_x1 += gx2[c] * x1b[c]; sum_x1_sq += x1b[c] * x1b[c]; }
+                float rms = 1.0f / std::sqrt((sum_x1_sq / (float)C) + 1e-6f);
+                for (int64_t c = 0; c < C; ++c) {
+                    float g = gx2[c] * rms * n2_ptr[c];
+                    g -= x1b[c] * rms * n2_ptr[c] * sum_gx2_x1 / (float)C * rms * rms;
+                    gx1b[c] += g;
+                    local_gn2[c] += gx2[c] * x1b[c] * rms;
+                }
+            }
+        }
+    }
+    for (int t = 0; t < n_threads; ++t) for (int64_t c = 0; c < C; ++c) gn2_ptr[c] += thread_gn2[t][c];
+    auto [g_xn1, g_qkvg_d, g_qkvg_b, g_qs, g_ks, g_wd_gla, g_bd, g_od, g_ob] = asdag_fused_monarch_gla_backward_cpp(
+        grad_x1, x_norm1, qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_raw,
+        phi_q, phi_k, gamma_all, S_all, z_all, y_mod,
+        q_norm_scale, k_norm_scale, w_decay, b_decay,
+        out_diagonals, out_perms, out_inv_perms, reset_mask
+    );
+    auto grad_x = g_xn1.clone();
+    auto grad_norm1_scale = torch::zeros({C}, torch::kFloat32);
+    const float* gx1g_ptr = g_xn1.data_ptr<float>();
+    const float* x_ptr = x.data_ptr<float>();
+    const float* n1_ptr = norm1_scale.data_ptr<float>();
+    float* gx_ptr = grad_x.data_ptr<float>();
+    float* gn1_ptr = grad_norm1_scale.data_ptr<float>();
+    std::vector<std::vector<float>> thread_gn1(n_threads, std::vector<float>(C, 0.0f));
+#pragma omp parallel num_threads(n_threads)
+    {
+        int tid = omp_get_thread_num();
+        asdag::pin_thread_to_physical_core(tid);
+        float* local_gn1 = thread_gn1[tid].data();
+#pragma omp for collapse(2) schedule(static)
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t t = 0; t < T; ++t) {
+                const float* gx1g = gx1g_ptr + (b * T + t) * C;
+                const float* xb = x_ptr + (b * T + t) * C;
+                float* gxb = gx_ptr + (b * T + t) * C;
+                float sum_sq = 0.0f, sum_gx = 0.0f;
+                for (int64_t c = 0; c < C; ++c) sum_sq += xb[c]*xb[c];
+                float rms = 1.0f / std::sqrt((sum_sq/(float)C)+1e-6f);
+                for (int64_t c = 0; c < C; ++c) sum_gx += gx1g[c]*xb[c];
+                for (int64_t c = 0; c < C; ++c) {
+                    float g = gx1g[c]*rms*n1_ptr[c] - xb[c]*rms*n1_ptr[c]*sum_gx/(float)C * rms * rms;
+                    gxb[c] = g;
+                    local_gn1[c] += gx1g[c]*xb[c]*rms;
+                }
+            }
+        }
+    }
+    for (int t = 0; t < n_threads; ++t) for (int64_t c = 0; c < C; ++c) gn1_ptr[c] += thread_gn1[t][c];
+    return std::make_tuple(grad_x, grad_norm1_scale, g_qkvg_d, g_qkvg_b, g_qs, g_ks, g_wd_gla, g_bd, g_od, g_ob, grad_norm2_scale, g_w_perm, g_bias_tree,
+        g_root_w.to(torch::kFloat32), g_root_scale.to(torch::kFloat32), g_root_b.to(torch::kFloat32), g_hyper.to(torch::kFloat32), g_router_b.to(torch::kFloat32));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 27. Native Fused CPU LPC Head (Zero Logit Materialization + AVX SIMD + OpenMP)
 // ─────────────────────────────────────────────────────────────────────────────
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> asdag_lpc_head_forward_backward_cpp(
@@ -4297,6 +4971,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_monarch_gla_backward", &asdag_cpu::asdag_fused_monarch_gla_backward_cpp, "ASDAG CPU Full-Layer Fused Monarch GLA Backward (AVX2/AVX-512)");
     m.def("fused_asdag_block_forward", &asdag_cpu::asdag_fused_asdag_block_forward_cpp, "ASDAG CPU Full-Block Fused ASDAG Layer Forward (AVX2/AVX-512)");
     m.def("fused_asdag_block_backward", &asdag_cpu::asdag_fused_asdag_block_backward_cpp, "ASDAG CPU Full-Block Fused ASDAG Layer Backward (AVX2/AVX-512)");
+    m.def("fused_asdag_tree_block_forward", &asdag_cpu::asdag_fused_asdag_tree_block_forward_cpp, "ASDAG CPU Fused Tree Block Forward (AVX2/AVX-512)");
+    m.def("fused_asdag_tree_block_backward", &asdag_cpu::asdag_fused_asdag_tree_block_backward_cpp, "ASDAG CPU Fused Tree Block Backward (AVX2/AVX-512)");
     m.def("fused_rmsnorm_proj", &asdag_cpu::asdag_fused_rmsnorm_proj_cpp, "ASDAG CPU Fused RMSNorm Projection");
     m.def("newton_schulz5", &asdag_cpu::asdag_newton_schulz5_cpp, "ASDAG CPU 5th-Order Newton-Schulz Optimizer Kernel");
     m.def("gla_scan_forward", &asdag_cpu::asdag_gla_scan_forward_cpp, "ASDAG CPU Fused GLA Associative Scan Forward (AVX2/AVX-512)");

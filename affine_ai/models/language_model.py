@@ -90,12 +90,21 @@ class ASDAGBlock(nn.Module):
                 reset_mask
             )
 
-        # Fused tree-block kernel diverges from the reference path; keep off.
-        if False and (not x.is_cuda and not return_state and state is None
+        first_leaf = self.asdag.leaves[0] if self.asdag is not None and self.asdag.leaves else None
+        if (not x.is_cuda and not return_state and state is None
             and self.channel_mixer_type == "asdag_tree"
             and x.shape[-1] >= 64
             and getattr(self.time_mixer, 'proj_type', '') == "monarch"
-            and getattr(self.time_mixer, 'rule', 'gla') == "gla"):
+            and getattr(self.time_mixer, 'rule', 'gla') == "gla"
+            and self.asdag is not None
+            and self.asdag.use_hierarchical_routing
+            and self.asdag.top_k == 2
+            and first_leaf is not None
+            and first_leaf.leaf_mode in ("permutation", "perm")
+            and first_leaf.activation == "relu6"
+            and not any(len(leaf.secondary_parents) > 0 for leaf in self.asdag.leaves)
+            and len(self.asdag.root.secondary_parents) == 0
+            and self.asdag.root.scale_perm is not None):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_asdag_tree_block
             from affine_ai.core.ast_dag import ternarize
             tm = self.time_mixer
@@ -107,23 +116,7 @@ class ASDAGBlock(nn.Module):
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
             inv_perms_stack = torch.stack([leaf.inv_perms for leaf in leaves], dim=0)
-            B, T, C = x.shape
-            x_flat = x.reshape(-1, C)
-            if self.asdag.use_hierarchical_routing:
-                routing_probs, _ = self.asdag.router.route_tokens(x_flat)
-            else:
-                r_w = self.asdag.router_weights
-                logits = torch.nn.functional.linear(x_flat, r_w, self.asdag.router_biases)
-                routing_probs = torch.nn.functional.softmax(logits, dim=-1)
-            top_k = self.asdag.top_k if self.asdag.top_k is not None else routing_probs.shape[-1]
-            if top_k < routing_probs.shape[-1]:
-                top_vals, top_indices = torch.topk(routing_probs, k=top_k, dim=-1)
-                top_weights = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            else:
-                top_indices = torch.arange(routing_probs.shape[-1], device=x.device).unsqueeze(0).expand(x_flat.shape[0], -1)
-                top_weights = routing_probs
-            top_indices = top_indices.reshape(B, T, -1)
-            top_weights = top_weights.reshape(B, T, -1)
+            root = self.asdag.root
             return asdag_cpu_fused_asdag_tree_block(
                 x,
                 self.norm1.scale,
@@ -141,7 +134,8 @@ class ASDAGBlock(nn.Module):
                 tm.out_proj.bias,
                 self.norm2.scale,
                 w_perm_stack, perms_stack, inv_perms_stack, b_stack,
-                top_indices, top_weights,
+                root.latent_w_perm, root.scale_perm, root.bias, root.perms,
+                self.asdag.router.hyperplanes, self.asdag.router.biases,
                 reset_mask
             )
 

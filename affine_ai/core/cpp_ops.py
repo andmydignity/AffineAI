@@ -651,26 +651,39 @@ class ASDAGFusedTreeBlockAutogradFunction(torch.autograd.Function):
         perms: torch.Tensor,
         inv_perms: torch.Tensor,
         bias: torch.Tensor,
-        top_indices: torch.Tensor,
-        top_weights: torch.Tensor,
+        root_latent_w: torch.Tensor,
+        root_scale: torch.Tensor,
+        root_bias: torch.Tensor,
+        root_perms: torch.Tensor,
+        hyperplanes: torch.Tensor,
+        router_biases: torch.Tensor,
         reset_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         ops = get_asdag_cpu_ops()
         rm = reset_mask if reset_mask is not None else torch.empty((0,))
         if ops and hasattr(ops, 'fused_asdag_tree_block_forward') and not x.is_cuda:
-            out_y, x_norm1, x1, x_norm2, qkvg_raw, phi_q, phi_k, gamma_all, S_all, z_all, y_mod, active_leaf = ops.fused_asdag_tree_block_forward(
+            out = ops.fused_asdag_tree_block_forward(
                 x, norm1_scale, qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias,
                 q_norm_scale, k_norm_scale, w_decay, b_decay,
                 out_diagonals, out_perms, out_inv_perms, out_bias,
-                norm2_scale, w_perm, perms, inv_perms, bias, top_indices, top_weights, rm
+                norm2_scale, w_perm, perms, inv_perms, bias,
+                root_latent_w, root_scale, root_bias, root_perms,
+                hyperplanes, router_biases, rm
             )
+            (out_y, x_norm1, x1, x_norm2, qkvg_raw, phi_q, phi_k, gamma_all,
+             S_all, z_all, y_mod, active_leaf, r_in_flat, xq_save, root_out_save,
+             root_preact, node_p, top_idx, top_w, top_vals, sc0, scf, sc1) = out
             ctx.save_for_backward(
                 x, norm1_scale, x_norm1, x1, norm2_scale, x_norm2,
                 qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias, qkvg_raw,
                 phi_q, phi_k, gamma_all, S_all, z_all, y_mod,
                 q_norm_scale, k_norm_scale, w_decay, b_decay,
                 out_diagonals, out_perms, out_inv_perms, out_bias,
-                w_perm, perms, inv_perms, bias, top_indices, top_weights, active_leaf, rm
+                w_perm, perms, inv_perms, bias,
+                root_latent_w, root_scale, root_bias, root_perms,
+                hyperplanes, router_biases,
+                r_in_flat, xq_save, root_out_save, root_preact, node_p,
+                top_idx, top_vals, active_leaf, sc0, sc1, rm
             )
             return out_y.to(x.dtype)
         raise RuntimeError("Fused Tree Block requires C++ CPU extension.")
@@ -683,15 +696,25 @@ class ASDAGFusedTreeBlockAutogradFunction(torch.autograd.Function):
         phi_q, phi_k, gamma_all, S_all, z_all, y_mod = saved[11:17]
         q_norm_scale, k_norm_scale, w_decay, b_decay = saved[17:21]
         out_diagonals, out_perms, out_inv_perms, out_bias = saved[21:25]
-        w_perm, perms, inv_perms, bias, top_indices, top_weights, active_leaf, rm = saved[25:33]
+        w_perm, perms, inv_perms, bias = saved[25:29]
+        root_latent_w, root_scale, root_bias, root_perms = saved[29:33]
+        hyperplanes, router_biases = saved[33:35]
+        r_in_flat, xq_save, root_out_save, root_preact, node_p = saved[35:40]
+        top_idx, top_vals, active_leaf, sc0, sc1, rm = saved[40:46]
         ops = get_asdag_cpu_ops()
-        grad_x, grad_n1, g_qkvg_d, g_qkvg_b, g_qs, g_ks, g_wd_gla, g_bd, g_od, g_ob, grad_n2, g_w_perm, g_bias_tree, g_topw = ops.fused_asdag_tree_block_backward(
+        (grad_x, grad_n1, g_qkvg_d, g_qkvg_b, g_qs, g_ks, g_wd_gla, g_bd,
+         g_od, g_ob, grad_n2, g_w_perm, g_bias_tree, g_root_w, g_root_scale,
+         g_root_b, g_hyper, g_router_b) = ops.fused_asdag_tree_block_backward(
             grad_y, x, norm1_scale, x_norm1, x1, norm2_scale, x_norm2,
             qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias, qkvg_raw,
             phi_q, phi_k, gamma_all, S_all, z_all, y_mod,
             q_norm_scale, k_norm_scale, w_decay, b_decay,
             out_diagonals, out_perms, out_inv_perms, out_bias,
-            w_perm, perms, inv_perms, bias, top_indices, top_weights, active_leaf, rm
+            w_perm, perms, inv_perms, bias,
+            root_latent_w, root_scale, root_bias, root_perms,
+            hyperplanes, router_biases,
+            r_in_flat, xq_save, root_out_save, root_preact, node_p,
+            top_idx, top_vals, active_leaf, sc0, sc1, rm
         )
         return (
             grad_x.to(grad_y.dtype),
@@ -701,7 +724,14 @@ class ASDAGFusedTreeBlockAutogradFunction(torch.autograd.Function):
             g_wd_gla.to(w_decay.dtype), g_bd.to(b_decay.dtype),
             g_od.to(out_diagonals.dtype), None, None, g_ob.to(out_bias.dtype),
             grad_n2.to(norm2_scale.dtype),
-            g_w_perm.to(w_perm.dtype), None, None, g_bias_tree.to(bias.dtype), None, None, None
+            g_w_perm.to(w_perm.dtype), None, None, g_bias_tree.to(bias.dtype),
+            g_root_w.to(root_latent_w.dtype),
+            g_root_scale.to(root_scale.dtype),
+            g_root_b.to(root_bias.dtype),
+            None,
+            g_hyper.to(hyperplanes.dtype),
+            g_router_b.to(router_biases.dtype),
+            None
         )
 
 
@@ -725,15 +755,21 @@ def asdag_cpu_fused_asdag_tree_block(
     perms: torch.Tensor,
     inv_perms: torch.Tensor,
     bias: torch.Tensor,
-    top_indices: torch.Tensor,
-    top_weights: torch.Tensor,
+    root_latent_w: torch.Tensor,
+    root_scale: torch.Tensor,
+    root_bias: torch.Tensor,
+    root_perms: torch.Tensor,
+    hyperplanes: torch.Tensor,
+    router_biases: torch.Tensor,
     reset_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return ASDAGFusedTreeBlockAutogradFunction.apply(
         x, norm1_scale, qkvg_diagonals, qkvg_perms, qkvg_inv_perms, qkvg_bias,
         q_norm_scale, k_norm_scale, w_decay, b_decay,
         out_diagonals, out_perms, out_inv_perms, out_bias,
-        norm2_scale, w_perm, perms, inv_perms, bias, top_indices, top_weights, reset_mask
+        norm2_scale, w_perm, perms, inv_perms, bias,
+        root_latent_w, root_scale, root_bias, root_perms,
+        hyperplanes, router_biases, reset_mask
     )
 
 

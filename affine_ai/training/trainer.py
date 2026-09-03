@@ -104,6 +104,13 @@ class ASDAGTrainer:
                 pass
 
         self.model = model.to(self.device)
+        if self.device == "cpu":
+            try:
+                from affine_ai.core.numa import node_count, interleave_model_weights
+                if node_count() > 1:
+                    interleave_model_weights(self.model)
+            except Exception:
+                pass
         if compile_model and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(self.model)

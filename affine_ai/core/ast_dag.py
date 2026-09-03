@@ -902,16 +902,23 @@ class ASTDAGLayer(nn.Module):
         r_in = quantize_shift4(root_out) if (use_shift4_act or first_leaf.use_shift4_activations) else root_out
 
         if first_leaf.leaf_mode in ("permutation", "perm"):
-            w_perm_stack = torch.stack([
-                ternarize(leaf.latent_w_perm, self.threshold_frac, scale=leaf.scale_perm if self.learnable_scale else None)
-                for leaf in leaves
-            ], dim=0)
+            latent_stack = torch.stack([leaf.latent_w_perm for leaf in leaves], dim=0)
+            abs_stack = latent_stack.detach().abs()
+            delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.threshold_frac
+            w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
+                        torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
+            if self.learnable_scale:
+                alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
+            else:
+                active = (w_sign != 0).to(latent_stack.dtype)
+                alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+            w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
             inv_perms_stack = torch.stack([leaf.inv_perms for leaf in leaves], dim=0)
 
             has_secondary = any(len(leaf.secondary_parents) > 0 for leaf in leaves)
-            if not r_in.is_cuda and not has_secondary and first_leaf.activation == "relu6" and not record_cache:
+            if not r_in.is_cuda and not has_secondary and first_leaf.activation == "relu6":
                 from affine_ai.core.cpp_ops import asdag_cpu_sparse_tree_perm
                 composite_out = asdag_cpu_sparse_tree_perm(
                     r_in, w_perm_stack, perms_stack, inv_perms_stack, b_stack, top_indices, top_weights
@@ -1063,10 +1070,17 @@ class ASTDAGLayer(nn.Module):
         r_in = quantize_shift4(root_out) if first_leaf.use_shift4_activations else root_out
 
         if first_leaf.leaf_mode in ("permutation", "perm"):
-            w_perm_stack = torch.stack([
-                ternarize(leaf.latent_w_perm, self.threshold_frac, scale=leaf.scale_perm if self.learnable_scale else None)
-                for leaf in leaves
-            ], dim=0)
+            latent_stack = torch.stack([leaf.latent_w_perm for leaf in leaves], dim=0)
+            abs_stack = latent_stack.detach().abs()
+            delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.threshold_frac
+            w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
+                        torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
+            if self.learnable_scale:
+                alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
+            else:
+                active = (w_sign != 0).to(latent_stack.dtype)
+                alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+            w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             if r_in.is_cuda:
                 K_num = len(leaves)

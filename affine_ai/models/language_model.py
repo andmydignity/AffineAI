@@ -106,13 +106,19 @@ class ASDAGBlock(nn.Module):
             and len(self.asdag.root.secondary_parents) == 0
             and self.asdag.root.scale_perm is not None):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_asdag_tree_block
-            from affine_ai.core.ast_dag import ternarize
             tm = self.time_mixer
             leaves = self.asdag.leaves
-            w_perm_stack = torch.stack([
-                ternarize(leaf.latent_w_perm, self.asdag.threshold_frac, scale=leaf.scale_perm if self.asdag.learnable_scale else None)
-                for leaf in leaves
-            ], dim=0)
+            latent_stack = torch.stack([leaf.latent_w_perm for leaf in leaves], dim=0)
+            abs_stack = latent_stack.detach().abs()
+            delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.asdag.threshold_frac
+            w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
+                        torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
+            if self.asdag.learnable_scale:
+                alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
+            else:
+                active = (w_sign != 0).to(latent_stack.dtype)
+                alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+            w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
             inv_perms_stack = torch.stack([leaf.inv_perms for leaf in leaves], dim=0)

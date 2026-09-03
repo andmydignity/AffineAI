@@ -26,6 +26,16 @@ from affine_ai.models.language_model import ASDAGLanguageModel
 from affine_ai.core.loss import ChunkedCrossEntropyLoss
 
 
+def suggest_batch_size() -> int:
+    """Throughput-optimal batch size for CPU training on this machine.
+
+    Measured sweet spot is ~1.5x physical cores (B12 on 8 cores;
+    mild oversubscription feeds the memory-bound phases). Scales
+    linearly: B24 on 16 cores, etc.
+    """
+    return max(1, (3 * get_cpu_physical_cores() + 1) // 2)
+
+
 def get_cpu_physical_cores() -> int:
     """Returns number of physical CPU cores (bypassing SMT hyperthreading).
 
@@ -58,7 +68,7 @@ class ASDAGTrainer:
         model: ASDAGLanguageModel,
         train_data: Union[torch.Tensor, np.ndarray],
         val_data: Union[torch.Tensor, np.ndarray],
-        batch_size: int = 16,
+        batch_size: Optional[int] = None,
         seq_len: int = 64,
         lr: float = 1e-3,
         weight_decay: float = 0.01,
@@ -99,7 +109,7 @@ class ASDAGTrainer:
             except Exception:
                 pass
 
-        self.batch_size = batch_size
+        self.batch_size = batch_size if batch_size is not None else suggest_batch_size()
         self.seq_len = seq_len
         self.lr = lr
         self.max_steps = max_steps

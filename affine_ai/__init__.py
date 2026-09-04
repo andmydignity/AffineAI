@@ -17,6 +17,8 @@ from affine_ai.models.jepa import TorosJEPA, TorosJEPAConfig
 from affine_ai.models.hybrid import TorosHybridLanguageModel, TorosHybridConfig
 from affine_ai.core.format import save_toros_model, load_toros_model, read_toros_metadata
 
+from affine_ai.models.qwen35_asdag import Qwen35ASDAGModel, Qwen35ASDAGConfig, Qwen35Block
+
 __all__ = [
     "ASTDAGLayer",
     "ASDAGConfig",
@@ -40,4 +42,7 @@ __all__ = [
     "save_toros_model",
     "load_toros_model",
     "read_toros_metadata",
+    "Qwen35ASDAGModel",
+    "Qwen35ASDAGConfig",
+    "Qwen35Block",
 ]

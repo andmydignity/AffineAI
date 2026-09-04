@@ -128,3 +128,32 @@ def test_upcycled_checkpoint_loading():
 
     assert out.shape == (1, 4, config.dim)
     assert not torch.isnan(out).any()
+
+
+def test_mtp_checkpoint_loading():
+    """Verify loading upcycled weights from checkpoints/qwen35_asdag/mtp_block.pt into Qwen35MTPBlock."""
+    ckpt_path = "checkpoints/qwen35_asdag/mtp_block.pt"
+    if not os.path.exists(ckpt_path):
+        pytest.skip(f"{ckpt_path} does not exist. Run scripts/upcycle_qwen35.py first.")
+
+    from affine_ai.models.qwen35_asdag import Qwen35MTPBlock
+    config = Qwen35ASDAGConfig(dtype=torch.bfloat16)
+    mtp = Qwen35MTPBlock(config)
+
+    mtp_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    block_state = {k: v for k, v in mtp_ckpt.items() if not k.startswith(('eh_proj', 'enorm', 'hnorm', 'shared_head_norm'))}
+    extra_state = {k: v for k, v in mtp_ckpt.items() if k.startswith(('eh_proj', 'enorm', 'hnorm', 'shared_head_norm'))}
+
+    mtp.block.load_state_dict(block_state)
+    mtp.eh_proj.weight.data.copy_(extra_state['eh_proj.weight'])
+    mtp.enorm.weight.data.copy_(extra_state['enorm.weight'])
+    mtp.hnorm.weight.data.copy_(extra_state['hnorm.weight'])
+    mtp.shared_head_norm.weight.data.copy_(extra_state['shared_head_norm.weight'])
+
+    B, T = 1, 4
+    h = torch.randn(B, T, config.dim, dtype=torch.bfloat16)
+    emb = torch.randn(B, T, config.dim, dtype=torch.bfloat16)
+    out, _ = mtp(h, emb, pos=0)
+
+    assert out.shape == (B, T, config.dim)
+    assert not torch.isnan(out).any()

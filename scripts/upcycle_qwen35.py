@@ -39,7 +39,7 @@ def extract_block_state_dict(reader, layer_idx: int, config: Qwen35ASDAGConfig) 
     Slices the 9216 SwiGLU FFN into K ASDAG leaves.
     """
     tensors = {t.name: t for t in reader.tensors if t.name.startswith(f"blk.{layer_idx}.")}
-    is_full_attn = ((layer_idx + 1) % config.full_attn_interval == 0)
+    is_full_attn = (layer_idx == 32) or ((layer_idx + 1) % config.full_attn_interval == 0)
 
     state_dict = {}
 
@@ -149,14 +149,35 @@ def main():
 
     t0 = time.time()
     for layer_idx in range(num_layers):
+        out_file = os.path.join(args.output_dir, f"block_{layer_idx:02d}.pt")
+        if os.path.exists(out_file):
+            print(f"  Layer {layer_idx:02d}: already converted at {out_file}, skipping...")
+            continue
         layer_t0 = time.time()
         block_state = extract_block_state_dict(reader, layer_idx, config)
-        out_file = os.path.join(args.output_dir, f"block_{layer_idx:02d}.pt")
         torch.save(block_state, out_file)
         dt = time.time() - layer_t0
         is_attn = ((layer_idx + 1) % config.full_attn_interval == 0)
         layer_type = "Gated Attention" if is_attn else "Gated DeltaNet"
         print(f"  Layer {layer_idx:02d} ({layer_type}): converted & saved in {dt:.2f}s -> {out_file}")
+
+    # Extract MTP block if present
+    has_mtp = any(t.name.startswith("blk.32.") for t in reader.tensors)
+    if has_mtp and (args.max_layers is None or args.max_layers >= 32):
+        print("\nExtracting MTP (Multi-Token Prediction) Block 32...")
+        mtp_t0 = time.time()
+        mtp_state = extract_block_state_dict(reader, 32, config)
+        
+        # Add nextn projection and norms
+        tensors_32 = {t.name: t for t in reader.tensors if t.name.startswith("blk.32.")}
+        mtp_state["eh_proj.weight"] = dequantize_tensor(tensors_32["blk.32.nextn.eh_proj.weight"]).to(config.dtype)
+        mtp_state["enorm.weight"] = dequantize_tensor(tensors_32["blk.32.nextn.enorm.weight"]).to(config.dtype)
+        mtp_state["hnorm.weight"] = dequantize_tensor(tensors_32["blk.32.nextn.hnorm.weight"]).to(config.dtype)
+        mtp_state["shared_head_norm.weight"] = dequantize_tensor(tensors_32["blk.32.nextn.shared_head_norm.weight"]).to(config.dtype)
+        
+        mtp_out = os.path.join(args.output_dir, "mtp_block.pt")
+        torch.save(mtp_state, mtp_out)
+        print(f"  MTP block saved in {time.time() - mtp_t0:.2f}s -> {mtp_out}")
 
     # Extract global weights if doing full model or first trial
     print("\nExtracting global weights (Token Embedding & Output Norm)...")

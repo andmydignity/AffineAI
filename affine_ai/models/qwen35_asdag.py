@@ -359,7 +359,7 @@ class Qwen35Block(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.is_full_attention = ((layer_idx + 1) % config.full_attn_interval == 0)
+        self.is_full_attention = (layer_idx == 32) or ((layer_idx + 1) % config.full_attn_interval == 0)
 
         self.attn_norm = Qwen35RMSNorm(config.dim, eps=config.rms_norm_eps)
         if self.is_full_attention:

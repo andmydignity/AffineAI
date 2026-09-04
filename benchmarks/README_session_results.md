@@ -159,3 +159,78 @@ retreating to corpus marginals). State recurrence design (GLA vs delta) modulate
 how STUCK a loop gets, not whether the model ENTERS it. The remaining untested
 levers from the ranked menu: readout fatigue (state-level escape pressure,
 cheap) and decode-side penalties (rep-penalty/n-gram block), all composable.
+
+## depth_vs_width (2026-09-03, CPU, TinyStories, hybrid defaults)
+
+Protocol: fixed ~0.3M budget, B8 T256, AdamW 3e-4 then Muon
+(lr 3e-3 + muon_lr 0.02 + clip 1.0), same seed/data, 2k steps (~4M tok),
+20-batch val. One 20k-step confirmation pair.
+
+| dim | L | P | AdamW val | Muon val |
+|---|---|---|---|---|
+| 256 | 2 | 0.334M | 2.39 | ~2.0 (FRAGILE: NaN 1/2 runs) |
+| 192 | 4 | 0.296M | 2.80 | 2.12 |
+| 160 | 6 | 0.298M | 2.52 | 2.26 |
+| 128 | 9 | 0.305M | 2.84 | 2.77 |
+| 96 | 14 | 0.318M | 3.22 | 3.97 |
+
+20k-step check (41M tok): 256x2 -> 2.01, 160x6 -> 2.54 (plateaued;
+train kept falling, val froze = optimization stall, not capacity).
+
+Findings:
+- Depth loses everywhere at this scale, both optimizers. Tree mixer
+  gives per-layer expressivity that dense nets need depth for.
+- Muon >> AdamW (e.g. 2.12 vs 2.80 at 192x4), but 256x2+Muon is on
+  the stability edge (OpenMP reduction-order nondeterminism flips one
+  run to NaN). 192x4 is the robust sweet spot.
+- Throughput peaks mid-range too (dim192/L4 fastest of the five).
+
+Scaling formula (fitted, TinyStories, 0.24-0.34M only):
+P ~= 2e-6 * L * dim^2. Rule: L* in [3,6] (default 4),
+dim* = sqrt(P / (2e-6 * L*)), d_byte = dim/2, heads 4.
+Predicts dim~285x4 at 0.7M (ran dim384x3 pre-formula instead;
+dim285x4 rematch pending). Do NOT trust past ~10M without refit.
+
+## secondary_parents_ab (2026-09-03, CPU, 700k dim384x3, Muon vs AdamW)
+
+Q: do DAG secondary (cross-leaf context) edges matter?
+A: No evidence they help; evidence they hurt.
+- Growth (step_topology) is UNWIRED: called only in tests, never in
+  training. use_growth=True alone changes nothing (controllers update
+  stats, topology never moves). Secondary lists stay empty on defaults.
+- Grafted-edge A/B (87 hand-added topo-ordered edges, 2k steps):
+  no-sec val 1.909 (PPL 6.7) at 30k tok/s;
+  grafted-sec NaN at 13k tok/s (fused kernels bail on has_secondary).
+- Diagnosis: machinery sound under AdamW (30 steps clean) and under
+  Muon@0.005 (60 steps clean). NaN is heat: secondary coupling +
+  Muon@0.02 overshoots. Forward starts identical (zero-init gates).
+- Verdict: keep secondary/growth OFF and unwired. The DAG is a tree
+  until someone shows edges buying PPL. Merging/splitting dynamics
+  untested; do not enable without an A/B.
+
+## mixer_ab (2026-09-03, CPU, 700k, full TinyStories 95/5, Muon, 2k steps)
+
+Same params (~0.7M), same L3, same protocol:
+- asdag_tree dim384: val 2.067 (PPL 7.9), 30k tok/s
+- ternary_swiglu dim176: val 2.346 (PPL 10.4), 83k tok/s
+
+Tree wins quality (-12% loss), swiglu wins speed (2.8x). Confounder:
+same params forces different shapes (tree is 2.2x wider -- sparse
+efficiency buys width). Tree's quality edge likely IS the width edge.
+Verdict: tree stays default (quality-first); swiglu is the documented
+fast alternative when throughput matters more than PPL.
+
+Same-shape control (dim176x3, Muon, 2k): tree 0.229M val 2.334
+vs swiglu 0.698M val 2.346, both ~81-83k tok/s. Identical quality
+AND speed at 1/3 the params. Mechanism cost is nil (shared GLA +
+decoder dominate); tree's win is pure param efficiency. The mixer
+A/B gap above is 100% width effect.
+
+## delta_vs_gla_swiglu (2026-09-03, CPU, 700k swiglu dim176x3, Muon, 2k)
+
+- gla+swiglu: val 2.327 (PPL 10.3), 82k tok/s
+- delta+swiglu: val 2.473 (PPL 11.9), 31k tok/s
+Delta loses both ways on CPU: no fused kernel (split-path sequential
+scan, 2.7x slower) and worse PPL (+0.15). Matches the old GPU verdict.
+Keep rule="gla" default; delta stays opt-in behind
+time_mixer_rule for long-horizon experiments only.

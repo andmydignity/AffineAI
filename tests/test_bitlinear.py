@@ -68,3 +68,74 @@ def test_full_option_b_language_model():
     # Test O(1) step generation (deterministic, no EOS early stop)
     gen = model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=5, temperature=0.0, eos_byte=None)
     assert gen.shape == (1, 8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_triton_swiglu_cuda_parity_and_backward():
+    from affine_ai.kernels.triton_bitlinear import triton_bitlinear_swiglu
+
+    torch.manual_seed(42)
+    M, K, N = 128, 64, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w_gv = torch.randn(2 * N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w_d = torch.randn(K, N, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    out = triton_bitlinear_swiglu(x, w_gv, w_d)
+    assert out.shape == (M, K)
+
+    loss = out.sum()
+    loss.backward()
+
+    assert x.grad is not None
+    assert w_gv.grad is not None
+    assert w_d.grad is not None
+    assert not torch.isnan(x.grad).any()
+    assert not torch.isnan(w_gv.grad).any()
+    assert not torch.isnan(w_d.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_triton_fused_add_rms_norm():
+    from affine_ai.kernels.triton_rms_norm import triton_fused_add_rms_norm
+
+    torch.manual_seed(42)
+    B, T, D = 4, 32, 64
+    x = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    res = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    scale = torch.randn(D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    y_norm, res_out = triton_fused_add_rms_norm(x, res, scale, eps=1e-6)
+
+    assert y_norm.shape == (B, T, D)
+    assert res_out.shape == (B, T, D)
+    assert torch.allclose(res_out, x + res, atol=1e-3)
+
+    loss = y_norm.sum() + res_out.sum()
+    loss.backward()
+
+    assert x.grad is not None
+    assert res.grad is not None
+    assert scale.grad is not None
+    assert not torch.isnan(x.grad).any()
+    assert not torch.isnan(res.grad).any()
+    assert not torch.isnan(scale.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_triton_2bit_ternary_packing_and_unpacking():
+    from affine_ai.kernels.triton_ternary import triton_pack_ternary_2bit, triton_unpack_ternary_2bit
+
+    torch.manual_seed(42)
+    Rows, Cols = 32, 64
+    w_raw = torch.randint(-1, 2, (Rows, Cols), device="cuda", dtype=torch.float32)
+
+    packed = triton_pack_ternary_2bit(w_raw)
+    assert packed.shape == (Rows, Cols // 16)
+    assert packed.dtype == torch.int32
+
+    unpacked = triton_unpack_ternary_2bit(packed, (Rows, Cols), dtype=torch.float32)
+    assert unpacked.shape == (Rows, Cols)
+    assert torch.equal(unpacked, w_raw)
+
+
+

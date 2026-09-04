@@ -44,10 +44,18 @@ class LocalPredictiveHead(nn.Module):
         w_scaled = self.weight / gamma
         w_ternary = torch.round(w_scaled).clamp(-1.0, 1.0)
         w_quant = self.weight + (w_ternary * gamma - self.weight).detach()
-        logits = F.linear(h_norm, w_quant)
         if targets is not None:
+            if h.is_cuda:
+                try:
+                    from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
+                    loss = triton_fused_lpc_head(h_norm, w_quant, targets, ignore_index=ignore_index)
+                    return h_norm, loss
+                except Exception:
+                    pass
+            logits = F.linear(h_norm, w_quant)
             loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
             return h_norm, loss
+        logits = F.linear(h_norm, w_quant)
         return logits, None
 
 
@@ -143,8 +151,9 @@ class LocalPredictiveLanguageModel(nn.Module):
         grad_clip: float = 1.0,
         ignore_index: int = -100,
         use_async_pipelining: bool = True,
-        stride: Optional[int] = None
-    ) -> Dict[str, float]:
+        stride: Optional[int] = None,
+        sync_loss: bool = False
+    ) -> Dict[str, Any]:
         """
         Executes a complete forward-only Local Predictive Coding step.
         Supports asynchronous CUDA stream pipelining and strided token error sampling.
@@ -158,15 +167,15 @@ class LocalPredictiveLanguageModel(nn.Module):
 
         is_cuda = input_ids.is_cuda
         if is_cuda and use_async_pipelining:
-            if getattr(self, '_cuda_streams', None) is None or len(self._cuda_streams) != len(self.base_model.blocks):
-                self._cuda_streams = [torch.cuda.Stream(device=input_ids.device) for _ in range(len(self.base_model.blocks))]
-        elif not is_cuda and use_async_pipelining:
-            import concurrent.futures
-            if getattr(self, '_cpu_executor', None) is None:
-                self._cpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if getattr(self, '_bwd_stream', None) is None or self._bwd_stream.device != input_ids.device:
+                self._bwd_stream = torch.cuda.Stream(device=input_ids.device)
+            bwd_stream = self._bwd_stream
+            bwd_event = None
+        else:
+            bwd_stream = None
+            bwd_event = None
 
         curr_h = x
-        prev_future = None
 
         for idx, block in enumerate(self.base_model.blocks):
             # Detach to guarantee zero cross-layer autograd tape (strictly O(1) memory)
@@ -180,53 +189,87 @@ class LocalPredictiveLanguageModel(nn.Module):
             # Local predictive head forward
             _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
 
-            # Asynchronous Pipelined Execution on CUDA
+            # Asynchronous Pipelined Execution on CUDA via Double-Buffering
             if is_cuda and use_async_pipelining:
-                stream = self._cuda_streams[idx]
-                with torch.cuda.stream(stream):
+                if bwd_event is not None:
+                    torch.cuda.current_stream().wait_event(bwd_event)
+
+                fwd_event = torch.cuda.Event()
+                fwd_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(bwd_stream):
+                    bwd_stream.wait_event(fwd_event)
                     opt_i = optimizers[idx]
                     opt_i.zero_grad(set_to_none=True)
                     loss_i.backward()
                     if grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(block.parameters(), grad_clip)
+                        params = []
+                        for pg in opt_i.param_groups:
+                            params.extend(pg['params'])
+                        torch.nn.utils.clip_grad_norm_(params, grad_clip)
                     opt_i.step()
                     opt_i.zero_grad(set_to_none=True)
-                layer_losses.append(loss_i.item())
+                    bwd_event = torch.cuda.Event()
+                    bwd_event.record(bwd_stream)
+
+                layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
             else:
                 opt_i = optimizers[idx]
-                opt_i.zero_grad(set_to_none=False)
+                opt_i.zero_grad(set_to_none=is_cuda)
                 loss_i.backward()
                 if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(block.parameters(), grad_clip)
+                    params = []
+                    for pg in opt_i.param_groups:
+                        params.extend(pg['params'])
+                    torch.nn.utils.clip_grad_norm_(params, grad_clip)
                 opt_i.step()
-                opt_i.zero_grad(set_to_none=False)
-                layer_losses.append(loss_i.item())
+                opt_i.zero_grad(set_to_none=is_cuda)
+                layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
 
             curr_h = next_h
+
+        if is_cuda and use_async_pipelining and bwd_event is not None:
+            torch.cuda.current_stream().wait_event(bwd_event)
 
         # Final output layer update
         curr_h_in = curr_h.detach().requires_grad_(True)
         final_h = self.base_model.norm_f(curr_h_in)
-        final_logits = self.base_model.lm_head(final_h)
-        loss_final = F.cross_entropy(final_logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
+        if final_h.is_cuda and self.vocab_size >= 4096:
+            try:
+                from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
+                loss_final = triton_fused_linear_cross_entropy(
+                    final_h, self.base_model.lm_head.weight, targets, ignore_index=ignore_index
+                )
+            except Exception:
+                final_logits = self.base_model.lm_head(final_h)
+                loss_final = F.cross_entropy(final_logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
+        else:
+            final_logits = self.base_model.lm_head(final_h)
+            loss_final = F.cross_entropy(final_logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
 
         opt_final = optimizers[-1]
-        opt_final.zero_grad(set_to_none=False if not is_cuda else True)
+        opt_final.zero_grad(set_to_none=is_cuda)
         loss_final.backward()
         if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.base_model.lm_head.parameters(), grad_clip)
+            params = []
+            for pg in opt_final.param_groups:
+                params.extend(pg['params'])
+            torch.nn.utils.clip_grad_norm_(params, grad_clip)
         opt_final.step()
-        opt_final.zero_grad(set_to_none=False if not is_cuda else True)
+        opt_final.zero_grad(set_to_none=is_cuda)
 
-        if is_cuda and use_async_pipelining:
-            for s in self._cuda_streams:
-                torch.cuda.current_stream().wait_stream(s)
-
-        return {
-            "loss": loss_final.item(),
-            "layer_losses": layer_losses,
-            "mean_local_loss": sum(layer_losses) / len(layer_losses) if layer_losses else loss_final.item()
-        }
+        if sync_loss:
+            return {
+                "loss": loss_final.item(),
+                "layer_losses": layer_losses,
+                "mean_local_loss": sum(layer_losses) / len(layer_losses) if layer_losses else loss_final.item()
+            }
+        else:
+            loss_final_det = loss_final.detach()
+            return {
+                "loss": loss_final_det,
+                "layer_losses": layer_losses,
+                "mean_local_loss": torch.stack(layer_losses).mean() if layer_losses else loss_final_det
+            }
 
     @torch.no_grad()
     def generate(self, *args, **kwargs) -> torch.Tensor:

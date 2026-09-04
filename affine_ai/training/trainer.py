@@ -27,13 +27,19 @@ from affine_ai.models.language_model import ASDAGLanguageModel
 from affine_ai.core.loss import ChunkedCrossEntropyLoss
 
 
-def suggest_batch_size() -> int:
-    """Throughput-optimal batch size for CPU training on this machine.
+def suggest_batch_size(device: Optional[str] = None) -> int:
+    """Throughput-optimal batch size for training on this machine.
 
-    Measured sweet spot is ~1.5x physical cores (B12 on 8 cores;
+    On GPU: B96 maximizes throughput (~212k-250k tok/s) while keeping
+    peak VRAM comfortably within budget (~1.7 GB, avoiding OOM seen at B256).
+    On CPU: sweet spot is ~1.5x physical cores (B12 on 8 cores;
     mild oversubscription feeds the memory-bound phases). Scales
     linearly: B24 on 16 cores, etc.
     """
+    if device is not None and "cuda" in str(device):
+        return 96
+    if device is None and torch.cuda.is_available():
+        return 96
     return max(1, (3 * get_cpu_physical_cores() + 1) // 2)
 
 
@@ -117,7 +123,10 @@ class ASDAGTrainer:
             except Exception:
                 pass
 
-        self.batch_size = batch_size if batch_size is not None else suggest_batch_size()
+        if batch_size is not None:
+            self.batch_size = batch_size
+        else:
+            self.batch_size = suggest_batch_size(self.device)
         self.seq_len = seq_len
         self.lr = lr
         self.max_steps = max_steps
@@ -137,6 +146,18 @@ class ASDAGTrainer:
             self.val_data = torch.from_numpy(val_data.astype(np.int64))
         else:
             self.val_data = val_data.to(torch.long)
+
+        # Allocate pinned staging buffers on CPU for zero-copy DMA to CUDA
+        if "cuda" in str(self.device):
+            try:
+                self._pinned_buf_x = torch.empty((self.batch_size, self.seq_len), dtype=torch.long, pin_memory=True)
+                self._pinned_buf_y = torch.empty((self.batch_size, self.seq_len), dtype=torch.long, pin_memory=True)
+            except Exception:
+                self._pinned_buf_x = None
+                self._pinned_buf_y = None
+        else:
+            self._pinned_buf_x = None
+            self._pinned_buf_y = None
 
         # Fused / standard AdamW
         fused = (self.device == "cuda" and hasattr(optim.AdamW, "_fused"))
@@ -228,8 +249,21 @@ class ASDAGTrainer:
         offsets = torch.arange(self.seq_len, device=ix.device)
         idx = ix.unsqueeze(1) + offsets.unsqueeze(0)
         idx_next = idx + 1
-        x = data[idx].to(self.device)
-        y = data[idx_next].to(self.device)
+
+        if data.is_cuda:
+            if idx.device != data.device:
+                idx = idx.to(data.device, non_blocking=True)
+                idx_next = idx_next.to(data.device, non_blocking=True)
+            x = data[idx]
+            y = data[idx_next]
+        elif "cuda" in str(self.device) and getattr(self, "_pinned_buf_x", None) is not None:
+            self._pinned_buf_x.copy_(data[idx])
+            self._pinned_buf_y.copy_(data[idx_next])
+            x = self._pinned_buf_x.to(self.device, non_blocking=True)
+            y = self._pinned_buf_y.to(self.device, non_blocking=True)
+        else:
+            x = data[idx].to(self.device, non_blocking=True)
+            y = data[idx_next].to(self.device, non_blocking=True)
         return x, y
 
     def get_lr(self, step: int) -> float:
@@ -299,7 +333,7 @@ class ASDAGTrainer:
         self.optimizer.step()
         return loss.item()
 
-    def train_step(self, step: int) -> float:
+    def train_step(self, step: int, sync_loss: bool = False) -> Any:
         """Executes a single optimized training step (Autograd, Backpressure, LPC, or Hybrid)."""
         if getattr(self.model, "hybrid", None) is not None:
             lr = self.get_lr(step)
@@ -317,7 +351,7 @@ class ASDAGTrainer:
                             pg["lr"] = lr
                 x, y = self.get_batch("train")
                 res = self.model.hybrid.forward_lpc_step(
-                    x, y, self.hybrid_optimizers, grad_clip=self.grad_clip
+                    x, y, self.hybrid_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss
                 )
                 return res["loss"]
             else:
@@ -330,7 +364,7 @@ class ASDAGTrainer:
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
-                return loss.item()
+                return loss.item() if sync_loss else loss.detach()
 
         if self.use_backpressure:
             return self.train_step_backpressure(step)
@@ -349,7 +383,7 @@ class ASDAGTrainer:
                     for pg in opt.param_groups:
                         pg["lr"] = lr
             x, y = self.get_batch("train")
-            res = self.lpc_model.forward_lpc_step(x, y, self.lpc_optimizers, grad_clip=self.grad_clip)
+            res = self.lpc_model.forward_lpc_step(x, y, self.lpc_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss)
             return res["loss"]
 
         lr = self.get_lr(step)
@@ -371,7 +405,7 @@ class ASDAGTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
         self.optimizer.step()
-        return loss.item()
+        return loss.item() if sync_loss else loss.detach()
 
     def train(self, save_path: Optional[str] = None) -> Dict[str, Any]:
         self.model.train()
@@ -383,7 +417,7 @@ class ASDAGTrainer:
             gc.disable()
         try:
             for step in range(self.max_steps):
-                loss_val = self.train_step(step)
+                loss_val = self.train_step(step, sync_loss=False)
                 if step % 500 == 499:
                     gc.collect()
 

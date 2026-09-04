@@ -12,6 +12,7 @@ def _optional_import(module_name, symbol):
 
 
 triton_rms_norm = _optional_import("affine_ai.kernels.triton_rms_norm", "triton_rms_norm")
+triton_fused_add_rms_norm = _optional_import("affine_ai.kernels.triton_rms_norm", "triton_fused_add_rms_norm")
 triton_fused_linear_cross_entropy = _optional_import(
     "affine_ai.kernels.triton_cross_entropy", "triton_fused_linear_cross_entropy")
 try:
@@ -30,12 +31,18 @@ triton_monarch_chain = _optional_import("affine_ai.kernels.triton_gla", "triton_
 triton_fused_monarch_chain = _optional_import("affine_ai.kernels.triton_gla", "triton_fused_monarch_chain")
 triton_gla_decay = _optional_import("affine_ai.kernels.triton_gla", "triton_gla_decay")
 triton_router_topk = _optional_import("affine_ai.kernels.triton_router", "triton_router_topk")
+triton_unpack_ternary_2bit = _optional_import("affine_ai.kernels.triton_ternary", "triton_unpack_ternary_2bit")
+triton_pack_ternary_2bit = _optional_import("affine_ai.kernels.triton_ternary", "triton_pack_ternary_2bit")
+triton_pack_sign_bits = _optional_import("affine_ai.kernels.triton_popc", "triton_pack_sign_bits")
+triton_popc_sign_similarity = _optional_import("affine_ai.kernels.triton_popc", "triton_popc_sign_similarity")
+triton_int8_imma_linear = _optional_import("affine_ai.kernels.triton_int8_imma", "triton_int8_imma_linear")
 
 TRITON_AVAILABLE = triton_rms_norm is not None
 
 __all__ = [
     "fused_asdag_forward_triton",
     "triton_rms_norm",
+    "triton_fused_add_rms_norm",
     "triton_fused_linear_cross_entropy",
     "triton_fused_lpc_head",
     "triton_ternary_linear",
@@ -49,6 +56,11 @@ __all__ = [
     "triton_fused_monarch_chain",
     "triton_gla_decay",
     "triton_router_topk",
+    "triton_unpack_ternary_2bit",
+    "triton_pack_ternary_2bit",
+    "triton_pack_sign_bits",
+    "triton_popc_sign_similarity",
+    "triton_int8_imma_linear",
     "TRITON_AVAILABLE",
 ]
 

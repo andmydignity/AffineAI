@@ -152,18 +152,21 @@ class ASDAGBlock(nn.Module):
             return_state=return_state,
             reset_mask=reset_mask
         )
-        x = x + time_out
+
+        # Fused Residual Addition + RMSNorm2 (In-SRAM SFU execution)
+        from affine_ai.core.norm import fused_add_rms_norm
+        x, norm2_x = fused_add_rms_norm(time_out, x, self.norm2.scale, self.norm2.eps)
 
         # 2. Channel Mixer
         if self.asdag is not None:
             channel_out = self.asdag(
-                self.norm2(x),
+                norm2_x,
                 record_cache=record_cache,
                 use_quantized_gates=use_quantized_gates,
                 use_shift4_act=use_shift4_act
             )
         else:
-            channel_out = self.channel_mixer(self.norm2(x))
+            channel_out = self.channel_mixer(norm2_x)
         x = x + channel_out
 
         if return_state or state is not None:

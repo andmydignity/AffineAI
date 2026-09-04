@@ -20,6 +20,7 @@ def _fused_asdag_2d_grid_kernel(
     Bias_stack_ptr,     # (K, D)
     Routing_ptr,        # (B, K)
     Context_ptr,        # (K, M_max, D)
+    Peer_ptr,           # (K, M_max, B, D)
     Norm_Factors_ptr,   # (K,)
     Leaf_Outs_ptr,      # (B, K, D)
     stride_xb, stride_xd,
@@ -27,11 +28,13 @@ def _fused_asdag_2d_grid_kernel(
     stride_bk, stride_bd,
     stride_rb, stride_rk,
     stride_ck, stride_cm, stride_cd,
+    stride_pok, stride_pos, stride_pob, stride_pod,
     stride_lob, stride_lok, stride_lod,
     B_SZ,
     DIM: tl.constexpr,
     MAX_SECONDARY: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    HAS_PEER: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -59,6 +62,15 @@ def _fused_asdag_2d_grid_kernel(
     # 4. Compute primary transformation: (BLOCK_M, BLOCK_D)
     y_prim = tl.dot(x, w_k, input_precision="ieee") + b_k[None, :]
 
+    # 4b. Secondary parent context accumulation
+    if HAS_PEER:
+        h_ctx = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        for s in range(MAX_SECONDARY):
+            c_s = tl.load(Context_ptr + pid_k * stride_ck + s * stride_cm + offs_d * stride_cd, mask=mask_d, other=0.0).to(tl.float32)
+            p_s = tl.load(Peer_ptr + pid_k * stride_pok + s * stride_pos + offs_m[:, None] * stride_pob + offs_d[None, :] * stride_pod, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            h_ctx += c_s[None, :] * p_s
+        y_prim = y_prim + h_ctx
+
     # 5. Variance scaling
     norm_factor = tl.load(Norm_Factors_ptr + pid_k)
     y_v = y_prim * norm_factor
@@ -82,6 +94,8 @@ def fused_asdag_2d_triton(
     context_gates: torch.Tensor,
     norm_factors: torch.Tensor,
     activation: str = "relu6",
+    peer_outputs: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> torch.Tensor:
     """
     2D Grid-Tiled Fused ASDAG Forward Pass in Triton.
@@ -98,21 +112,32 @@ def fused_asdag_2d_triton(
 
     grid = (triton.cdiv(B, BLOCK_M), K)
 
+    has_peer = peer_outputs is not None
+    dummy_peer = x if not has_peer else peer_outputs
+
     _fused_asdag_2d_grid_kernel[grid](
-        x, w_stack, bias_stack, routing_probs, context_gates, norm_factors, leaf_outs,
+        x, w_stack, bias_stack, routing_probs, context_gates, dummy_peer, norm_factors, leaf_outs,
         x.stride(0), x.stride(1),
         w_stack.stride(0), w_stack.stride(1), w_stack.stride(2),
         bias_stack.stride(0), bias_stack.stride(1),
         routing_probs.stride(0), routing_probs.stride(1),
         context_gates.stride(0), context_gates.stride(1), context_gates.stride(2),
+        dummy_peer.stride(0) if has_peer else 0,
+        dummy_peer.stride(1) if has_peer else 0,
+        dummy_peer.stride(2) if has_peer else 0,
+        dummy_peer.stride(3) if has_peer else 0,
         leaf_outs.stride(0), leaf_outs.stride(1), leaf_outs.stride(2),
         B,
         DIM=D,
         MAX_SECONDARY=M_max,
         ACTIVATION=act_code,
+        HAS_PEER=has_peer,
         BLOCK_M=BLOCK_M,
         BLOCK_D=BLOCK_D,
     )
 
     # Reduction across leaves with routing probs
     return torch.einsum('bk, bkd -> bd', routing_probs, leaf_outs)
+
+
+fused_asdag_forward_triton = fused_asdag_2d_triton

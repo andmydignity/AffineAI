@@ -158,71 +158,90 @@ class TritonMonarchChainFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, diagonals, perms, inv_perms, bias):
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1]).contiguous().float()
-        ctx.save_for_backward(x, diagonals, perms, bias)
-        out = triton_monarch_chain_fwd(
-            x_flat,
-            diagonals.detach().float().contiguous(),
-            perms.detach().to(torch.int32).contiguous(),
-            bias.detach().float().contiguous())
+        x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
+        num_stages = diagonals.shape[0]
+        
+        h_list = [x_flat * diagonals[0]]
+        for s in range(num_stages - 1):
+            h_next = h_list[-1][:, perms[s]] * diagonals[s + 1]
+            h_list.append(h_next)
+            
+        out = h_list[-1] + bias
+        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, *h_list[:-1])
+        ctx.num_stages = num_stages
+        ctx.orig_shape = orig_shape
+        ctx.orig_dtype = x.dtype
         return out.to(x.dtype).reshape(*orig_shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, diagonals, perms, bias = ctx.saved_tensors
-        num_stages = diagonals.shape[0]
-        with torch.enable_grad():
-            xr = x.detach().requires_grad_(x.requires_grad)
-            dr = diagonals.detach().requires_grad_(diagonals.requires_grad)
-            br = bias.detach().requires_grad_(bias.requires_grad)
-            xf = xr.reshape(-1, xr.shape[-1]).float()
-            h_list = [xf * dr[0].float()]
-            for s in range(num_stages - 1):
-                h_next = h_list[-1][:, perms[s]] * dr[s + 1].float()
-                h_list.append(h_next)
-            out = h_list[-1] + br.float()
-            torch.autograd.backward(out, grad_output.reshape(-1, out.shape[-1]).float())
-        return (xr.grad if xr.requires_grad else None,
-                dr.grad if dr.requires_grad else None,
-                None, None,
-                br.grad if br.requires_grad else None)
+        saved = ctx.saved_tensors
+        x_flat = saved[0]
+        diagonals = saved[1]
+        perms = saved[2]
+        inv_perms = saved[3]
+        num_stages = ctx.num_stages
+        h_list = saved[4:]
+        
+        go_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(diagonals.dtype)
+        g_bias = go_flat.sum(0)
+        g_diagonals = torch.empty_like(diagonals)
+        gh = go_flat
+        
+        for s in range(num_stages - 1, 0, -1):
+            h_perm = h_list[s - 1][:, perms[s - 1]]
+            g_diagonals[s] = (gh * h_perm).sum(0)
+            gh = (gh * diagonals[s])[:, inv_perms[s - 1]]
+            
+        g_diagonals[0] = (gh * x_flat).sum(0)
+        gx = (gh * diagonals[0]).to(ctx.orig_dtype)
+        return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
 
 
 class TritonFusedMonarchChainFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, diagonals, perms, inv_perms, bias):
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1]).contiguous().float()
-        out = triton_fused_monarch_chain_fwd(
-            x_flat,
-            diagonals.detach().float().contiguous(),
-            perms.detach().to(torch.int32).contiguous() if perms.dtype != torch.int32 else perms.detach().contiguous(),
-            bias.detach().float().contiguous())
-        M = diagonals.shape[0]
-        ctx.save_for_backward(x, diagonals, perms, bias)
-        return tuple(out[m].to(x.dtype).reshape(*orig_shape) for m in range(M))
+        x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
+        num_branches = diagonals.shape[0]
+        num_stages = diagonals.shape[1]
+        
+        h_list = [x_flat.unsqueeze(0) * diagonals[:, 0].unsqueeze(1)]
+        for s in range(num_stages - 1):
+            h_next = h_list[-1][:, :, perms[s]] * diagonals[:, s + 1].unsqueeze(1)
+            h_list.append(h_next)
+            
+        out = h_list[-1] + bias.unsqueeze(1)
+        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, *h_list[:-1])
+        ctx.num_branches = num_branches
+        ctx.num_stages = num_stages
+        ctx.orig_shape = orig_shape
+        ctx.orig_dtype = x.dtype
+        return tuple(out[m].to(x.dtype).reshape(*orig_shape) for m in range(num_branches))
 
     @staticmethod
     def backward(ctx, *grad_outs):
-        x, diagonals, perms, bias = ctx.saved_tensors
-        M = diagonals.shape[0]
-        num_stages = diagonals.shape[1]
-        with torch.enable_grad():
-            xr = x.detach().requires_grad_(x.requires_grad)
-            dr = diagonals.detach().requires_grad_(diagonals.requires_grad)
-            br = bias.detach().requires_grad_(bias.requires_grad)
-            xf = xr.reshape(-1, xr.shape[-1]).float()
-            h_list = [xf.unsqueeze(0) * dr[:, 0].unsqueeze(1).float()]
-            for s in range(num_stages - 1):
-                h_next = h_list[-1][:, :, perms[s]] * dr[:, s + 1].unsqueeze(1).float()
-                h_list.append(h_next)
-            out = h_list[-1] + br.unsqueeze(1).float()
-            go = torch.stack([g.reshape(-1, g.shape[-1]).float() for g in grad_outs], dim=0)
-            torch.autograd.backward(out, go)
-        return (xr.grad if xr.requires_grad else None,
-                dr.grad if dr.requires_grad else None,
-                None, None,
-                br.grad if br.requires_grad else None)
+        saved = ctx.saved_tensors
+        x_flat = saved[0]
+        diagonals = saved[1]
+        perms = saved[2]
+        inv_perms = saved[3]
+        num_stages = ctx.num_stages
+        h_list = saved[4:]
+        
+        g_stack = torch.stack([g.reshape(-1, g.shape[-1]).to(diagonals.dtype) for g in grad_outs], dim=0)
+        g_bias = g_stack.sum(1)
+        g_diagonals = torch.empty_like(diagonals)
+        gh = g_stack
+        
+        for s in range(num_stages - 1, 0, -1):
+            h_perm = h_list[s - 1][:, :, perms[s - 1]]
+            g_diagonals[:, s] = (gh * h_perm).sum(1)
+            gh = (gh * diagonals[:, s].unsqueeze(1))[:, :, inv_perms[s - 1]]
+            
+        g_diagonals[:, 0] = (gh * x_flat.unsqueeze(0)).sum(1)
+        gx = (gh * diagonals[:, 0].unsqueeze(1)).sum(0).to(ctx.orig_dtype)
+        return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
 
 
 def triton_monarch_chain(x, diagonals, perms, inv_perms, bias):
@@ -265,11 +284,8 @@ def _gla_decay_kernel(
     m = j <= i
     val = tl.exp(diff)
     val = tl.where(m & mask, val, 0.0)
-    flat = ((b * H + h) * T + i) * T + j
-    tl.store(
-        Decay + flat,
-        val, mask=mask,
-    )
+    out_ptr = Decay + b * stride_db + h * stride_dh + i * stride_di + j * stride_dj
+    tl.store(out_ptr, val, mask=mask)
 
 
 def triton_gla_decay_fwd(cum_log_gam):
@@ -296,9 +312,11 @@ class TritonGLADecayFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if not ctx.needs_input_grad[0]:
+            return None
         (gamma,) = ctx.saved_tensors
         with torch.enable_grad():
-            gr = gamma.detach().requires_grad_(gamma.requires_grad)
+            gr = gamma.detach().requires_grad_(True)
             log_gam = torch.log(gr.float().clamp(min=1e-5))
             cum = torch.cumsum(log_gam, dim=-1)
             T = cum.shape[-1]
@@ -306,7 +324,7 @@ class TritonGLADecayFunction(torch.autograd.Function):
             mask = torch.tril(torch.ones(T, T, device=cum.device, dtype=torch.bool))
             out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
             torch.autograd.backward(out, grad_output.reshape(out.shape).float())
-        return gr.grad if gr.requires_grad else None
+        return gr.grad.to(gamma.dtype) if gr.grad is not None else None
 
 
 def triton_gla_decay(gamma):

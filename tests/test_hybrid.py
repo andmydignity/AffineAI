@@ -73,8 +73,10 @@ def test_hybrid_native_lpc():
         dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8
     )
     model = TorosHybridLanguageModel(config)
-    assert not hasattr(model, "forward_lpc_step")
-    assert not hasattr(model, "local_heads")
+    assert not hasattr(model, "local_heads") or getattr(model, "local_heads", None) is None
+    assert hasattr(model, "forward_lpc_step")
+    assert hasattr(model, "enable_lpc")
+    assert hasattr(model, "get_default_lpc_optimizers")
     optimizers = model.get_default_optimizers(lr=1e-3)
     assert len(optimizers) == 3
     x = torch.randint(0, 256, (2, 32))
@@ -82,6 +84,12 @@ def test_hybrid_native_lpc():
     _, loss, m = model(x, targets=y)
     loss.backward()
     assert m["loss_gen"] > 0
+    model.enable_lpc()
+    assert hasattr(model, "local_heads") and model.local_heads is not None
+    lpc_opts = model.get_default_lpc_optimizers(lr=1e-3)
+    assert len(lpc_opts) == 3
+    res = model.forward_lpc_step(x, y, lpc_opts)
+    assert "loss" in res and res["loss"] > 0
 
 
 def test_hybrid_inference_export(tmp_path):

@@ -62,6 +62,10 @@ def test_generation_faster_than_full_forward_loop():
     model = _small_model()
     prompt = torch.randint(1, 256, (1, 32))
 
+    # Warmup both paths to eliminate one-time JIT compile / lazy allocation skew
+    model.forward(prompt)
+    model.generate_with_latent_planning(prompt, max_new_bytes=1, temperature=0.0)
+
     torch.manual_seed(0)
     curr = prompt.clone()
     t0 = time.perf_counter()
@@ -104,8 +108,9 @@ def test_forward_default_config_jepa_off():
 
 def test_lpc_step_runs_and_updates():
     model = _small_model()
-    assert not hasattr(model, "forward_lpc_step")
-    assert not hasattr(model, "local_heads")
+    assert not hasattr(model, "local_heads") or getattr(model, "local_heads", None) is None
+    assert hasattr(model, "forward_lpc_step")
+    assert hasattr(model, "enable_lpc")
     assert not hasattr(model, "predictor")
     model.train()
     x = torch.randint(1, 256, (2, 24))
@@ -114,3 +119,8 @@ def test_lpc_step_runs_and_updates():
     loss.backward()
     assert m["loss_gen"] > 0
     assert model.byte_decoder.lm_head.weight.grad is not None
+    model.enable_lpc()
+    assert hasattr(model, "local_heads") and model.local_heads is not None
+    opts = model.get_default_lpc_optimizers(lr=1e-3)
+    res = model.forward_lpc_step(x, y, opts)
+    assert "loss" in res and res["loss"] > 0

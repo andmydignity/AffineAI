@@ -72,8 +72,12 @@ class RLSPredictiveHead(nn.Module):
         h_n = h_n[valid]
         tgt = tgt[valid]
         N = h_n.shape[0]
+        if N > 64:
+            idx = torch.randperm(N, device=h_n.device)[:64]
+            h_n = h_n[idx]
+            tgt = tgt[idx]
+            N = 64
         lam = self.forgetting
-        # Iterate rows (sequential dependency on P); keep on device, avoid .item() host sync
         for i in range(N):
             x = h_n[i]
             y_idx = tgt[i]

@@ -30,7 +30,7 @@ def _router_cascade_topk_kernel(
     col = tl.arange(0, MAXW)
     # Level 0: root node 0 splits into (p_left, p_right)
     z0 = tl.load(Logits + offs_m * stride_lm, mask=mask_m, other=0.0)
-    pr0 = 1.0 / (1.0 + tl.exp(-2.0 * z0))
+    pr0 = tl.sigmoid(tl.clamp(2.0 * z0, -30.0, 30.0))
     cur = tl.where(col[None, :] == 0, 1.0 - pr0[:, None], 0.0)
     cur = tl.where(col[None, :] == 1, pr0[:, None], cur)
     cur_n = 2
@@ -43,7 +43,7 @@ def _router_cascade_topk_kernel(
                 Logits + offs_m * stride_lm + node * stride_li,
                 mask=mask_m, other=0.0,
             )
-            sr = 1.0 / (1.0 + tl.exp(-2.0 * logit))
+            sr = tl.sigmoid(tl.clamp(2.0 * logit, -30.0, 30.0))
             pv = tl.sum(tl.where(col[None, :] == j, cur, 0.0), axis=1)
             nxt = tl.where(col[None, :] == 2 * j, (pv * (1.0 - sr))[:, None], nxt)
             nxt = tl.where(col[None, :] == 2 * j + 1, (pv * sr)[:, None], nxt)
@@ -81,15 +81,16 @@ def _grid(m, bm=64):
     return ((m + bm - 1) // bm,)
 
 
-def triton_router_topk_fwd(node_logits, tree_depth, top_k):
+def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):
     B, I = node_logits.shape
-    K = 1 << tree_depth
-    top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int32)
+    if num_leaves is None:
+        num_leaves = 1 << tree_depth
+    top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int64)
     top_w = torch.empty((B, top_k), device=node_logits.device, dtype=torch.float32)
     _router_cascade_topk_kernel[_grid(B, 64)](
         node_logits, top_idx, top_w,
         node_logits.stride(0), node_logits.stride(1),
-        B, I, K, tree_depth, top_k, 1 << tree_depth, BLOCK_M=64, num_warps=4)
+        B, I, num_leaves, tree_depth, top_k, 1 << tree_depth, BLOCK_M=64, num_warps=4)
     return top_idx, top_w
 
 
@@ -100,7 +101,7 @@ class TritonRouterTopkFunction(torch.autograd.Function):
         with torch.no_grad():
             W_route = ternarize(hyperplanes)
             node_logits = torch.nn.functional.linear(x_flat.float(), W_route.float(), biases.float())
-            top_idx, top_w = triton_router_topk_fwd(node_logits, tree_depth, top_k)
+            top_idx, top_w = triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves)
         ctx.save_for_backward(x_flat, hyperplanes, biases)
         ctx.tree_depth = tree_depth
         ctx.top_k = top_k
@@ -129,6 +130,7 @@ class TritonRouterTopkFunction(torch.autograd.Function):
                     pr = torch.sigmoid(logit * 2.0)
                     next_level_probs.append(p_parent * (1.0 - pr))
                     next_level_probs.append(p_parent * pr)
+                current_level_probs = next_level_probs
             leaf_probs = torch.cat(current_level_probs, dim=-1)
             routing_probs = leaf_probs[:, :ctx.num_leaves]
             routing_probs = routing_probs / routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)

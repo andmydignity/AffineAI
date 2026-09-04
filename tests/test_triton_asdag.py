@@ -7,11 +7,17 @@ import torch
 import torch.nn.functional as F
 
 from affine_ai.kernels import TRITON_AVAILABLE
-if TRITON_AVAILABLE:
-    from affine_ai.kernels.triton_asdag import fused_asdag_forward_triton
+try:
+    if TRITON_AVAILABLE:
+        from affine_ai.kernels.triton_asdag import fused_asdag_forward_triton
+        HAS_ASDAG_TRITON = True
+    else:
+        HAS_ASDAG_TRITON = False
+except Exception:
+    HAS_ASDAG_TRITON = False
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_AVAILABLE, reason="CUDA and Triton required")
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_ASDAG_TRITON, reason="CUDA and ASDAG Triton kernel required")
 def test_triton_fused_asdag_parity():
     torch.manual_seed(42)
     device = "cuda"

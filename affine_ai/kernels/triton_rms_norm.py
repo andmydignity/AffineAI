@@ -88,7 +88,7 @@ def _rms_norm_fwd_kernel(
     stride_xb, stride_xd,
     stride_sb,
     stride_ob, stride_od,
-    D: tl.constexpr, eps: tl.constexpr,
+    D: tl.constexpr, eps: tl.float32,
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
@@ -265,5 +265,126 @@ class TritonRMSNormFunc(torch.autograd.Function):
 
 def triton_rms_norm(x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return TritonRMSNormFunc.apply(x, scale, eps)
+
+
+@triton.autotune(
+    configs=_get_fwd_bwd_autotune_configs(),
+    key=['D'],
+    prune_configs_by={'early_config_prune': _prune_fwd_bwd_configs}
+)
+@triton.jit
+def _fused_add_rms_norm_fwd_kernel(
+    X_ptr, Res_ptr, Scale_ptr, Out_ptr, Res_out_ptr, Rsqrt_ptr,
+    stride_xb, stride_xd,
+    stride_rb, stride_rd,
+    stride_sb,
+    stride_ob, stride_od,
+    stride_rob, stride_rod,
+    D: tl.constexpr, eps: tl.float32,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < D
+
+    x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+    res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    res = tl.load(res_ptrs, mask=mask, other=0.0)
+
+    x_dtype = x.dtype
+    acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
+    res_acc = x.to(acc_dtype) + res.to(acc_dtype)
+    res_out = res_acc.to(x_dtype)
+    tl.store(Res_out_ptr + row_idx * stride_rob + cols * stride_rod, res_out, mask=mask)
+
+    var = tl.sum(res_acc * res_acc, axis=0) / D
+    rsqrt = tl.rsqrt(var + eps)
+    tl.store(Rsqrt_ptr + row_idx, rsqrt)
+
+    scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
+    y = (res_acc * rsqrt * scale).to(x_dtype)
+
+    out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
+    tl.store(out_ptrs, y, mask=mask)
+
+
+class TritonFusedAddRMSNormFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6):
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1]).contiguous()
+        res_flat = residual.reshape(-1, orig_shape[-1]).contiguous()
+        scale_contig = scale.view(-1).contiguous()
+        N, D = x_flat.shape
+
+        out = torch.empty_like(x_flat)
+        res_out = torch.empty_like(x_flat)
+        calc_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        rsqrt = torch.empty(N, device=x.device, dtype=calc_dtype)
+
+        _fused_add_rms_norm_fwd_kernel[(N,)](
+            x_flat, res_flat, scale_contig, out, res_out, rsqrt,
+            x_flat.stride(0), x_flat.stride(1),
+            res_flat.stride(0), res_flat.stride(1),
+            scale_contig.stride(0),
+            out.stride(0), out.stride(1),
+            res_out.stride(0), res_out.stride(1),
+            D=D, eps=eps
+        )
+
+        ctx.save_for_backward(res_out, scale_contig, rsqrt)
+        ctx.orig_shape = orig_shape
+        ctx.D = D
+        ctx.scale_shape = scale.shape
+        return out.reshape(*orig_shape), res_out.reshape(*orig_shape)
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor, dres_out: Optional[torch.Tensor] = None):
+        res_out, scale, rsqrt = ctx.saved_tensors
+        dy_flat = dy.reshape(-1, ctx.D).contiguous()
+        N = res_out.shape[0]
+        D = ctx.D
+
+        dx = torch.empty_like(res_out)
+        _rms_norm_bwd_dx_kernel[(N,)](
+            dy_flat, res_out, scale, rsqrt, dx,
+            dy_flat.stride(0), dy_flat.stride(1),
+            res_out.stride(0), res_out.stride(1),
+            scale.stride(0),
+            dx.stride(0), dx.stride(1),
+            D=D
+        )
+
+        if dres_out is not None:
+            dx = dx + dres_out.reshape(-1, ctx.D)
+
+        dx_out = dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[0] else None
+        dres_out_val = dx.clone().reshape(*ctx.orig_shape) if (ctx.needs_input_grad[0] and ctx.needs_input_grad[1]) else (dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[1] else None)
+
+        dscale = None
+        if ctx.needs_input_grad[2]:
+            calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
+            dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
+            grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+            _rms_norm_bwd_dscale_kernel[grid](
+                dy_flat, res_out, rsqrt, dscale_acc,
+                dy_flat.stride(0), dy_flat.stride(1),
+                res_out.stride(0), res_out.stride(1),
+                N=N, D=D
+            )
+            dscale = dscale_acc.to(scale.dtype).view(ctx.scale_shape)
+
+        return dx_out, dres_out_val, dscale, None
+
+
+def triton_fused_add_rms_norm(x: torch.Tensor, residual: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused In-SRAM Add + RMSNorm:
+    Computes res_out = x + residual, and y = RMSNorm(res_out, scale) in a single kernel launch.
+    Returns (y, res_out).
+    """
+    return TritonFusedAddRMSNormFunc.apply(x, residual, scale, eps)
 
 

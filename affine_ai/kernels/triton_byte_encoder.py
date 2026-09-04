@@ -38,7 +38,7 @@ class TritonByteEncoderFunction(torch.autograd.Function):
         
         # 3. Residual & RMSNorm
         x_res = x + x_conv
-        rms = torch.rsqrt(x_res.pow(2).mean(dim=-1, keepdim=True) + 1e-5)
+        rms = torch.rsqrt(x_res.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5).to(x_res.dtype)
         h = (x_res * rms * norm_scale).to(proj_w.dtype)
         
         # 4. Proj & SiLU
@@ -51,7 +51,7 @@ class TritonByteEncoderFunction(torch.autograd.Function):
         if bp_b is not None:
             b_logits = b_logits + bp_b
         
-        ctx.save_for_backward(byte_ids, embed_w, conv_w, norm_scale, proj_w, bp_w, x, x_pad, x_res, rms, h, u, sig, h_byte)
+        ctx.save_for_backward(byte_ids, embed_w, conv_w, norm_scale, proj_w, bp_w, x_pad, x_res, rms, h, u, sig, h_byte)
         ctx.has_conv_b = conv_b is not None
         ctx.has_bp_b = bp_b is not None
         ctx.K = K
@@ -59,7 +59,7 @@ class TritonByteEncoderFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g_h_byte: torch.Tensor, g_b_logits: torch.Tensor):
-        byte_ids, embed_w, conv_w, norm_scale, proj_w, bp_w, x, x_pad, x_res, rms, h, u, sig, h_byte = ctx.saved_tensors
+        byte_ids, embed_w, conv_w, norm_scale, proj_w, bp_w, x_pad, x_res, rms, h, u, sig, h_byte = ctx.saved_tensors
         B, T = byte_ids.shape
         d_byte = embed_w.shape[1]
         K = ctx.K
@@ -102,8 +102,10 @@ class TritonByteEncoderFunction(torch.autograd.Function):
         g_x = (g_res + g_x_conv).to(embed_w.dtype)
         
         # In-Place Scatter Add for Embedding table (Zero EmbeddingBackward0 overhead)
-        g_embed_w = torch.zeros_like(embed_w)
-        g_embed_w.scatter_add_(0, byte_ids.view(-1, 1).expand(-1, d_byte), g_x.reshape(-1, d_byte))
+        g_embed_w = torch.zeros(embed_w.shape, dtype=torch.float32, device=embed_w.device)
+        idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte)
+        g_embed_w.scatter_add_(0, idx, g_x.reshape(-1, d_byte).float())
+        g_embed_w = g_embed_w.to(embed_w.dtype)
         
         return None, g_embed_w, g_conv_w, g_conv_b, g_norm_s, g_proj_w, g_bp_w, g_bp_b
 

@@ -26,21 +26,50 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
             return ops.newton_schulz5(G, steps, eps)
 
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16() if G.dtype != torch.bfloat16 and torch.cuda.is_bf16_supported() else G.float()
+    orig_dtype = G.dtype
+    X = G.bfloat16() if (orig_dtype == torch.bfloat16 or torch.cuda.is_bf16_supported()) else G.float()
     X = X / (X.norm() + eps)  # Spectral norm normalization
     
-    if G.size(0) > G.size(1):
+    transposed = X.size(0) > X.size(1)
+    if transposed:
         X = X.T
         
     for _ in range(steps):
         A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+        B = torch.addmm(A, A, A, beta=b, alpha=c)
+        X = torch.addmm(X, B, X, beta=a, alpha=1.0)
         
-    if G.size(0) > G.size(1):
+    if transposed:
         X = X.T
         
-    return X.to(G.dtype)
+    return X.to(orig_dtype)
+
+
+def zeropower_via_newtonschulz5_batched(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Batched Newton-Schulz iteration for 3D tensor of shape [B, M, N].
+    Fuses multiple 2D matrices into batched GEMM (bmm/baddbmm) operations.
+    """
+    assert len(G.shape) == 3, f"Expected 3D tensor, got shape {G.shape}"
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    orig_dtype = G.dtype
+    X = G.bfloat16() if (orig_dtype == torch.bfloat16 or torch.cuda.is_bf16_supported()) else G.float()
+    norms = torch.linalg.vector_norm(X, dim=(1, 2), keepdim=True)
+    X = X / (norms + eps)
+    
+    transposed = X.size(1) > X.size(2)
+    if transposed:
+        X = X.transpose(1, 2)
+        
+    for _ in range(steps):
+        A = torch.bmm(X, X.transpose(1, 2))
+        B = torch.baddbmm(A, A, A, beta=b, alpha=c)
+        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)
+        
+    if transposed:
+        X = X.transpose(1, 2)
+        
+    return X.to(orig_dtype)
 
 
 class Muon(torch.optim.Optimizer):
@@ -74,6 +103,9 @@ class Muon(torch.optim.Optimizer):
             ns_steps = group['ns_steps']
             weight_decay = group.get('weight_decay', 0.0)
 
+            shape_to_params = {}
+            non_2d_params = []
+
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -87,19 +119,32 @@ class Muon(torch.optim.Optimizer):
                 buf = state['momentum_buffer']
                 buf.mul_(momentum).add_(g)
                 
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
+                update_grad = g.add(buf, alpha=momentum) if nesterov else buf
 
-                # Apply Newton-Schulz orthogonalization to 2D tensors
-                if len(p.shape) >= 2:
-                    orig_shape = p.shape
-                    g_2d = g.view(orig_shape[0], -1)
-                    update = zeropower_via_newtonschulz5(g_2d, steps=ns_steps).view(orig_shape)
-                    p.data.add_(update, alpha=-lr)
+                if len(p.shape) == 2 and p.shape[0] > 1 and p.shape[1] > 1:
+                    key = (p.shape, p.device, p.dtype)
+                    if key not in shape_to_params:
+                        shape_to_params[key] = []
+                    shape_to_params[key].append((p, update_grad))
                 else:
-                    p.data.add_(g, alpha=-lr)
+                    non_2d_params.append((p, update_grad))
+
+            for p, update_grad in non_2d_params:
+                p.data.add_(update_grad, alpha=-lr)
+
+            for key, items in shape_to_params.items():
+                if len(items) == 1 or not items[0][0].is_cuda:
+                    for p, g in items:
+                        orig_shape = p.shape
+                        g_2d = g.view(orig_shape[0], -1)
+                        update = zeropower_via_newtonschulz5(g_2d, steps=ns_steps).view(orig_shape)
+                        p.data.add_(update, alpha=-lr)
+                else:
+                    params_list, grads_list = zip(*items)
+                    G_batch = torch.stack(grads_list, dim=0)
+                    updates_batch = zeropower_via_newtonschulz5_batched(G_batch, steps=ns_steps)
+                    for i, p in enumerate(params_list):
+                        p.data.add_(updates_batch[i], alpha=-lr)
 
         return loss
 
@@ -127,15 +172,21 @@ class HybridMuonAdamW:
             if not p.requires_grad:
                 continue
             
-            # Diagonals, embeddings, norms, biases, and 1D scales to AdamW
-            if any(k in name for k in ("diagonals", "diagonal", "embedding", "tok_embeddings", "lm_head", "bias", "norm", "scale", "decay")) or p.ndim < 2:
-                if any(k in name for k in ("bias", "norm", "scale", "decay", "diagonals", "diagonal")):
+            is_2d_matrix = (p.ndim == 2 and p.shape[0] > 1 and p.shape[1] > 1)
+            is_special = any(k in name.lower() for k in (
+                "diagonals", "diagonal", "embed", "tok_embeddings", "lm_head",
+                "bias", "norm", "scale", "decay", "sos_patch", "boundary_predictor", "conv"
+            ))
+
+            if is_2d_matrix and not is_special:
+                # 2D BitLinear/Linear projection matrices to Muon
+                muon_params.append(p)
+            else:
+                # Embeddings, 1D vectors, norms, biases, convs, scales to AdamW
+                if any(k in name.lower() for k in ("bias", "norm", "scale", "decay", "diagonals", "diagonal")):
                     adamw_nodecay_params.append(p)
                 else:
                     adamw_decay_params.append(p)
-            else:
-                # 2D BitLinear/Linear projection matrices to Muon
-                muon_params.append(p)
 
         self.optimizers = []
 

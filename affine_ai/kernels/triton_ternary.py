@@ -8,6 +8,7 @@ Matches affine_ai CPU training numerics exactly:
 All tl.dot calls are fp32->fp32 (SIMT cores, no Tensor Cores).
 """
 
+from typing import Optional, List, Tuple
 import torch
 import triton
 import triton.language as tl
@@ -246,46 +247,50 @@ def _grid(m, n, bm=64, bn=64):
 
 
 def triton_row_amax(x: torch.Tensor) -> torch.Tensor:
-    M, K = x.shape
+    K = x.shape[-1]
+    x2d = x.reshape(-1, K)
+    M = x2d.shape[0]
     out = torch.empty((M,), device=x.device, dtype=torch.float32)
     _row_amax_kernel[_grid(M, 1, 64, 1)](
-        x, out, x.stride(0), x.stride(1), M, K, BLOCK_M=64, BLOCK_K=1024)
+        x2d, out, x2d.stride(0), x2d.stride(1), M, K, BLOCK_M=64, BLOCK_K=1024)
     return out
 
 
 def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None):
-    M, K = x.shape
+    K = x.shape[-1]
+    x2d = x.reshape(-1, K)
+    M = x2d.shape[0]
     N = w_tern.shape[0]
     if amax is None:
-        amax = triton_row_amax(x.reshape(-1, K)).reshape(-1) if x.dim() > 2 else triton_row_amax(x)
-        x2d = x.reshape(-1, K)
+        amax = triton_row_amax(x2d).reshape(-1)
     else:
-        x2d = x.reshape(-1, K)
         amax = amax.reshape(-1)
-    out = torch.empty((x2d.shape[0], N), device=x.device, dtype=torch.float32)
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
     has_bias = bias is not None
-    _ternary_fwd_kernel[_grid(x2d.shape[0], N)](
+    _ternary_fwd_kernel[_grid(M, N)](
         x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),
         x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
         out.stride(0), out.stride(1),
-        x2d.shape[0], N, K,
+        M, N, K,
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, HAS_BIAS=has_bias,
         num_warps=4, num_stages=3)
     return out.reshape(*x.shape[:-1], N)
 
 
 def triton_fp32_linear(a, b, bias=None):
-    M, K = a.shape
+    K = a.shape[-1]
+    x2d = a.reshape(-1, K)
+    M = x2d.shape[0]
     N = b.shape[0]
     out = torch.empty((M, N), device=a.device, dtype=torch.float32)
     has_bias = bias is not None
     _fp32_dot_kernel[_grid(M, N)](
-        a, b, out, bias if has_bias else a,
-        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        x2d, b, out, bias if has_bias else x2d,
+        x2d.stride(0), x2d.stride(1), b.stride(0), b.stride(1),
         out.stride(0), out.stride(1),
         M, N, K, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
         HAS_BIAS=has_bias, num_warps=4, num_stages=3)
-    return out
+    return out.reshape(*a.shape[:-1], N)
 
 
 class TritonTernaryLinearFunction(torch.autograd.Function):
@@ -300,24 +305,23 @@ class TritonTernaryLinearFunction(torch.autograd.Function):
         w_ternary = torch.round(w_f / gamma).clamp(-1.0, 1.0)
         amax = triton_row_amax(x_flat)
         out = triton_ternary_linear_fwd(x_flat, w_ternary, gamma.item(), bias.float() if bias is not None else None, amax)
-        ctx.save_for_backward(x_flat, w_ternary)
+        ctx.save_for_backward(x_flat, w_ternary, amax)
         ctx.gamma = gamma.item()
         ctx.has_bias = bias is not None
-        ctx.amax = amax
+        ctx.w_dtype = w_latent.dtype
         return out.to(x.dtype).reshape(*orig_shape[:-1], out_dim)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_flat, w_ternary = ctx.saved_tensors
-        gamma, has_bias, amax = ctx.gamma, ctx.has_bias, ctx.amax
+        x_flat, w_ternary, amax = ctx.saved_tensors
+        gamma, has_bias = ctx.gamma, ctx.has_bias
         out_dim = w_ternary.size(0)
+        in_dim = w_ternary.size(1)
         go_flat = grad_output.reshape(-1, out_dim).contiguous().float()
-        gx = triton_fp32_linear(go_flat, (w_ternary * gamma).t(), None)
-        gw = triton_ternary_linear_gw(go_flat, x_flat, amax, out_dim, w_ternary.size(1))
-        grad_b = go_flat.sum(0) if has_bias else None
-        return (gx.to(grad_output.dtype).reshape(grad_output.shape[:-1] + (w_ternary.size(1),)),
-                gw.to(w_ternary.dtype),
-                grad_b.to(grad_output.dtype) if has_bias else None)
+        gx = (triton_fp32_linear(go_flat, (w_ternary * gamma).t(), None).to(grad_output.dtype).reshape(grad_output.shape[:-1] + (in_dim,))) if ctx.needs_input_grad[0] else None
+        gw = (triton_ternary_linear_gw(go_flat, x_flat, amax, out_dim, in_dim) * gamma).to(ctx.w_dtype) if ctx.needs_input_grad[1] else None
+        grad_b = go_flat.sum(0).to(grad_output.dtype) if (has_bias and ctx.needs_input_grad[2]) else None
+        return gx, gw, grad_b
 
 
 def triton_ternary_linear(x, w_latent, bias=None):
@@ -350,26 +354,29 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
             out.stride(0), out.stride(1),
             M, O, in_dim, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
             HAS_BIAS=has_bias, num_warps=4, num_stages=3)
-        ctx.save_for_backward(x_flat, w1t, w2t)
-        ctx.g1, ctx.g2, ctx.has_bias, ctx.amax = g1, g2, has_bias, amax
+        ctx.save_for_backward(x_flat, w1t, w2t, amax)
+        ctx.g1, ctx.g2, ctx.has_bias = g1, g2, has_bias
+        ctx.w1_dtype = w1_latent.dtype
+        ctx.w2_dtype = w2_latent.dtype
         return out.to(x.dtype).reshape(*orig_shape[:-1], 2 * O)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_flat, w1t, w2t = ctx.saved_tensors
-        g1, g2, has_bias, amax = ctx.g1, ctx.g2, ctx.has_bias, ctx.amax
+        x_flat, w1t, w2t, amax = ctx.saved_tensors
+        g1, g2, has_bias = ctx.g1, ctx.g2, ctx.has_bias
         O = w1t.size(0)
+        in_dim = w1t.size(1)
         go_flat = grad_output.reshape(-1, 2 * O).contiguous().float()
         go1, go2 = go_flat.split(O, dim=-1)
         gx = (triton_fp32_linear(go1, (w1t * g1).t(), None)
-              + triton_fp32_linear(go2, (w2t * g2).t(), None))
-        gw1 = triton_ternary_linear_gw(go1.contiguous(), x_flat, amax, O, w1t.size(1))
-        gw2 = triton_ternary_linear_gw(go2.contiguous(), x_flat, amax, O, w2t.size(1))
-        gb1 = go1.sum(0) if has_bias else None
-        gb2 = go2.sum(0) if has_bias else None
-        return (gx.to(grad_output.dtype).reshape(grad_output.shape[:-1] + (w1t.size(1),)),
-                gw1.to(w1t.dtype), gb1.to(grad_output.dtype) if has_bias else None,
-                gw2.to(w2t.dtype), gb2.to(grad_output.dtype) if has_bias else None)
+              + triton_fp32_linear(go2, (w2t * g2).t(), None)).to(grad_output.dtype).reshape(grad_output.shape[:-1] + (in_dim,)) if ctx.needs_input_grad[0] else None
+        gw1 = (triton_ternary_linear_gw(go1.contiguous(), x_flat, amax, O, in_dim) * g1).to(ctx.w1_dtype) if ctx.needs_input_grad[1] else None
+        gw2 = (triton_ternary_linear_gw(go2.contiguous(), x_flat, amax, O, in_dim) * g2).to(ctx.w2_dtype) if (ctx.needs_input_grad[2] or (len(ctx.needs_input_grad) > 3 and ctx.needs_input_grad[3])) else None
+        gb1 = go1.sum(0).to(grad_output.dtype) if (has_bias and len(ctx.needs_input_grad) > 2 and ctx.needs_input_grad[2]) else None
+        gb2 = go2.sum(0).to(grad_output.dtype) if (has_bias and len(ctx.needs_input_grad) > 4 and ctx.needs_input_grad[4]) else None
+        return (gx,
+                gw1, gb1,
+                gw2, gb2)
 
 
 def triton_ternary_twin(x, w1, b1, w2, b2):
@@ -386,3 +393,68 @@ def triton_ternary_linear_gw(go, x, amax, N, K):
         M, N, K, BLOCK_M=64, BLOCK_N=32, BLOCK_K=64,
         num_warps=4, num_stages=2)
     return gw
+
+
+@triton.jit
+def _unpack_2bit_kernel(
+    Packed_ptr, Unpacked_ptr,
+    stride_packed_row, stride_unpacked_row,
+    Rows, Cols,
+    BLOCK_COLS: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    col_block_idx = tl.program_id(1)
+
+    offs_col = col_block_idx * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    mask_col = offs_col < Cols
+
+    # 16 weights per 32-bit integer
+    packed_col = offs_col // 16
+    bit_pos = (offs_col % 16) * 2
+
+    packed_val = tl.load(Packed_ptr + row_idx * stride_packed_row + packed_col, mask=mask_col, other=0)
+    code = (packed_val >> bit_pos) & 3
+    tern = tl.where(code == 1, 1.0, tl.where(code == 2, -1.0, 0.0))
+
+    tl.store(Unpacked_ptr + row_idx * stride_unpacked_row + offs_col, tern.to(Unpacked_ptr.dtype.element_ty), mask=mask_col)
+
+
+def triton_unpack_ternary_2bit(
+    packed: torch.Tensor,
+    out_shape: Tuple[int, int],
+    dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """
+    Unpacks 2-bit packed ternary weights into a 2D float tensor on GPU.
+    packed: [Rows, Cols // 16] int32 tensor.
+    Returns: [Rows, Cols] tensor of values in {-1.0, 0.0, 1.0}.
+    """
+    Rows, Cols = out_shape
+    unpacked = torch.empty(out_shape, device=packed.device, dtype=dtype)
+    BLOCK_COLS = 128
+    grid = (Rows, triton.cdiv(Cols, BLOCK_COLS))
+    _unpack_2bit_kernel[grid](
+        packed, unpacked,
+        packed.stride(0), unpacked.stride(0),
+        Rows, Cols,
+        BLOCK_COLS=BLOCK_COLS
+    )
+    return unpacked
+
+
+def triton_pack_ternary_2bit(w_ternary: torch.Tensor) -> torch.Tensor:
+    """
+    Packs a 2D ternary tensor {-1, 0, 1} into 2-bit packed int32 tensor.
+    w_ternary: [Rows, Cols] tensor with Cols % 16 == 0.
+    Returns: [Rows, Cols // 16] int32 tensor.
+    """
+    Rows, Cols = w_ternary.shape
+    assert Cols % 16 == 0, f"Cols must be divisible by 16, got {Cols}"
+    w_int8 = w_ternary.to(torch.int8)
+    # Map 0 -> 0, 1 -> 1, -1 -> 2
+    mapped = torch.where(w_int8 == 1, 1, torch.where(w_int8 == -1, 2, 0)).to(torch.int32)
+    packed = torch.zeros((Rows, Cols // 16), dtype=torch.int32, device=w_ternary.device)
+    for i in range(16):
+        packed |= (mapped[:, i::16] << (2 * i))
+    return packed
+

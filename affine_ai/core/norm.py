@@ -24,3 +24,22 @@ class RMSNorm(nn.Module):
         variance = x.to(calc_dtype).pow(2).mean(-1, keepdim=True)
         rsqrt = torch.rsqrt(variance + self.eps).to(x.dtype)
         return x * rsqrt * self.scale.to(x.dtype)
+
+
+def fused_add_rms_norm(x: torch.Tensor, residual: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6):
+    """
+    Fused In-SRAM Residual Addition + RMSNorm:
+    Computes res_out = x + residual, and y_norm = RMSNorm(res_out, scale) in a single pass.
+    Returns (res_out, y_norm).
+    """
+    if x.is_cuda and getattr(kernels, "triton_fused_add_rms_norm", None) is not None and x.dtype != torch.float64:
+        y_norm, res_out = kernels.triton_fused_add_rms_norm(x, residual, scale, eps)
+        return res_out, y_norm
+
+    res_out = x + residual
+    calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
+    variance = res_out.to(calc_dtype).pow(2).mean(-1, keepdim=True)
+    rsqrt = torch.rsqrt(variance + eps).to(res_out.dtype)
+    y_norm = res_out * rsqrt * scale.to(res_out.dtype)
+    return res_out, y_norm
+

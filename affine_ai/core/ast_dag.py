@@ -686,6 +686,44 @@ class HierarchicalSignRouter(nn.Module):
         routing_probs = routing_probs / routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         return routing_probs, node_logits
 
+    def route_tokens_popc(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fast 1-Bit POPC hardware ALU routing using native popc.b32 instructions.
+        Replaces 32 FP32 FMAs with 1 XOR + 1 POPC per 32 dimensions on the INT32 ALU datapath.
+        """
+        if not x_flat.is_cuda:
+            return self.route_tokens(x_flat)
+        try:
+            from affine_ai.kernels.triton_popc import triton_pack_sign_bits, triton_popc_sign_similarity
+            x_bits = triton_pack_sign_bits(x_flat)
+            w_bits = triton_pack_sign_bits(self.hyperplanes)
+            sim = triton_popc_sign_similarity(x_bits, w_bits, scale=1.0 / math.sqrt(self.dim))
+            node_logits = sim + self.biases.unsqueeze(0)
+        except Exception:
+            return self.route_tokens(x_flat)
+
+        logit_root = node_logits[:, 0:1]
+        p_right = torch.sigmoid(logit_root * 2.0)
+        p_left = 1.0 - p_right
+        current_level_probs = [p_left, p_right]
+
+        for depth in range(1, self.tree_depth):
+            next_level_probs = []
+            start_node = (1 << depth) - 1
+            for n_idx, p_parent in enumerate(current_level_probs):
+                curr_node = start_node + n_idx
+                logit = node_logits[:, curr_node:curr_node+1]
+                pr = torch.sigmoid(logit * 2.0)
+                pl = 1.0 - pr
+                next_level_probs.append(p_parent * pl)
+                next_level_probs.append(p_parent * pr)
+            current_level_probs = next_level_probs
+
+        leaf_probs = torch.cat(current_level_probs, dim=-1)
+        routing_probs = leaf_probs[:, :self.num_leaves]
+        routing_probs = routing_probs / routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return routing_probs, node_logits
+
 
 # ---------------------------------------------------------------------------
 # ASTDAG Layer (Ultra-Low Compute)
@@ -884,7 +922,7 @@ class ASTDAGLayer(nn.Module):
                     self.router.tree_depth, self.top_k, self.router.num_leaves)
                 routing_probs = torch.zeros(
                     B, self.router.num_leaves, device=x_flat.device,
-                    dtype=top_weights.dtype).scatter_(-1, top_indices, top_weights)
+                    dtype=top_weights.dtype).scatter_(-1, top_indices.long(), top_weights)
             except Exception:
                 _fused_route = False
         if self.use_hierarchical_routing and not _fused_route:

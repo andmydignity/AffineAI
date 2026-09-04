@@ -60,7 +60,7 @@ class TorosHybridConfig:
     num_mtp_heads: int = 2
     compile_forward: bool = False
     mtp_lambda: float = 0.3
-    dtype: Any = torch.float32
+    dtype: Any = torch.bfloat16
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
     def __init__(self, **kwargs):
@@ -262,7 +262,9 @@ class TorosHybridLanguageModel(nn.Module):
         grad_clip: float = 1.0,
         ignore_index: int = -100,
         stride: int = 1,
-    ) -> Dict[str, float]:
+        use_async_pipelining: bool = True,
+        sync_loss: bool = False,
+    ) -> Dict[str, Any]:
         self.enable_lpc()
         assert self.local_heads is not None
         B, T = byte_ids.shape
@@ -281,7 +283,7 @@ class TorosHybridLanguageModel(nn.Module):
         sub_targets = tp[:, ::stride] if stride > 1 else tp
         is_cuda = byte_ids.is_cuda
         curr_h = latent_patches
-        layer_losses: List[float] = []
+        layer_losses: List[Any] = []
         for idx, block in enumerate(self.context_encoder.blocks):
             if idx == 0:
                 next_h = block(curr_h)
@@ -301,7 +303,7 @@ class TorosHybridLanguageModel(nn.Module):
                 torch.nn.utils.clip_grad_norm_(params, grad_clip)
             opt_i.step()
             opt_i.zero_grad(set_to_none=is_cuda)
-            layer_losses.append(loss_i.item())
+            layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
             curr_h = next_h.detach() if idx == 0 else next_h
         curr_h_det = curr_h.detach().requires_grad_(True)
         final_h = self.context_encoder.norm_out(curr_h_det)
@@ -339,7 +341,21 @@ class TorosHybridLanguageModel(nn.Module):
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
         opt_final.step()
         opt_final.zero_grad(set_to_none=is_cuda)
-        return {"loss": loss_final.item(), "layer_losses": layer_losses, "mean_local_loss": sum(layer_losses)/len(layer_losses) if layer_losses else loss_final.item(), "loss_total": loss_final.item()}
+        if sync_loss:
+            return {
+                "loss": loss_final.item(),
+                "layer_losses": layer_losses,
+                "mean_local_loss": sum(layer_losses) / len(layer_losses) if layer_losses else loss_final.item(),
+                "loss_total": loss_final.item()
+            }
+        else:
+            loss_det = loss_final.detach()
+            return {
+                "loss": loss_det,
+                "layer_losses": layer_losses,
+                "mean_local_loss": torch.stack(layer_losses).mean() if layer_losses else loss_det,
+                "loss_total": loss_det
+            }
 
     def update_target_encoder(self, *args, **kwargs):
         """Deprecated stub: JEPA target encoder removed. No-op for checkpoint compat."""

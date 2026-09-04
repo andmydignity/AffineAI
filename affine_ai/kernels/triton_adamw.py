@@ -26,8 +26,8 @@ def _adamw_kernel(
     beta2: tl.float32,
     eps: tl.float32,
     weight_decay: tl.float32,
-    bias_correction1: tl.float32,
-    bias_correction2: tl.float32,
+    step_size: tl.float32,
+    bc2_sqrt: tl.float32,
     N,                  # Total number of elements
     BLOCK_SIZE: tl.constexpr
 ):
@@ -49,17 +49,13 @@ def _adamw_kernel(
     m = beta1 * m + (1.0 - beta1) * g
     v = beta2 * v + (1.0 - beta2) * (g * g)
 
-    # 4. Compute bias-corrected estimates
-    m_hat = m / bias_correction1
-    v_hat = v / bias_correction2
-
-    # 5. Compute parameter update
-    denom = tl.sqrt(v_hat) + eps
-    step = (m_hat / denom) * lr
+    # 4. Compute bias-corrected estimates and parameter update
+    denom = (tl.sqrt(v) / bc2_sqrt) + eps
+    step = step_size * (m / denom)
     p = p - step
 
-    # 6. Store updated states back to global VRAM
-    tl.store(P_ptr + offs, p, mask=mask)
+    # 5. Store updated states back to global VRAM
+    tl.store(P_ptr + offs, p.to(P_ptr.dtype.element_ty), mask=mask)
     tl.store(Exp_avg_ptr + offs, m, mask=mask)
     tl.store(Exp_avg_sq_ptr + offs, v, mask=mask)
 
@@ -110,6 +106,7 @@ class TritonAdamW(Optimizer):
             beta1, beta2 = group['betas']
             eps = group['eps']
             weight_decay = group['weight_decay']
+            correct_bias = group.get('correct_bias', True)
 
             for p in group['params']:
                 if p.grad is None:
@@ -127,40 +124,25 @@ class TritonAdamW(Optimizer):
 
                 state['step'] += 1
                 step_val = state['step']
-                bias_correction1 = 1.0 - beta1 ** step_val
-                bias_correction2 = 1.0 - beta2 ** step_val
+                bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
+                bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
+                step_size = lr / bias_correction1
+                bc2_sqrt = math.sqrt(bias_correction2)
 
                 if p.is_cuda:
                     N = p.numel()
                     BLOCK_SIZE = 1024
                     grid = (triton.cdiv(N, BLOCK_SIZE),)
-                    
-                    orig_dtype = p.dtype
-                    if orig_dtype != torch.float32:
-                        p_f32 = p.float()
-                        g_f32 = grad.float()
-                        _adamw_kernel[grid](
-                            p_f32,
-                            g_f32,
-                            state['exp_avg'],
-                            state['exp_avg_sq'],
-                            lr, beta1, beta2, eps, weight_decay,
-                            bias_correction1, bias_correction2,
-                            N,
-                            BLOCK_SIZE=BLOCK_SIZE
-                        )
-                        p.copy_(p_f32.to(orig_dtype))
-                    else:
-                        _adamw_kernel[grid](
-                            p,
-                            grad,
-                            state['exp_avg'],
-                            state['exp_avg_sq'],
-                            lr, beta1, beta2, eps, weight_decay,
-                            bias_correction1, bias_correction2,
-                            N,
-                            BLOCK_SIZE=BLOCK_SIZE
-                        )
+                    _adamw_kernel[grid](
+                        p,
+                        grad,
+                        state['exp_avg'],
+                        state['exp_avg_sq'],
+                        lr, beta1, beta2, eps, weight_decay,
+                        step_size, bc2_sqrt,
+                        N,
+                        BLOCK_SIZE=BLOCK_SIZE
+                    )
                 else:
                     # CPU Fallback
                     if weight_decay != 0.0:
@@ -169,8 +151,7 @@ class TritonAdamW(Optimizer):
                     exp_avg_sq = state['exp_avg_sq']
                     exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
-                    step_size = lr / bias_correction1
+                    denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
                     p.data.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss

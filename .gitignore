@@ -10,6 +10,7 @@ data/
 # Trained artifacts
 /models/
 checkpoints/
+checkpoints_*/
 
 # C++ extension build cache
 cpp_infer/*.o

@@ -307,43 +307,45 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         B, H, T, D = q.shape
         C_eff = min(C, T)
         NC = T // C_eff
-        q_f, k_f, v_f, g_f = q.float(), k.float(), v.float(), gamma.float()
+        dtype = q.dtype
         
-        qc = q_f.view(B, H, NC, C_eff, D)
-        kc = k_f.view(B, H, NC, C_eff, D)
-        vc = v_f.view(B, H, NC, C_eff, D)
-        gc = g_f.view(B, H, NC, C_eff)
+        qc = q.view(B, H, NC, C_eff, D)
+        kc = k.view(B, H, NC, C_eff, D)
+        vc = v.view(B, H, NC, C_eff, D)
+        gc = gamma.view(B, H, NC, C_eff)
         
-        log_gc = torch.log(gc.clamp(min=1e-5))
+        log_gc = torch.log(gc.float().clamp(min=1e-5))
         cum_log_c = torch.cumsum(log_gc, dim=-1)
         decay_intra = (cum_log_c.unsqueeze(-1) - cum_log_c.unsqueeze(-2)).clamp(max=0.0)
         mask_intra = torch.tril(torch.ones(C_eff, C_eff, device=q.device, dtype=torch.bool))
-        decay_mat_intra = torch.where(mask_intra, torch.exp(decay_intra), torch.zeros_like(decay_intra))
+        decay_mat_intra = torch.where(mask_intra, torch.exp(decay_intra), torch.zeros_like(decay_intra)).to(dtype)
         
         scores_intra = torch.matmul(qc, kc.transpose(-1, -2)) * decay_mat_intra
         num_intra = torch.matmul(scores_intra, vc)
         den_intra = scores_intra.sum(dim=-1, keepdim=True)
         
-        decay_chunk_tot = torch.exp(cum_log_c[:, :, :, -1:])
-        weight_to_end = torch.exp((cum_log_c[:, :, :, -1:] - cum_log_c).unsqueeze(-1))
+        decay_chunk_tot = torch.exp(cum_log_c[:, :, :, -1:])  # [B, H, NC, 1]
+        weight_to_end = torch.exp((cum_log_c[:, :, :, -1:] - cum_log_c).unsqueeze(-1)).to(dtype)
         
         kw = kc * weight_to_end
-        S_local = torch.matmul(kw.transpose(-1, -2), vc)
-        z_local = kw.sum(dim=-2)
+        S_local = torch.matmul(kw.transpose(-1, -2), vc)  # [B, H, NC, D, D]
+        z_local = kw.sum(dim=-2)                          # [B, H, NC, D]
         
-        S_states = [torch.zeros(B, H, D, D, device=q.device)]
-        z_states = [torch.zeros(B, H, D, device=q.device)]
-        for c in range(NC - 1):
-            gam_tot = decay_chunk_tot[:, :, c].unsqueeze(-1)
-            S_next = S_states[-1] * gam_tot + S_local[:, :, c]
-            z_next = z_states[-1] * gam_tot.squeeze(-1) + z_local[:, :, c]
-            S_states.append(S_next)
-            z_states.append(z_next)
+        # Vectorized inter-chunk associative scan without Python loop
+        if NC > 1:
+            c = cum_log_c[:, :, :, -1]  # [B, H, NC]
+            c_prev = torch.cat([torch.zeros(B, H, 1, device=c.device, dtype=c.dtype), c[:, :, :-1]], dim=-1)
+            diff = c_prev.unsqueeze(-1) - c.unsqueeze(-2)
+            strict_tril = torch.tril(torch.ones(NC, NC, device=c.device, dtype=torch.bool), diagonal=-1)
+            M_mat = torch.where(strict_tril, torch.exp(diff), torch.zeros_like(diff)).to(dtype)
+            S_all = torch.matmul(M_mat, S_local.view(B, H, NC, D * D)).view(B, H, NC, D, D)
+            z_all = torch.matmul(M_mat, z_local)
+        else:
+            M_mat = None
+            S_all = torch.zeros(B, H, 1, D, D, device=q.device, dtype=dtype)
+            z_all = torch.zeros(B, H, 1, D, device=q.device, dtype=dtype)
             
-        S_all = torch.stack(S_states, dim=2)
-        z_all = torch.stack(z_states, dim=2)
-        
-        weight_from_start = torch.exp(cum_log_c.unsqueeze(-1))
+        weight_from_start = torch.exp(cum_log_c.unsqueeze(-1)).to(dtype)
         q_cur = qc * weight_from_start
         num_inter = torch.matmul(q_cur, S_all)
         den_inter = torch.matmul(q_cur, z_all.unsqueeze(-1))
@@ -352,17 +354,19 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         den_total = (den_intra + den_inter).clamp(min=1e-5)
         y = (num_total / den_total).view(B, H, T, D)
         
-        ctx.save_for_backward(qc, kc, vc, gc, y.view(B, H, NC, C_eff, D), num_total, den_total, scores_intra, decay_mat_intra, S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start)
-        ctx.orig_dtype = q.dtype
+        ctx.save_for_backward(qc, kc, vc, gc, y.view(B, H, NC, C_eff, D), num_total, den_total, scores_intra, decay_mat_intra, S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start, M_mat)
+        ctx.orig_dtype = dtype
         ctx.C_eff = C_eff
-        return y.to(q.dtype)
+        ctx.NC = NC
+        return y
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        qc, kc, vc, gc, y, num_tot, den_tot, scores_intra, decay_mat_intra, S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start = ctx.saved_tensors
+        qc, kc, vc, gc, y, num_tot, den_tot, scores_intra, decay_mat_intra, S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start, M_mat = ctx.saved_tensors
         B, H, NC, C_eff, D = qc.shape
         T = NC * C_eff
-        go = grad_out.float().view(B, H, NC, C_eff, D)
+        go = grad_out.view(B, H, NC, C_eff, D)
+        dtype = qc.dtype
         
         d_num = go / den_tot
         d_den = -(go * y).sum(dim=-1, keepdim=True) / den_tot
@@ -371,24 +375,13 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         d_S_all = torch.matmul((qc * weight_from_start).transpose(-1, -2), d_num)
         d_z_all = (qc * weight_from_start * d_den).sum(dim=-2)
         
-        d_S_run = torch.zeros(B, H, D, D, device=go.device)
-        d_z_run = torch.zeros(B, H, D, device=go.device)
-        
-        d_S_local_list = []
-        d_z_local_list = []
-        for c in range(NC - 1, -1, -1):
-            d_S_cur = d_S_all[:, :, c] + d_S_run
-            d_z_cur = d_z_all[:, :, c] + d_z_run
-            d_S_local_list.append(d_S_cur)
-            d_z_local_list.append(d_z_cur)
+        if ctx.NC > 1 and M_mat is not None:
+            d_S_local = torch.matmul(M_mat.transpose(-1, -2), d_S_all.view(B, H, NC, D * D)).view(B, H, NC, D, D)
+            d_z_local = torch.matmul(M_mat.transpose(-1, -2), d_z_all)
+        else:
+            d_S_local = torch.zeros_like(d_S_all)
+            d_z_local = torch.zeros_like(d_z_all)
             
-            gam_tot = decay_chunk_tot[:, :, c].unsqueeze(-1)
-            d_S_run = d_S_cur * gam_tot
-            d_z_run = d_z_cur * gam_tot.squeeze(-1)
-            
-        d_S_local = torch.stack(d_S_local_list[::-1], dim=2)
-        d_z_local = torch.stack(d_z_local_list[::-1], dim=2)
-        
         d_kw = torch.matmul(vc, d_S_local.transpose(-1, -2)) + d_z_local.unsqueeze(-2)
         d_vc_inter = torch.matmul(kc * weight_to_end, d_S_local)
         d_kc_inter = d_kw * weight_to_end
@@ -400,10 +393,10 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         d_kc_intra = torch.matmul(d_decay_scores.transpose(-1, -2), qc)
         d_vc_intra = torch.matmul(scores_intra.transpose(-1, -2), d_num)
         
-        g_q = (d_q_inter + d_qc_intra).view(B, H, T, D).to(ctx.orig_dtype)
-        g_k = (d_kc_inter + d_kc_intra).view(B, H, T, D).to(ctx.orig_dtype)
-        g_v = (d_vc_inter + d_vc_intra).view(B, H, T, D).to(ctx.orig_dtype)
-        g_gamma = torch.zeros(B, H, T, device=go.device, dtype=ctx.orig_dtype)
+        g_q = (d_q_inter + d_qc_intra).view(B, H, T, D)
+        g_k = (d_kc_inter + d_kc_intra).view(B, H, T, D)
+        g_v = (d_vc_inter + d_vc_intra).view(B, H, T, D)
+        g_gamma = torch.zeros(B, H, T, device=go.device, dtype=dtype)
         
         return g_q, g_k, g_v, g_gamma, None
 
@@ -526,15 +519,15 @@ class NativeASDAGAssociativeMixer(nn.Module):
         q_raw, k_raw, v_raw, g_raw = self.qkvg_proj(x)
 
         # Positive Feature Maps (ELU + 1.0)
-        phi_q = (F.elu(self.q_norm(q_raw.view(B, T, H, D))) + 1.0).transpose(1, 2).float() # [B, H, T, D]
-        phi_k = (F.elu(self.k_norm(k_raw.view(B, T, H, D))) + 1.0).transpose(1, 2).float() # [B, H, T, D]
-        v = v_raw.view(B, T, H, D).transpose(1, 2).float()                                 # [B, H, T, D]
-        g = F.silu(g_raw)                                                                 # [B, T, C]
+        phi_q = (F.elu(self.q_norm(q_raw.view(B, T, H, D))) + 1.0).transpose(1, 2)  # [B, H, T, D]
+        phi_k = (F.elu(self.k_norm(k_raw.view(B, T, H, D))) + 1.0).transpose(1, 2)  # [B, H, T, D]
+        v = v_raw.view(B, T, H, D).transpose(1, 2)                                  # [B, H, T, D]
+        g = F.silu(g_raw)                                                          # [B, T, C]
 
         # Data-dependent decay in (0, 1)
-        gamma = torch.sigmoid(self.gate_decay(x.to(self.gate_decay.weight.dtype))).transpose(1, 2).float() # [B, H, T]
+        gamma = torch.sigmoid(self.gate_decay(x.to(self.gate_decay.weight.dtype))).transpose(1, 2)  # [B, H, T]
         if reset_mask is not None:
-            gamma = gamma * (~reset_mask.unsqueeze(1)).float()
+            gamma = gamma * (~reset_mask.unsqueeze(1)).to(gamma.dtype)
 
         # 2. Sequential O(1) Step Mode (Inference Generation with state caching)
         if state is not None:
@@ -633,7 +626,7 @@ class NativeASDAGAssociativeMixer(nn.Module):
 
         # Chunked fast path requires T to divide evenly into C_eff-sized chunks
         if x.is_cuda and not return_state and T % 64 == 0:
-            y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+            y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma).transpose(1, 2).reshape(B, T, C)
             return self.out_proj(y * g), None
 
         cum_log_gam = None

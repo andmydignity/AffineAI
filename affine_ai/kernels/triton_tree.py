@@ -28,46 +28,46 @@ def _tree_perm_fwd_kernel(
     stride_twb, stride_twk,
     stride_ym, stride_yd,
     B_ROWS, K_LEAVES, D_DIM, P_NUM, TOPK,
-    BLOCK_BTK: tl.constexpr, BLOCK_D: tl.constexpr,
+    BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    pid_btk = tl.program_id(0)
+    pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
-    offs_btk = pid_btk * BLOCK_BTK + tl.arange(0, BLOCK_BTK)
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_btk = offs_btk < B_ROWS * TOPK
+    mask_b = offs_b < B_ROWS
     mask_d = offs_d < D_DIM
+    mask = mask_b[:, None] & mask_d[None, :]
 
-    b = offs_btk // TOPK
-    tk = offs_btk % TOPK
-    mask_b = b < B_ROWS
+    acc_total = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
+    for tk in range(TOPK):
+        ki = tl.load(TI + offs_b * stride_tbt + tk * stride_tbk, mask=mask_b, other=0)
+        tw = tl.load(TW + offs_b * stride_twb + tk * stride_twk, mask=mask_b, other=0.0)
+        ki = tl.where(mask_b, ki, 0)
 
-    ki = tl.load(TI + b * stride_tbt + tk * stride_tbk, mask=mask_btk, other=0)
-    tw = tl.load(TW + b * stride_twb + tk * stride_twk, mask=mask_btk, other=0.0)
-    ki = tl.where(mask_btk, ki, 0)
+        acc = tl.load(
+            B + ki[:, None] * stride_bk + offs_d[None, :] * stride_bd,
+            mask=mask, other=0.0,
+        )
+        for p in range(P_NUM):
+            w = tl.load(
+                W + ki[:, None] * stride_wk + p * stride_wp + offs_d[None, :] * stride_wd,
+                mask=mask, other=0.0,
+            )
+            pm = tl.load(
+                P + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd,
+                mask=mask, other=0,
+            )
+            xv = tl.load(
+                R + offs_b[:, None] * stride_rm + pm * stride_rd,
+                mask=mask, other=0.0,
+            )
+            acc += w * xv
+        acc = tl.minimum(tl.maximum(acc, 0.0), 6.0)
+        acc_total += acc * tw[:, None]
 
-    acc = tl.load(
-        B + ki[:, None] * stride_bk + offs_d[None, :] * stride_bd,
-        mask=mask_btk[:, None] & mask_d[None, :], other=0.0,
-    )
-    for p in range(P_NUM):
-        w = tl.load(
-            W + ki[:, None] * stride_wk + p * stride_wp + offs_d[None, :] * stride_wd,
-            mask=mask_btk[:, None] & mask_d[None, :], other=0.0,
-        )
-        pm = tl.load(
-            P + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd,
-            mask=mask_btk[:, None] & mask_d[None, :], other=0,
-        )
-        xv = tl.load(
-            R + b[:, None] * stride_rm + pm * stride_rd,
-            mask=mask_btk[:, None] & mask_d[None, :], other=0.0,
-        )
-        acc += w * xv
-    acc = tl.minimum(tl.maximum(acc, 0.0), 6.0)
-    acc = acc * tw[:, None]
-    tl.atomic_add(
-        Y + b[:, None] * stride_ym + offs_d[None, :] * stride_yd,
-        acc, mask=mask_btk[:, None] & mask_d[None, :],
+    tl.store(
+        Y + offs_b[:, None] * stride_ym + offs_d[None, :] * stride_yd,
+        acc_total, mask=mask,
     )
 
 
@@ -78,7 +78,7 @@ def triton_tree_perm_fwd(r_in, w_perm, bias, perms, top_idx, top_w):
     assert Dp == D
     out = torch.zeros((B, D), device=r_in.device, dtype=torch.float32)
     BM, BD = 16, 32
-    grid = ((B * Tk + BM - 1) // BM, (D + BD - 1) // BD)
+    grid = ((B + BM - 1) // BM, (D + BD - 1) // BD)
     _tree_perm_fwd_kernel[grid](
         r_in, w_perm, bias, perms, top_idx, top_w, out,
         r_in.stride(0), r_in.stride(1),
@@ -89,7 +89,7 @@ def triton_tree_perm_fwd(r_in, w_perm, bias, perms, top_idx, top_w):
         top_w.stride(0), top_w.stride(1),
         out.stride(0), out.stride(1),
         B, K, D, P, Tk,
-        BLOCK_BTK=BM, BLOCK_D=BD, num_warps=4)
+        BLOCK_B=BM, BLOCK_D=BD, num_warps=4)
     return out
 
 
@@ -111,29 +111,55 @@ class TritonTreePermFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         r_in, w_perm, bias, perms, top_idx, top_w = ctx.saved_tensors
-        B = r_in.shape[0]
-        K = w_perm.shape[0]
+        orig_shape = r_in.shape
         D = r_in.shape[-1]
+        r_flat = r_in.reshape(-1, D)
+        B_flat = r_flat.shape[0]
+        K = w_perm.shape[0]
         P = w_perm.shape[1]
-        with torch.enable_grad():
-            xr = r_in.detach().requires_grad_(r_in.requires_grad)
-            wr = w_perm.detach().requires_grad_(w_perm.requires_grad)
-            br = bias.detach().requires_grad_(bias.requires_grad if isinstance(bias, torch.Tensor) else False)
-            tw = top_w.detach().requires_grad_(top_w.requires_grad)
-            leaf_prim = br.unsqueeze(0).expand(B, K, -1).clone()
-            r_exp = xr.unsqueeze(1).expand(-1, K, -1)
-            for p_idx in range(P):
-                p_k = perms[:, p_idx]
-                x_p = torch.gather(r_exp, -1, p_k.unsqueeze(0).expand(B, -1, -1))
-                leaf_prim = leaf_prim + x_p * wr[:, p_idx].unsqueeze(0)
-            act = F.relu6(leaf_prim)
-            ao = act[torch.arange(B, device=act.device).unsqueeze(1), top_idx]
-            out = (ao * tw.unsqueeze(-1)).sum(1)
-            torch.autograd.backward(out, grad_output.reshape(-1, D).to(out.dtype))
-        gr = xr.grad if xr.requires_grad else None
-        gw = wr.grad if wr.requires_grad else None
-        gb = br.grad if isinstance(br, torch.Tensor) and br.requires_grad else None
-        gt = tw.grad if tw.requires_grad else None
+        Tk = top_idx.shape[1]
+
+        go_flat = grad_output.reshape(B_flat, D).contiguous()
+
+        flat_k = top_idx.reshape(-1)
+        b_active = bias[top_idx]
+        w_active = w_perm[top_idx]
+        perms_active = perms[top_idx]
+
+        r_exp = r_flat.unsqueeze(1).unsqueeze(2).expand(B_flat, Tk, P, D)
+        x_p_active = torch.gather(r_exp, -1, perms_active.long())
+
+        prim_active = b_active + (x_p_active * w_active).sum(dim=2)
+        mask_relu = ((prim_active > 0.0) & (prim_active < 6.0)).to(go_flat.dtype)
+        act_active = F.relu6(prim_active)
+
+        gt = (act_active * go_flat.unsqueeze(1)).sum(dim=-1) if ctx.needs_input_grad[5] else None
+
+        d_prim = (go_flat.unsqueeze(1) * top_w.unsqueeze(-1)) * mask_relu
+
+        gb = None
+        if ctx.needs_input_grad[2] and isinstance(bias, torch.Tensor):
+            gb = torch.zeros(bias.shape, dtype=torch.float32, device=bias.device)
+            gb.index_add_(0, flat_k, d_prim.reshape(-1, D).float())
+            gb = gb.to(bias.dtype)
+
+        gw = None
+        if ctx.needs_input_grad[1]:
+            gw_active = d_prim.unsqueeze(2) * x_p_active
+            gw = torch.zeros(w_perm.shape, dtype=torch.float32, device=w_perm.device)
+            gw.index_add_(0, flat_k, gw_active.reshape(-1, P, D).float())
+            gw = gw.to(w_perm.dtype)
+
+        gr = None
+        if ctx.needs_input_grad[0]:
+            dx_p_active = d_prim.unsqueeze(2) * w_active
+            perms_flat_tp = perms_active.view(B_flat, -1, D)
+            dx_flat_tp = dx_p_active.view(B_flat, -1, D).float()
+            gr_flat = torch.zeros((B_flat, D), dtype=torch.float32, device=r_flat.device)
+            for p_idx in range(Tk * P):
+                gr_flat.scatter_add_(-1, perms_flat_tp[:, p_idx, :].long(), dx_flat_tp[:, p_idx, :])
+            gr = gr_flat.to(r_flat.dtype).reshape(orig_shape)
+
         return gr, gw, gb, None, None, gt
 
 

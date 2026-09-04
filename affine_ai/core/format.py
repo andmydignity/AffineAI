@@ -157,12 +157,14 @@ def save_toros_model(
     for name, tensor in state_dict.items():
         name_bytes = name.encode("utf-8")
         
-        # Detect if tensor is a 1.58-bit ternary weight (BitLinear / Ternary Channel Mixer)
+        # Detect if tensor is a 1.58-bit ternary weight (BitLinear / Ternary Channel Mixer / ASDAG leaves)
         is_ternary_candidate = (
             tensor.dim() >= 2 and
-            ("channel_mixer" in name or "gate_decay" in name or "bitlinear" in name or "tree" in name) and
+            ("channel_mixer" in name or "gate_decay" in name or "bitlinear" in name or "tree" in name or "asdag_ffn" in name or "leaves" in name) and
             ("weight" in name) and
-            ("norm" not in name)
+            ("norm" not in name) and
+            ("router" not in name) and
+            ("conv" not in name)
         )
         
         if is_ternary_candidate:
@@ -319,7 +321,13 @@ def load_toros_model(
     model_type_name = meta.get("model_type", "TorosHybridLanguageModel")
     config_kwargs = meta.get("config", {})
     
-    if model_type_name == "TorosHybridLanguageModel" or model_class is not None:
+    if model_class is not None:
+        model = model_class(config_kwargs).to(device) if config_kwargs else model_class().to(device)
+    elif model_type_name == "Qwen35ASDAGModel":
+        from affine_ai.models.qwen35_asdag import Qwen35ASDAGModel, Qwen35ASDAGConfig
+        config = Qwen35ASDAGConfig(**config_kwargs) if config_kwargs else Qwen35ASDAGConfig()
+        model = Qwen35ASDAGModel(config).to(device)
+    elif model_type_name == "TorosHybridLanguageModel":
         from affine_ai.models.hybrid import TorosHybridLanguageModel, TorosHybridConfig
         config = TorosHybridConfig(**config_kwargs) if config_kwargs else TorosHybridConfig()
         model = TorosHybridLanguageModel(config).to(device)

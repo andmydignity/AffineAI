@@ -157,3 +157,21 @@ def test_mtp_checkpoint_loading():
 
     assert out.shape == (B, T, config.dim)
     assert not torch.isnan(out).any()
+
+
+def test_toros_metadata_reading():
+    """Verify instant reading of .toros metadata header without loading entire 4B weights."""
+    toros_path = "checkpoints/qwen35_asdag.toros"
+    if not os.path.exists(toros_path):
+        pytest.skip(f"{toros_path} does not exist.")
+
+    from affine_ai.core.format import read_toros_metadata
+    meta = read_toros_metadata(toros_path)
+
+    assert meta["format"] == "TOROS"
+    assert meta["model_type"] == "Qwen35ASDAGModel"
+    assert meta["config"]["dim"] == 2560
+    assert meta["config"]["num_layers"] == 32
+    assert meta["config"]["num_leaves"] == 8
+    assert meta["statistics"]["total_params"] == 4327026688
+    assert meta["statistics"]["ternary_tensors"] == 792

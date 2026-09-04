@@ -38,6 +38,14 @@ class Qwen35ASDAGConfig:
     has_mtp: bool = True
     dtype: torch.dtype = torch.bfloat16
 
+    # Native ASDAG Defaults
+    ternary_leaves: bool = True
+    use_shift4_routing: bool = True
+    use_fp8_hybrid: bool = True
+
+
+from affine_ai.core.ast_dag import quantize_shift4, ternarize, _FP8HybridSTE
+
 
 class Qwen35RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -54,23 +62,47 @@ class Qwen35RMSNorm(nn.Module):
 
 
 class Qwen35ASDAGLeaf(nn.Module):
-    """A single ASDAG leaf containing a slice of the SwiGLU intermediate channels."""
-    def __init__(self, in_dim: int, leaf_dim: int, out_dim: int, dtype: torch.dtype = torch.bfloat16):
+    """
+    ASDAG Tree Leaf:
+    Holds ternary weights {-1, 0, +1} * gamma with BF16 master weights during training.
+    Master weights are never stored in serialized .toros artifacts.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        leaf_dim: int,
+        out_dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+        ternary: bool = True,
+        use_fp8: bool = True
+    ):
         super().__init__()
+        self.ternary = ternary
+        self.use_fp8 = use_fp8
         self.gate_proj = nn.Linear(in_dim, leaf_dim, bias=False, dtype=dtype)
         self.up_proj = nn.Linear(in_dim, leaf_dim, bias=False, dtype=dtype)
         self.down_proj = nn.Linear(leaf_dim, out_dim, bias=False, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        w_gate = ternarize(self.gate_proj.weight) if self.ternary else self.gate_proj.weight
+        w_up = ternarize(self.up_proj.weight) if self.ternary else self.up_proj.weight
+        w_down = ternarize(self.down_proj.weight) if self.ternary else self.down_proj.weight
+
+        act = F.silu(F.linear(x, w_gate)) * F.linear(x, w_up)
+        out = F.linear(act, w_down)
+
+        if self.use_fp8 and self.training:
+            out = _FP8HybridSTE.apply(out)
+        return out
 
 
 class Qwen35ASDAGFFN(nn.Module):
     """
-    ASDAG Tree FFN:
-    Partitions the 9216 intermediate channels into K leaves (e.g. 8 leaves x 1152 channels).
-    When evaluating all leaves (top_k=K), it is mathematically identical to the dense SwiGLU FFN.
-    When evaluating top_k < K, it slashes intermediate compute proportionally (e.g. 75% for top_k=2).
+    Native ASDAG Tree FFN:
+      1. 4-bit Log-Shift Routing (Log4/Shift4): quantizes token activations to powers-of-two.
+      2. Ternary Leaves: evaluates selected Top-k leaves using {-1, 0, +1} * gamma weights.
+      3. Hybrid FP8: gradient backpressure through tree leaves.
+      4. BF16 Master Weights: preserved in memory during training, stripped during .toros storage.
     """
     def __init__(self, config: Qwen35ASDAGConfig):
         super().__init__()
@@ -79,16 +111,24 @@ class Qwen35ASDAGFFN(nn.Module):
         self.leaf_dim = config.leaf_dim
         self.top_k = config.top_k
         self.dim = config.dim
+        self.use_shift4_routing = config.use_shift4_routing
 
         self.leaves = nn.ModuleList([
-            Qwen35ASDAGLeaf(config.dim, config.leaf_dim, config.dim, dtype=config.dtype)
+            Qwen35ASDAGLeaf(
+                config.dim,
+                config.leaf_dim,
+                config.dim,
+                dtype=config.dtype,
+                ternary=config.ternary_leaves,
+                use_fp8=config.use_fp8_hybrid
+            )
             for _ in range(self.num_leaves)
         ])
         self.router = nn.Linear(config.dim, self.num_leaves, bias=False, dtype=config.dtype)
 
     def forward(self, x: torch.Tensor, top_k: Optional[int] = None) -> torch.Tensor:
         """
-        Forward pass with sparse routing to Top-k leaves.
+        Forward pass with 4-bit log-shift routing to Top-k ternary leaves.
         """
         k = top_k if top_k is not None else self.top_k
         if k >= self.num_leaves:
@@ -98,24 +138,24 @@ class Qwen35ASDAGFFN(nn.Module):
         x_2d = x.reshape(-1, self.dim)
         N = x_2d.shape[0]
 
-        # Route tokens
-        router_logits = self.router(x_2d).float()  # [N, num_leaves]
+        # 4-bit Logarithmic Shift Quantization for zero-multiplier routing
+        x_route = quantize_shift4(x_2d) if self.use_shift4_routing else x_2d
+        router_logits = self.router(x_route).float()  # [N, num_leaves]
+
         routing_weights, selected_leaves = torch.topk(router_logits, k, dim=-1)  # [N, k]
         routing_weights = F.softmax(routing_weights, dim=-1).to(x.dtype)
 
-        # Evaluate selected leaves
+        # Evaluate selected ternary leaves
         out = torch.zeros_like(x_2d)
         for leaf_idx, leaf in enumerate(self.leaves):
-            # Find tokens routed to this leaf
-            mask = (selected_leaves == leaf_idx)  # [N, k]
-            token_mask = mask.any(dim=-1)         # [N]
+            mask = (selected_leaves == leaf_idx)
+            token_mask = mask.any(dim=-1)
             if not token_mask.any():
                 continue
 
             sub_x = x_2d[token_mask]
-            sub_out = leaf(sub_x)  # [N_sub, dim]
+            sub_out = leaf(sub_x)
 
-            # Weight by router probability
             weights = (routing_weights * mask.to(routing_weights.dtype)).sum(dim=-1, keepdim=True)
             out[token_mask] += sub_out * weights[token_mask]
 

@@ -13,7 +13,7 @@ from affine_ai.models.qwen35_asdag import (
 
 
 def test_asdag_ffn_mathematical_parity():
-    """Verify that forward_dense(x) across all sliced ASDAG leaves is 100% identical to full SwiGLU."""
+    """Verify that forward_dense(x) across sliced continuous leaves is 100% identical to full SwiGLU."""
     torch.manual_seed(42)
     dim = 2560
     intermediate_dim = 9216
@@ -25,9 +25,13 @@ def test_asdag_ffn_mathematical_parity():
         intermediate_dim=intermediate_dim,
         num_leaves=num_leaves,
         leaf_dim=leaf_dim,
-        dtype=torch.float32  # Test in float32 for exact bit parity
+        dtype=torch.float32,
+        ternary_leaves=False,  # Test continuous slicing identity
+        use_shift4_routing=False,
+        use_fp8_hybrid=False
     )
     asdag_ffn = Qwen35ASDAGFFN(config)
+    asdag_ffn.eval()
 
     # Reconstruct the equivalent dense weights by concatenating leaf weights
     dense_gate = torch.cat([leaf.gate_proj.weight for leaf in asdag_ffn.leaves], dim=0)  # [9216, 2560]
@@ -46,10 +50,38 @@ def test_asdag_ffn_mathematical_parity():
     max_diff = (dense_out - asdag_dense_out).abs().max().item()
     assert max_diff < 1e-5, f"ASDAG dense slicing deviates from full SwiGLU: max_diff={max_diff}"
 
-    # 3. ASDAG Top-2 sparse forward
-    sparse_out = asdag_ffn(x, top_k=2)
-    assert sparse_out.shape == x.shape
-    assert not torch.isnan(sparse_out).any()
+
+def test_asdag_native_defaults():
+    """Verify ASDAG native defaults: ternary leaves {-1, 0, 1}, 4-bit logshift routing, and FP8 hybrid."""
+    torch.manual_seed(42)
+    dim = 2560
+    intermediate_dim = 9216
+    config = Qwen35ASDAGConfig(
+        dim=dim,
+        intermediate_dim=intermediate_dim,
+        num_leaves=8,
+        leaf_dim=1152,
+        top_k=2,
+        ternary_leaves=True,
+        use_shift4_routing=True,
+        use_fp8_hybrid=True,
+        dtype=torch.bfloat16
+    )
+    asdag_ffn = Qwen35ASDAGFFN(config)
+    asdag_ffn.train()
+
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16, requires_grad=True)
+    out = asdag_ffn(x, top_k=2)
+
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
+
+    # Verify backward pass with FP8 hybrid gradient backpressure
+    loss = out.sum()
+    loss.backward()
+
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
 
 
 def test_gated_deltanet_forward():

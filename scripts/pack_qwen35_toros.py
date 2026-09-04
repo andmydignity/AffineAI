@@ -109,13 +109,16 @@ def main():
                 nonlocal uncompressed_bytes, ternary_count, fp16_count
                 name_bytes = name.encode("utf-8")
 
+                # Quantize all linear projections in both Time Mixers and Channel Mixers to ternary
                 is_ternary = (
                     tensor.dim() >= 2 and
-                    ("leaves" in name or "asdag_ffn" in name) and
                     ("weight" in name) and
-                    ("router" not in name) and
+                    ("token_embd" not in name) and
                     ("norm" not in name) and
-                    ("conv" not in name)
+                    ("conv" not in name) and
+                    ("router" not in name) and
+                    ("alpha_proj" not in name) and
+                    ("beta_proj" not in name)
                 )
 
                 if is_ternary:

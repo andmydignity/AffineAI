@@ -157,14 +157,16 @@ def save_toros_model(
     for name, tensor in state_dict.items():
         name_bytes = name.encode("utf-8")
         
-        # Detect if tensor is a 1.58-bit ternary weight (BitLinear / Ternary Channel Mixer / ASDAG leaves)
+        # Detect if tensor is a 1.58-bit ternary weight (All linear projections except embeddings and norms)
         is_ternary_candidate = (
             tensor.dim() >= 2 and
-            ("channel_mixer" in name or "gate_decay" in name or "bitlinear" in name or "tree" in name or "asdag_ffn" in name or "leaves" in name) and
             ("weight" in name) and
+            ("token_embd" not in name) and
             ("norm" not in name) and
+            ("conv" not in name) and
             ("router" not in name) and
-            ("conv" not in name)
+            ("alpha_proj" not in name) and
+            ("beta_proj" not in name)
         )
         
         if is_ternary_candidate:

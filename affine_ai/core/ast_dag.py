@@ -54,7 +54,7 @@ class ASDAGConfig:
     time_mixer_rule: str = "gla"  # "gla" (accumulative) or "delta" (error-corrective)
     use_conv_prefix: bool = True
     conv_kernel_size: int = 4
-    use_fp8: bool = True
+    use_fp8: bool = False   # simulated FP8 off by default on Ampere
     dtype: Any = torch.bfloat16
 
 class EdgeType(Enum):
@@ -282,7 +282,7 @@ class ASTDAGNode(nn.Module):
         event_delta_threshold: float = 0.05,
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
-        use_fp8: bool = True,
+        use_fp8: bool = False   # simulated FP8 off by default on Ampere,
     ):
         super().__init__()
         self.node_id = node_id
@@ -813,7 +813,7 @@ class ASTDAGLayer(nn.Module):
         top_k: Optional[int] = 2,
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
-        use_fp8: bool = True,
+        use_fp8: bool = False   # simulated FP8 off by default on Ampere,
     ):
         super().__init__()
         if isinstance(dim, ASDAGConfig):

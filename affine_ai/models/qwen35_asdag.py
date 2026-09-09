@@ -52,7 +52,7 @@ class Qwen35ASDAGConfig:
     ternary_mixers: bool = True
     ternary_embedding: bool = False  # Sacred layer: kept in BF16 for 248k vocabulary discrimination
     use_shift4_routing: bool = True
-    use_fp8_hybrid: bool = True
+    use_fp8_hybrid: bool = False
 
     # Weight Quantization & Sparsity Modes
     weight_quant_mode: str = "pot5"  # "pot5" (Default 5-state POT 2.32b), "dual_ternary" (3.17b), "ternary" (1.58b)
@@ -128,7 +128,7 @@ class Qwen35ASDAGLeaf(nn.Module):
         use_nm: bool = False,
         nm_n: int = 1,
         nm_m: int = 16,
-        use_fp8: bool = True
+        use_fp8: bool = False
     ):
         super().__init__()
         self.ternary = ternary
@@ -172,7 +172,7 @@ class Qwen35ASDAGLeaf(nn.Module):
 
 class _ASDAGLeafSliceView(nn.Module):
     """View over unified ASDAG projections matching the Qwen35ASDAGLeaf interface."""
-    def __init__(self, gate_proj, up_proj, down_proj, st, ed, ternary=True, weight_quant_mode="pot5", use_dual=False, use_fp8=True):
+    def __init__(self, gate_proj, up_proj, down_proj, st, ed, ternary=True, weight_quant_mode="pot5", use_dual=False, use_fp8=False):
         super().__init__()
         self._gate_proj = gate_proj
         self._up_proj = up_proj
@@ -254,7 +254,7 @@ class Qwen35ASDAGFFN(nn.Module):
         self.use_nm = (self.sparsity_mode == "cluster_moe") and getattr(config, "use_nm_sparsity", False) and self.ternary_leaves
         self.nm_n = getattr(config, "nm_n", 1)
         self.nm_m = getattr(config, "nm_m", 16)
-        self.use_fp8 = getattr(config, "use_fp8_hybrid", True)
+        self.use_fp8 = getattr(config, "use_fp8_hybrid", False)
 
         # Unified linear projections for high throughput & AbsTopK
         self.gate_proj = nn.Linear(config.dim, config.intermediate_dim, bias=False, dtype=config.dtype)

@@ -302,7 +302,7 @@ class ASDAGLanguageModel(nn.Module):
         leaf_mode: str = "permutation",
         num_permutations: int = 4,
         channel_mixer_type: str = "ternary_swiglu",
-        use_fp8: bool = True,
+        use_fp8: bool = False,
         dtype: Any = torch.bfloat16,
         tie_weights: bool = True,
         use_blt: bool = True,

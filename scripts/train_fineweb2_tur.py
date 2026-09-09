@@ -35,6 +35,7 @@ def parse_args():
     p.add_argument("--max-rows", type=int, default=None, help="cap stream after N docs (debug)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save", type=str, default="checkpoints/fineweb2_tur_best.pt")
+    p.add_argument("--eval-interval", type=int, default=None, help="eval every N steps (default max(200, steps//10))")
     return p.parse_args()
 
 
@@ -103,7 +104,7 @@ def main():
         seq_len=args.seq,
         lr=args.lr,
         max_steps=args.steps,
-        eval_interval=max(200, args.steps // 10),
+        eval_interval=args.eval_interval if args.eval_interval is not None else max(200, args.steps // 10),
         eval_iters=20,
         use_lpc=True,
         use_muon=True,

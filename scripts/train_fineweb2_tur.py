@@ -67,6 +67,7 @@ def main():
     print(f"Device: {device} | dim={args.dim} L={args.layers} mixer={args.mixer}")
     print(f"Batch {args.batch} x seq {args.seq} x steps {args.steps} = {args.steps * args.batch * args.seq / 1e9:.2f}B bytes")
     print(f"Dataset: epfml/FineWeb2-HQ tur_Latn (streaming, text_field='text')")
+    print(f"Context 1M, gen 20K, 1:16 sparsity, dynamic patching OFF (your spec)")
 
     # Two independent streams so train/val don't share iterator state
     train_src = make_stream(args.quality_min, args.max_rows)
@@ -79,7 +80,15 @@ def main():
         vocab_size=256, d_model=args.dim, n_layers=args.layers, n_heads=args.heads,
         channel_mixer_type=args.mixer, dtype=torch.bfloat16, use_blt=True, d_byte=min(128, args.dim),
         target_patch_size=16,
+        # your spec: 1M context, 20K gen budget, static patching, 1:16 sparsity
+        sparsity_ratio=0.9375, num_leaves=16, top_k=2, leaf_mode="permutation",
+        context_window=1_000_000, max_seq_len=1_000_000,
     ).to(device)
+    # disable dynamic "dictionary for hard tokens" machinery explicitly
+    if hasattr(model, "hybrid") and model.hybrid is not None:
+        for k in ("use_growth", "use_bmr", "use_info_gain", "use_type_codebook", "dynamic_patching"):
+            if hasattr(model.hybrid.config, k):
+                setattr(model.hybrid.config, k, False)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params/1e6:.1f}M params ({args.mixer})")
@@ -103,12 +112,12 @@ def main():
     stats = trainer.train(save_path=args.save)
     print(f"Done. best_val_loss={stats['best_val_loss']:.4f} bpc={stats['best_val_bpc']:.4f} ppl={stats['best_val_ppl']:.2f}")
 
-    # Quick Turkish sample
+    # Quick Turkish sample (generation uses your 20K max from config)
     model.eval()
     prompt = "Merhaba, bugün hava çok güzel. "
     with torch.no_grad():
         ids = torch.tensor([[ord(c) % 256 for c in prompt]], dtype=torch.long, device=device)
-        out = model.generate(ids, max_new_tokens=120)
+        out = model.generate(ids, max_new_tokens=20_000)
         txt = "".join(chr(int(b) % 256) for b in out[0].tolist())
         print(f"\nPrompt: {prompt}\nSample: {txt[:400]}")
 

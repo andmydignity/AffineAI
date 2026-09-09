@@ -80,10 +80,12 @@ def main():
         vocab_size=256, d_model=args.dim, n_layers=args.layers, n_heads=args.heads,
         channel_mixer_type=args.mixer, dtype=torch.bfloat16, use_blt=True, d_byte=min(128, args.dim),
         target_patch_size=16,
-        # your spec: 1M context, 20K gen budget, static patching, 1:16 sparsity
         sparsity_ratio=0.9375, num_leaves=16, top_k=2, leaf_mode="permutation",
-        context_window=1_000_000, max_seq_len=1_000_000,
     ).to(device)
+    # your spec: 1M context / 20K gen — set on hybrid config (ASDAGLanguageModel doesn't take it in __init__)
+    if hasattr(model, "hybrid") and model.hybrid is not None:
+        model.hybrid.config.context_window = 1_000_000
+        model.hybrid.config.max_seq_len = 1_000_000
     # disable dynamic "dictionary for hard tokens" machinery explicitly
     if hasattr(model, "hybrid") and model.hybrid is not None:
         for k in ("use_growth", "use_bmr", "use_info_gain", "use_type_codebook", "dynamic_patching"):

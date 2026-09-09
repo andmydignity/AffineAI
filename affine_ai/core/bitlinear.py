@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Any
+from typing import Optional, Any, Tuple
 
 
 class BitLinear(nn.Module):

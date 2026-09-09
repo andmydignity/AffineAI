@@ -36,6 +36,7 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save", type=str, default="checkpoints/fineweb2_tur_best.pt")
     p.add_argument("--eval-interval", type=int, default=None, help="eval every N steps (default max(200, steps//10))")
+    p.add_argument("--log-interval", type=int, default=1, help="print train loss/ppl/speed every N steps")
     return p.parse_args()
 
 
@@ -111,8 +112,39 @@ def main():
         device=device,
     )
 
-    # Suggested budget: shakedown ~1B bytes (steps ~3000 at B32/T1024), main ~6-12B
-    stats = trainer.train(save_path=args.save)
+    # per-step logging + eval, screen-safe (flush every line)
+    import sys as _sys
+    best_val = float("inf")
+    t0 = time.time()
+    log_n = max(1, args.log_interval)
+    for step in range(args.steps):
+        t_step0 = time.time()
+        train_loss = trainer.train_step(step)
+        t_step = time.time() - t_step0
+        tok_s = (args.batch * args.seq) / max(1e-6, t_step)
+        # train ppl/bpc from loss (bf16-safe)
+        try:
+            tl = float(train_loss) if not hasattr(train_loss, "item") else float(train_loss.item())
+        except Exception:
+            tl = float(train_loss)
+        ppl = math.exp(min(tl, 20.0))
+        bpc = tl / math.log(2)
+        if (step + 1) % log_n == 0 or step == 0:
+            print(f"step {step+1:6d}/{args.steps} | loss {tl:.4f} ppl {ppl:6.1f} bpc {bpc:.3f} | {tok_s:,.0f} tok/s {t_step*1000:.0f}ms/step", flush=True)
+        do_eval = (step + 1) % trainer.eval_interval == 0 or step == args.steps - 1
+        if do_eval:
+            em = trainer.evaluate()
+            vl, vppl, vbpc = em["val_loss"], em["val_ppl"], em["val_bpc"]
+            print(f"  -> eval val_loss {vl:.4f} ppl {vppl:.1f} bpc {vbpc:.3f} | elapsed {(time.time()-t0)/3600:.2f}h", flush=True)
+            if vl < best_val:
+                best_val = vl
+                import os as _os
+                _d = _os.path.dirname(args.save)
+                if _d:
+                    _os.makedirs(_d, exist_ok=True)
+                torch.save(model.state_dict(), args.save)
+                print(f"  ** saved {args.save} (best {best_val:.4f})", flush=True)
+    stats = {"best_val_loss": best_val, "best_val_bpc": best_val / math.log(2), "best_val_ppl": math.exp(min(best_val, 20.0)), "total_time_seconds": time.time() - t0}
     print(f"Done. best_val_loss={stats['best_val_loss']:.4f} bpc={stats['best_val_bpc']:.4f} ppl={stats['best_val_ppl']:.2f}")
 
     # Quick Turkish sample (generation uses your 20K max from config)

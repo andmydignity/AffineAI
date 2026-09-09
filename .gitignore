@@ -5,7 +5,7 @@ __pycache__/
 .pytest_cache/
 
 # Datasets (12 GB, on-disk only)
-data/
+/data/
 
 # Trained artifacts
 /models/

@@ -12,6 +12,7 @@ adapted for the 1.58-Bit MatMul-Free ASDAG engine:
 """
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
 import torch
@@ -26,6 +27,10 @@ from affine_ai.models.language_model import ASDAGBlock
 
 @dataclass
 class TorosJEPAConfig:
+    """
+    .. deprecated:: 0.2.0
+        `TorosJEPAConfig` is deprecated. Use `TorosHybridConfig` or `ASDAGConfig` instead.
+    """
     dim: int = 128
     d_byte: int = 64
     n_encoder_layers: int = 4
@@ -33,7 +38,10 @@ class TorosJEPAConfig:
     n_heads: int = 4
     target_patch_size: int = 16
     channel_mixer_type: str = "ternary_swiglu"
+    mlp_hidden_dim: int = 84
     time_mixer_rule: str = "gla"
+    use_conv_prefix: bool = True
+    conv_kernel_size: int = 4
     sim_loss_weight: float = 1.0
     sigreg_weight: float = 1.0
     sigreg_n_sketches: int = 4
@@ -65,7 +73,14 @@ class TorosEncoder(nn.Module):
             dtype=config.dtype
         )
         
-        asdag_cfg = ASDAGConfig(dim=config.dim, dtype=config.dtype, time_mixer_rule=getattr(config, 'time_mixer_rule', 'gla'))
+        asdag_cfg = ASDAGConfig(
+            dim=config.dim,
+            dtype=config.dtype,
+            time_mixer_rule=getattr(config, 'time_mixer_rule', 'gla'),
+            use_conv_prefix=getattr(config, 'use_conv_prefix', True),
+            conv_kernel_size=getattr(config, 'conv_kernel_size', 4),
+            mlp_hidden_dim=getattr(config, 'mlp_hidden_dim', 84)
+        )
         self.blocks = nn.ModuleList([
             ASDAGBlock(
                 config=asdag_cfg,
@@ -88,11 +103,19 @@ class TorosEncoder(nn.Module):
 
 class TorosPredictor(nn.Module):
     """
+    .. deprecated:: 0.2.0
+        TorosPredictor is deprecated as part of the JEPA deprecation.
+
     Lightweight 1.58-Bit Latent Space Predictor:
     Predicts future state s_hat_y from current state s_x.
     """
     def __init__(self, config: TorosJEPAConfig):
         super().__init__()
+        warnings.warn(
+            "TorosPredictor is deprecated as part of the JEPA deprecation.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         asdag_cfg = ASDAGConfig(dim=config.dim, dtype=config.dtype, time_mixer_rule=getattr(config, 'time_mixer_rule', 'gla'))
         self.blocks = nn.ModuleList([
@@ -117,6 +140,11 @@ class TorosPredictor(nn.Module):
 
 class TorosJEPA(nn.Module):
     """
+    .. deprecated:: 0.2.0
+        `TorosJEPA` is deprecated. Empirical benchmarks demonstrated that latent auxiliary
+        JEPA losses degrade language modeling perplexity compared to next-token prediction
+        at 1.4-2.2x step cost. Use `TorosHybridLanguageModel` or `ASDAGLanguageModel` instead.
+
     Toros Joint Embedding Predictive Architecture (Toros-JEPA):
     - Context Encoder E_theta (Active Gradients)
     - Target Encoder E_xi (EMA-Updated, Zero Reverse-Mode Tape)
@@ -124,6 +152,13 @@ class TorosJEPA(nn.Module):
     """
     def __init__(self, config: Optional[TorosJEPAConfig] = None):
         super().__init__()
+        warnings.warn(
+            "TorosJEPA is deprecated. Empirical benchmarks demonstrated that latent auxiliary "
+            "JEPA losses degrade language modeling perplexity compared to next-token prediction "
+            "at 1.4-2.2x step cost. Use TorosHybridLanguageModel or ASDAGLanguageModel instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config or TorosJEPAConfig()
 
         # 1. Context Encoder

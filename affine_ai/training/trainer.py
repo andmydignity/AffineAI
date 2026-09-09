@@ -72,9 +72,9 @@ class ASDAGTrainer:
     """
     def __init__(
         self,
-        model: ASDAGLanguageModel,
-        train_data: Union[torch.Tensor, np.ndarray],
-        val_data: Union[torch.Tensor, np.ndarray],
+        model: Any,
+        train_data: Any,
+        val_data: Optional[Any] = None,
         batch_size: Optional[int] = None,
         seq_len: int = 64,
         lr: float = 1e-3,
@@ -92,13 +92,53 @@ class ASDAGTrainer:
         use_backpressure: bool = False,
         use_lpc: bool = True,
         use_muon: bool = True,
-        muon_lr: float = 0.03
+        muon_lr: float = 0.03,
+        use_priority_replay: bool = True,
+        replay_ratio: float = 0.25,
+        replay_buffer_capacity: int = 4000,
+        replay_max_replays: int = 3,
+        use_cuda_graph: Optional[bool] = None,
+        pad_id: int = 0,
+        ignore_index: int = -100,
+        context_window: Optional[int] = None,
+        inject_eos: bool = True,
+        eos_token: Union[str, bytes, int] = "<|endoftext|>",
+        as_stream: bool = False,
+        use_mtp: Optional[bool] = None,
+        num_mtp_heads: Optional[int] = None,
+        mtp_lambda: Optional[float] = None,
+        channel_mixer: Optional[str] = None,
+        time_mixer: Optional[str] = None,
     ):
+        self.pad_id = pad_id
+        self.ignore_index = ignore_index
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_cuda_graph = ("cuda" in str(self.device)) if use_cuda_graph is None else bool(use_cuda_graph)
         self.use_backpressure = use_backpressure
         self.use_lpc = use_lpc
         self.use_muon = use_muon
         self.muon_lr = muon_lr
+        self.use_priority_replay = use_priority_replay
+        self.replay_ratio = replay_ratio
+        self.inject_eos = inject_eos
+        self.eos_token = eos_token
+        self.as_stream = as_stream
+        self.use_mtp = use_mtp
+        self.num_mtp_heads = num_mtp_heads
+        self.mtp_lambda = mtp_lambda
+        self.channel_mixer = channel_mixer
+        self.time_mixer = time_mixer
+        self._last_train_fresh_ix = []
+
+        if self.use_priority_replay:
+            from affine_ai.core.priority_replay import DynamicPriorityReplayBuffer
+            self.replay_buffer = DynamicPriorityReplayBuffer(
+                max_capacity=replay_buffer_capacity,
+                max_replays=replay_max_replays,
+                replay_ratio=replay_ratio
+            )
+        else:
+            self.replay_buffer = None
         
         # CPU Threading Optimization
         if self.device == "cpu":
@@ -110,6 +150,59 @@ class ASDAGTrainer:
                 pass
 
         self.model = model.to(self.device)
+
+        # Context window / max sequence length configuration
+        if context_window is not None:
+            self.seq_len = int(context_window)
+        else:
+            self.seq_len = int(seq_len)
+        self.context_window = self.seq_len
+        if hasattr(self.model, "context_window"):
+            self.model.context_window = self.context_window
+        if hasattr(self.model, "config") and hasattr(self.model.config, "context_window"):
+            self.model.config.context_window = self.context_window
+        if hasattr(self.model, "config") and hasattr(self.model.config, "max_seq_len"):
+            self.model.config.max_seq_len = self.context_window
+
+
+        # Configure architectural mixers if requested
+        if channel_mixer is not None:
+            if hasattr(self.model, "channel_mixer_type"):
+                self.model.channel_mixer_type = channel_mixer
+            if hasattr(self.model, "config") and hasattr(self.model.config, "channel_mixer_type"):
+                self.model.config.channel_mixer_type = channel_mixer
+
+        if time_mixer is not None:
+            if hasattr(self.model, "time_mixer_rule"):
+                self.model.time_mixer_rule = time_mixer
+            if hasattr(self.model, "config") and hasattr(self.model.config, "time_mixer_rule"):
+                self.model.config.time_mixer_rule = time_mixer
+
+        # Configure Multi-Token Prediction (MTP) if requested
+        from affine_ai.models.hybrid import TorosHybridLanguageModel
+        if isinstance(self.model, TorosHybridLanguageModel):
+            self.hybrid = self.model
+        elif getattr(self.model, "hybrid", None) is not None:
+            self.hybrid = self.model.hybrid
+        else:
+            self.hybrid = None
+
+        if self.use_mtp is not None:
+            if self.hybrid is not None:
+                if self.use_mtp:
+                    self.hybrid.enable_mtp(
+                        num_mtp_heads=self.num_mtp_heads if self.num_mtp_heads is not None else 2,
+                        mtp_lambda=self.mtp_lambda if self.mtp_lambda is not None else 0.3
+                    )
+                else:
+                    self.hybrid.disable_mtp()
+            elif hasattr(self.model, "use_mtp"):
+                self.model.use_mtp = bool(self.use_mtp)
+                if self.num_mtp_heads is not None and hasattr(self.model, "num_mtp_heads"):
+                    self.model.num_mtp_heads = self.num_mtp_heads
+                if self.mtp_lambda is not None and hasattr(self.model, "mtp_lambda"):
+                    self.model.mtp_lambda = self.mtp_lambda
+
         if self.device == "cpu":
             try:
                 from affine_ai.core.numa import node_count, interleave_model_weights
@@ -127,7 +220,6 @@ class ASDAGTrainer:
             self.batch_size = batch_size
         else:
             self.batch_size = suggest_batch_size(self.device)
-        self.seq_len = seq_len
         self.lr = lr
         self.max_steps = max_steps
         self.warmup_steps = warmup_steps
@@ -137,15 +229,67 @@ class ASDAGTrainer:
         self.use_quantized_gates = use_quantized_gates
         self.use_shift4_act = use_shift4_act
 
-        if isinstance(train_data, np.ndarray):
-            self.train_data = torch.from_numpy(train_data.astype(np.int64))
-        else:
-            self.train_data = train_data.to(torch.long)
+        from affine_ai.data.dataloader import PaddedDataLoader, HFStreamDataLoader
 
-        if isinstance(val_data, np.ndarray):
-            self.val_data = torch.from_numpy(val_data.astype(np.int64))
+        # Ingest train data
+        if isinstance(train_data, (PaddedDataLoader, HFStreamDataLoader)):
+            self.train_loader = train_data
+            self.train_data = None
+        elif isinstance(train_data, (list, tuple)) and not isinstance(train_data, (torch.Tensor, np.ndarray)):
+            self.train_loader = PaddedDataLoader(
+                train_data,
+                batch_size=self.batch_size,
+                seq_len=self.seq_len,
+                pad_id=self.pad_id,
+                ignore_index=self.ignore_index,
+                device=self.device,
+                shuffle=True,
+                pad_remainder=True,
+                inject_eos=self.inject_eos,
+                eos_token=self.eos_token,
+                as_stream=self.as_stream,
+            )
+            self.train_data = None
         else:
-            self.val_data = val_data.to(torch.long)
+            self.train_loader = None
+            if isinstance(train_data, np.ndarray):
+                self.train_data = torch.from_numpy(train_data.astype(np.int64))
+            elif isinstance(train_data, torch.Tensor):
+                self.train_data = train_data.to(torch.long)
+            else:
+                self.train_data = train_data
+
+        # Ingest val data
+        if isinstance(val_data, (PaddedDataLoader, HFStreamDataLoader)):
+            self.val_loader = val_data
+            self.val_data = None
+        elif isinstance(val_data, (list, tuple)) and not isinstance(val_data, (torch.Tensor, np.ndarray)):
+            self.val_loader = PaddedDataLoader(
+                val_data,
+                batch_size=self.batch_size,
+                seq_len=self.seq_len,
+                pad_id=self.pad_id,
+                ignore_index=self.ignore_index,
+                device=self.device,
+                shuffle=False,
+                pad_remainder=True,
+                inject_eos=self.inject_eos,
+                eos_token=self.eos_token,
+                as_stream=self.as_stream,
+            )
+            self.val_data = None
+        elif val_data is not None:
+            self.val_loader = None
+            if isinstance(val_data, np.ndarray):
+                self.val_data = torch.from_numpy(val_data.astype(np.int64))
+            elif isinstance(val_data, torch.Tensor):
+                self.val_data = val_data.to(torch.long)
+            else:
+                self.val_data = val_data
+        else:
+            self.val_loader = None
+            self.val_data = None
+
 
         # Allocate pinned staging buffers on CPU for zero-copy DMA to CUDA
         if "cuda" in str(self.device):
@@ -161,8 +305,16 @@ class ASDAGTrainer:
 
         # Fused / standard AdamW
         fused = (self.device == "cuda" and hasattr(optim.AdamW, "_fused"))
-        if getattr(self.model, "hybrid", None) is not None:
-            hybrid = self.model.hybrid
+        from affine_ai.models.hybrid import TorosHybridLanguageModel
+        if isinstance(self.model, TorosHybridLanguageModel):
+            self.hybrid = self.model
+        elif getattr(self.model, "hybrid", None) is not None:
+            self.hybrid = self.model.hybrid
+        else:
+            self.hybrid = None
+
+        if self.hybrid is not None:
+            hybrid = self.hybrid
             can_lpc = self.use_lpc and hasattr(hybrid, 'enable_lpc') and hasattr(hybrid, 'get_default_lpc_optimizers')
             has_legacy_local = self.use_lpc and getattr(hybrid, 'local_heads', None) is not None
             if can_lpc:
@@ -179,8 +331,8 @@ class ASDAGTrainer:
                     if hasattr(hybrid.get_default_lpc_optimizers, '__code__'):
                         import inspect
                         sig = inspect.signature(hybrid.get_default_lpc_optimizers)
-                        if 'muon_lr' in sig.parameters:
-                            lpc_kwargs['muon_lr'] = self.muon_lr
+                    if 'capturable' in sig.parameters:
+                        lpc_kwargs['capturable'] = self.use_cuda_graph
                     try:
                         self.hybrid_optimizers = hybrid.get_default_lpc_optimizers(
                             lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, **lpc_kwargs
@@ -196,11 +348,12 @@ class ASDAGTrainer:
                     self.hybrid_optimizers = None
                     self.lpc_model = None
                     self.lpc_optimizers = None
+                    adamw_kwargs = {"lr": lr, "weight_decay": weight_decay, "fused": fused}
+                    if self.use_cuda_graph:
+                        adamw_kwargs["capturable"] = True
                     self.optimizer = optim.AdamW(
                         self.model.parameters(),
-                        lr=lr,
-                        weight_decay=weight_decay,
-                        fused=fused
+                        **adamw_kwargs
                     )
             elif has_legacy_local:
                 self.hybrid_optimizers = hybrid.get_default_optimizers(
@@ -241,11 +394,51 @@ class ASDAGTrainer:
         self.loss_fn = nn.CrossEntropyLoss()
 
     def get_batch(self, split: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
+        loader = self.train_loader if split == "train" else self.val_loader
+        if loader is not None:
+            if split == "train" and getattr(self, "use_priority_replay", False) and getattr(self, "replay_buffer", None) is not None and getattr(loader, "stream_len", None) is not None and hasattr(loader, "get_batch_by_indices"):
+                max_units = (loader.stream_len - 1) // loader.seq_len if loader.is_stream else len(loader.data)
+                if max_units > 0:
+                    n_replay = min(int(self.batch_size * self.replay_ratio), len(self.replay_buffer))
+                    n_fresh = self.batch_size - n_replay
+                    fresh_ix = torch.randint(0, max_units, (n_fresh,)).tolist()
+                    replayed_ix = self.replay_buffer.sample(n_replay) if n_replay > 0 else []
+                    self._last_train_fresh_ix = fresh_ix
+                    all_ix = fresh_ix + replayed_ix
+                    return loader.get_batch_by_indices(all_ix)
+
+            iter_attr = f"_{split}_iter"
+            it = getattr(self, iter_attr, None)
+            if it is None:
+                it = iter(loader)
+                setattr(self, iter_attr, it)
+            try:
+                x, y = next(it)
+            except StopIteration:
+                it = iter(loader)
+                setattr(self, iter_attr, it)
+                x, y = next(it)
+            return x, y
+
+
         data = self.train_data if split == "train" else self.val_data
+        if data is None:
+            raise ValueError(f"No {split} data available in trainer.")
         high = len(data) - self.seq_len - 1
         if high <= 0:
             raise ValueError(f"Dataset too small ({len(data)}) for seq_len {self.seq_len}")
-        ix = torch.randint(0, high, (self.batch_size,))
+        if split == "train" and getattr(self, "use_priority_replay", False) and getattr(self, "replay_buffer", None) is not None:
+            n_replay = min(int(self.batch_size * self.replay_ratio), len(self.replay_buffer))
+            n_fresh = self.batch_size - n_replay
+            fresh_ix = torch.randint(0, high, (n_fresh,)).tolist()
+            replayed_ix = self.replay_buffer.sample(n_replay) if n_replay > 0 else []
+            self._last_train_fresh_ix = fresh_ix
+            all_ix = fresh_ix + replayed_ix
+            ix = torch.tensor(all_ix, dtype=torch.long)
+        else:
+            ix = torch.randint(0, high, (self.batch_size,))
+            if split == "train":
+                self._last_train_fresh_ix = ix.tolist()
         offsets = torch.arange(self.seq_len, device=ix.device)
         idx = ix.unsqueeze(1) + offsets.unsqueeze(0)
         idx_next = idx + 1
@@ -274,12 +467,14 @@ class ASDAGTrainer:
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
+        if getattr(self, "val_loader", None) is None and getattr(self, "val_data", None) is None:
+            return {"val_loss": 0.0, "val_bpc": 0.0, "val_ppl": 1.0}
         self.model.eval()
         losses = []
         for _ in range(self.eval_iters):
             x, y = self.get_batch("val")
-            if getattr(self.model, "hybrid", None) is not None:
-                _, loss, _ = self.model.hybrid(x, targets=y, return_logits=False)
+            if getattr(self, "hybrid", None) is not None:
+                _, loss, _ = self.hybrid(x, targets=y, return_logits=False)
                 losses.append(loss.item())
             else:
                 logits = self.model(
@@ -335,10 +530,10 @@ class ASDAGTrainer:
 
     def train_step(self, step: int, sync_loss: bool = False) -> Any:
         """Executes a single optimized training step (Autograd, Backpressure, LPC, or Hybrid)."""
-        if getattr(self.model, "hybrid", None) is not None:
+        if getattr(self, "hybrid", None) is not None:
             lr = self.get_lr(step)
             lr_ratio = lr / max(1e-8, self.lr)
-            if self.use_lpc and self.hybrid_optimizers is not None and hasattr(self.model.hybrid, 'forward_lpc_step'):
+            if self.use_lpc and self.hybrid_optimizers is not None and hasattr(self.hybrid, 'forward_lpc_step'):
                 for opt in self.hybrid_optimizers:
                     if hasattr(opt, "muon_opt") and opt.muon_opt:
                         for pg in opt.muon_opt.param_groups:
@@ -350,20 +545,32 @@ class ASDAGTrainer:
                         for pg in opt.param_groups:
                             pg["lr"] = lr
                 x, y = self.get_batch("train")
-                res = self.model.hybrid.forward_lpc_step(
-                    x, y, self.hybrid_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss
+                res = self.hybrid.forward_lpc_step(
+                    x, y, self.hybrid_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss,
+                    return_sample_loss=self.use_priority_replay,
+                    use_cuda_graph=self.use_cuda_graph,
                 )
+                if self.use_priority_replay and self.replay_buffer is not None and "sample_loss" in res and res["sample_loss"] is not None:
+                    n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
+                    if n_fresh > 0:
+                        self.replay_buffer.push_candidates(self._last_train_fresh_ix, res["sample_loss"][:n_fresh])
                 return res["loss"]
             else:
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = lr
                 x, y = self.get_batch("train")
                 self.optimizer.zero_grad()
-                _, loss, _ = self.model.hybrid(x, targets=y, return_logits=False)
+                logits, loss, _ = self.hybrid(x, targets=y, return_logits=True)
                 loss.backward()
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
+                if self.use_priority_replay and self.replay_buffer is not None:
+                    n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
+                    if n_fresh > 0:
+                        with torch.no_grad():
+                            s_loss = F.cross_entropy(logits.view(-1, 256), y.view(-1), reduction='none').view(x.shape[0], -1).mean(dim=-1)
+                            self.replay_buffer.push_candidates(self._last_train_fresh_ix, s_loss[:n_fresh])
                 return loss.item() if sync_loss else loss.detach()
 
         if self.use_backpressure:
@@ -405,6 +612,12 @@ class ASDAGTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
         self.optimizer.step()
+        if self.use_priority_replay and self.replay_buffer is not None:
+            n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
+            if n_fresh > 0:
+                with torch.no_grad():
+                    s_loss = F.cross_entropy(logits.view(-1, self.model.vocab_size), y.view(-1), reduction='none').view(x.shape[0], -1).mean(dim=-1)
+                    self.replay_buffer.push_candidates(self._last_train_fresh_ix, s_loss[:n_fresh])
         return loss.item() if sync_loss else loss.detach()
 
     def train(self, save_path: Optional[str] = None) -> Dict[str, Any]:
@@ -438,3 +651,128 @@ class ASDAGTrainer:
             "best_val_ppl": math.exp(min(best_val_loss, 20.0)),
             "total_time_seconds": total_time
         }
+
+
+def train(
+    model: Any,
+    train_data: Any,
+    val_data: Optional[Any] = None,
+    batch_size: Optional[int] = None,
+    seq_len: int = 512,
+    context_window: Optional[int] = None,
+    lr: float = 1e-3,
+    weight_decay: float = 0.01,
+    max_steps: int = 1000,
+    warmup_steps: int = 100,
+    eval_interval: int = 100,
+    eval_iters: int = 20,
+    grad_clip: float = 1.0,
+    device: Optional[Union[str, torch.device]] = None,
+    save_path: Optional[str] = None,
+    use_cuda_graph: Optional[bool] = None,
+    use_muon: bool = True,
+    muon_lr: float = 0.02,
+    pad_id: int = 0,
+    ignore_index: int = -100,
+    # Context window & Token injection options
+    inject_eos: bool = True,
+    eos_token: Union[str, bytes, int] = "<|endoftext|>",
+    as_stream: bool = False,
+    # Multi-Token Prediction (MTP) options
+    use_mtp: Optional[bool] = None,
+    num_mtp_heads: Optional[int] = None,
+    mtp_lambda: Optional[float] = None,
+    # Architectural Mixer options
+    channel_mixer: Optional[str] = None,
+    time_mixer: Optional[str] = None,
+    # Priority Replay (AXIOM Info-Gain Selection) options
+    use_priority_replay: bool = True,
+    replay_ratio: float = 0.25,
+    replay_buffer_capacity: int = 4000,
+    replay_max_replays: int = 3,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    High-level, zero-friction training entry point for AffineAI models.
+
+    Automatically handles:
+    - Data ingestion via PaddedDataLoader (guaranteeing invariant static shapes).
+    - Hardware INT8 IMMA Tensor Cores and zero-overhead CUDA Graphs on GPU.
+    - Automatic <|endoftext|> injection into documents and sequences.
+    - Multi-Token Prediction (MTP) heads & loss management.
+    - Channel mixer (ternary_swiglu, asdag_tree, classic_mlp, dense_swiglu) & Time mixer (gla) configuration.
+    - Dynamic Priority Replay (AXIOM info-gain selection) on high-uncertainty sequences.
+    - Muon (for 2D projection weights) + AdamW (for norms, embeddings, 1D vectors).
+    - Periodic evaluation and checkpoint saving.
+
+    Parameters:
+        model: TorosHybridLanguageModel, ASDAGLanguageModel, or any AffineAI model.
+        train_data: List of strings/bytes, 1D numpy array, 1D torch Tensor, memmap, or PaddedDataLoader.
+        val_data: Optional validation data (same formats as train_data).
+        batch_size: Training batch size (auto-tuned if None).
+        seq_len: Target sequence length in bytes or tokens (default: 512).
+        context_window: Context window / sequence length alias (overrides seq_len if provided).
+        lr: Learning rate for AdamW (default: 1e-3).
+        weight_decay: Weight decay (default: 0.01).
+        max_steps: Total training steps (default: 1000).
+        warmup_steps: Linear LR warmup steps (default: 100).
+        eval_interval: Evaluation interval in steps (default: 100).
+        eval_iters: Number of batches to evaluate on (default: 20).
+        grad_clip: Maximum gradient norm (default: 1.0).
+        device: 'cuda', 'cpu', or torch.device (defaults to auto-detect).
+        save_path: Optional file path to save the best model weights.
+        use_cuda_graph: True to enable CUDA Graph replay (default: True on CUDA).
+        use_muon: True to enable Muon Newton-Schulz optimization (default: True).
+        muon_lr: Learning rate for Muon (default: 0.02).
+        pad_id: Padding token/byte ID (default: 0).
+        ignore_index: Target label for padded positions (default: -100).
+        inject_eos: Whether to automatically inject <|endoftext|> to each sample/document (default: True).
+        eos_token: End-of-text marker/token string, bytes, or int ID (default: "<|endoftext|>").
+        as_stream: Whether to concatenate sequence inputs into a continuous 1D stream joined by EOS (default: False).
+        use_mtp: Whether to enable Multi-Token Prediction (MTP) auxiliary heads (default: None).
+        num_mtp_heads: Number of future prediction heads (default: 1 for ASDAG, 2 for TorosHybrid).
+        mtp_lambda: Loss weighting coefficient for MTP auxiliary predictions (default: 0.3).
+        channel_mixer: Channel mixer type ('ternary_swiglu', 'asdag_tree', 'classic_mlp', 'dense_swiglu').
+        time_mixer: Time mixer rule ('gla').
+        use_priority_replay: Whether to enable AXIOM Dynamic Priority Replay (default: True).
+        replay_ratio: Fraction of batch capacity reserved for high-uncertainty replayed sequences (default: 0.25).
+        replay_buffer_capacity: Maximum number of active sequence offsets in the replay buffer (default: 4000).
+        replay_max_replays: Maximum replays per sequence before retirement (default: 3).
+    """
+    trainer = ASDAGTrainer(
+        model=model,
+        train_data=train_data,
+        val_data=val_data,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        context_window=context_window,
+        lr=lr,
+        weight_decay=weight_decay,
+        max_steps=max_steps,
+        warmup_steps=warmup_steps,
+        eval_interval=eval_interval,
+        eval_iters=eval_iters,
+        grad_clip=grad_clip,
+        device=str(device) if device is not None else None,
+        use_cuda_graph=use_cuda_graph,
+        use_muon=use_muon,
+        muon_lr=muon_lr,
+        pad_id=pad_id,
+        ignore_index=ignore_index,
+        inject_eos=inject_eos,
+        eos_token=eos_token,
+        as_stream=as_stream,
+        use_mtp=use_mtp,
+        num_mtp_heads=num_mtp_heads,
+        mtp_lambda=mtp_lambda,
+        channel_mixer=channel_mixer,
+        time_mixer=time_mixer,
+        use_priority_replay=use_priority_replay,
+        replay_ratio=replay_ratio,
+        replay_buffer_capacity=replay_buffer_capacity,
+        replay_max_replays=replay_max_replays,
+        **kwargs,
+    )
+    return trainer.train(save_path=save_path)
+
+

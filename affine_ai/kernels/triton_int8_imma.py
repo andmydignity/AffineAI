@@ -14,6 +14,13 @@ from typing import Optional, Tuple
 
 @triton.autotune(
     configs=[
+        # Consumer GPU & single-token inference small tiles
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=2, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        # Mid-size & datacenter tiles (shared memory <= 48 KB)
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
@@ -29,6 +36,7 @@ def _int8_imma_gemm_kernel(
     stride_wn, stride_wk,
     stride_om, stride_on,
     stride_sx, stride_sw,
+    stride_b,
     M, N, K,
     HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
@@ -58,7 +66,7 @@ def _int8_imma_gemm_kernel(
 
     out = acc.to(tl.float32) * sx[:, None] * sw[None, :]
     if HAS_BIAS:
-        b_val = tl.load(Bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        b_val = tl.load(Bias_ptr + offs_n * stride_b, mask=mask_n, other=0.0).to(tl.float32)
         out += b_val[None, :]
 
     tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
@@ -80,16 +88,21 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
 
         # Dynamic activation INT8 quantization
         sx = (x_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1).contiguous()
-        x_int8 = (x_flat / sx.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        x_int8 = (x_flat / sx.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
 
         # Weight INT8 quantization
         w_f = weight.contiguous()
         sw = (w_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1).contiguous()
-        w_int8 = (w_f / sw.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        w_int8 = (w_f / sw.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
 
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
         has_bias = bias is not None
-        bias_tensor = bias.contiguous() if has_bias else x_flat
+        if has_bias:
+            bias_tensor = bias.contiguous().reshape(-1)
+            stride_b = bias_tensor.stride(0)
+        else:
+            bias_tensor = x_flat
+            stride_b = 0
 
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
@@ -100,6 +113,7 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             w_int8.stride(0), w_int8.stride(1),
             out.stride(0), out.stride(1),
             sx.stride(0), sw.stride(0),
+            stride_b,
             M, N, K,
             HAS_BIAS=has_bias,
         )

@@ -10,6 +10,27 @@ from affine_ai.core.associative import NativeASDAGAssociativeMixer
 from affine_ai.core.bitlinear import TernaryBitLinearSwiGLU
 
 
+class ClassicMLP(nn.Module):
+    """
+    Classic 2-layer dense MLP (fc1 -> GELU -> fc2) with exact parameter parity.
+    Tracks hidden activations for mechanistic interpretability and monosemanticity profiling.
+    """
+    def __init__(self, dim: int, hidden_dim: int = 84, bias: bool = False, dtype: Any = None):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=bias, dtype=dtype)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=bias, dtype=dtype)
+        self.last_hidden_act = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.fc1(x))
+        if not self.training:
+            self.last_hidden_act = h.detach()
+        return self.fc2(h)
+
+
 class ASDAGBlock(nn.Module):
     """
     Native Dual-Mixer ASDAG Block (100% MatMul-Free):
@@ -38,6 +59,24 @@ class ASDAGBlock(nn.Module):
         )
         self.norm2 = RMSNorm(config.dim)
 
+        self.use_conv_prefix = getattr(config, 'use_conv_prefix', True)
+        self.conv_kernel_size = getattr(config, 'conv_kernel_size', 4)
+        if self.use_conv_prefix:
+            self.conv_prefix = nn.Conv1d(
+                in_channels=config.dim,
+                out_channels=config.dim,
+                kernel_size=self.conv_kernel_size,
+                padding=0,
+                groups=config.dim,
+                bias=False,
+                dtype=config.dtype if config.dtype is not None and config.dtype != torch.bfloat16 else None
+            )
+            nn.init.normal_(self.conv_prefix.weight, mean=0.0, std=0.02)
+            self.conv_act = nn.SiLU()
+        else:
+            self.conv_prefix = None
+            self.conv_act = None
+
         if self.channel_mixer_type == "ternary_swiglu":
             self.channel_mixer = TernaryBitLinearSwiGLU(config.dim, expand=2, dtype=config.dtype)
             self.asdag = None
@@ -47,6 +86,10 @@ class ASDAGBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(2 * config.dim, config.dim, bias=False, dtype=config.dtype)
             )
+            self.asdag = None
+        elif self.channel_mixer_type == "classic_mlp":
+            hidden_dim = getattr(config, 'mlp_hidden_dim', 84)
+            self.channel_mixer = ClassicMLP(config.dim, hidden_dim=hidden_dim, bias=False, dtype=config.dtype)
             self.asdag = None
         else: # "asdag_tree"
             self.asdag = AdaptiveSparseTreeDAGLayer(config)
@@ -63,6 +106,7 @@ class ASDAGBlock(nn.Module):
         reset_mask: Optional[torch.Tensor] = None
     ) -> Any:
         if (not x.is_cuda and not return_state and state is None
+            and not getattr(self, 'use_conv_prefix', False)
             and self.channel_mixer_type == "ternary_swiglu"
             and getattr(self.time_mixer, 'proj_type', '') == "monarch"
             and getattr(self.time_mixer, 'rule', 'gla') == "gla"):
@@ -92,6 +136,7 @@ class ASDAGBlock(nn.Module):
 
         first_leaf = self.asdag.leaves[0] if self.asdag is not None and self.asdag.leaves else None
         if (not x.is_cuda and not return_state and state is None
+            and not getattr(self, 'use_conv_prefix', False)
             and self.channel_mixer_type == "asdag_tree"
             and x.shape[-1] >= 64
             and getattr(self.time_mixer, 'proj_type', '') == "monarch"
@@ -145,13 +190,56 @@ class ASDAGBlock(nn.Module):
                 reset_mask
             )
 
-        # 1. Time Mixer (Monarch GLA State Space)
-        time_out, next_state = self.time_mixer(
-            self.norm1(x),
-            state=state,
-            return_state=return_state,
-            reset_mask=reset_mask
-        )
+        # 1. Time Mixer (Monarch GLA State Space with optional Causal Conv Prefix)
+        norm1_x = self.norm1(x)
+
+        if getattr(self, 'use_conv_prefix', False) and self.conv_prefix is not None:
+            K = self.conv_kernel_size
+            tm_state = None
+            conv_state = None
+            if state is not None:
+                if isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], torch.Tensor) and state[1].dim() == 3:
+                    tm_state, conv_state = state
+                elif isinstance(state, dict):
+                    tm_state = state.get("tm_state")
+                    conv_state = state.get("conv_state")
+                else:
+                    tm_state = state
+                    conv_state = None
+
+            if conv_state is not None:
+                h_cat = torch.cat([conv_state, norm1_x], dim=1)
+            else:
+                h_cat = F.pad(norm1_x, (0, 0, K - 1, 0))
+
+            if reset_mask is not None and K > 1:
+                # Zero out receptive field across document boundaries so no past data bleeds into next data
+                # 100% vectorized without CPU-GPU sync (safe for CUDA Graphs)
+                clear_mask = torch.zeros(h_cat.shape[0], h_cat.shape[1], dtype=torch.bool, device=h_cat.device)
+                T_curr = norm1_x.shape[1]
+                for k in range(K - 1):
+                    clear_mask[:, k : k + T_curr] = clear_mask[:, k : k + T_curr] | reset_mask
+                h_cat = h_cat.masked_fill(clear_mask.unsqueeze(-1), 0.0)
+
+            next_conv_state = h_cat[:, -(K - 1):].detach() if K > 1 else None
+            x_conv = self.conv_prefix(h_cat.transpose(1, 2).to(self.conv_prefix.weight.dtype)).transpose(1, 2)
+            h_time_in = self.conv_act(x_conv).to(norm1_x.dtype)
+
+
+            time_out, next_tm_state = self.time_mixer(
+                h_time_in,
+                state=tm_state,
+                return_state=return_state,
+                reset_mask=reset_mask
+            )
+            next_state = (next_tm_state, next_conv_state) if (return_state or state is not None) else None
+        else:
+            time_out, next_state = self.time_mixer(
+                norm1_x,
+                state=state,
+                return_state=return_state,
+                reset_mask=reset_mask
+            )
 
         # Fused Residual Addition + RMSNorm2 (In-SRAM SFU execution)
         from affine_ai.core.norm import fused_add_rms_norm
@@ -341,10 +429,11 @@ class ASDAGLanguageModel(nn.Module):
         use_quantized_gates: bool = True,
         use_shift4_act: bool = True,
         record_cache: Optional[bool] = None,
-        return_states: bool = False
+        return_states: bool = False,
+        reset_mask: Optional[torch.Tensor] = None,
     ) -> Any:
         if getattr(self, 'hybrid', None) is not None:
-            logits, _, _ = self.hybrid(input_ids)
+            logits, _, _ = self.hybrid(input_ids, reset_mask=reset_mask)
             if return_states:
                 return logits, []
             return logits
@@ -354,6 +443,13 @@ class ASDAGLanguageModel(nn.Module):
             if return_states:
                 return logits, []
             return logits
+
+        if reset_mask is None and input_ids.dim() == 2:
+            is_zero = (input_ids == 0)
+            reset_mask = torch.zeros_like(is_zero)
+            reset_mask[:, 0] = True
+            if input_ids.shape[1] > 1:
+                reset_mask[:, 1:] = is_zero[:, :-1] & (~is_zero[:, 1:])
 
         x = self.tok_embeddings(input_ids)
 
@@ -366,13 +462,15 @@ class ASDAGLanguageModel(nn.Module):
                 return_state=return_states,
                 use_quantized_gates=use_quantized_gates,
                 use_shift4_act=use_shift4_act,
-                record_cache=record_cache
+                record_cache=record_cache,
+                reset_mask=reset_mask,
             )
             if return_states or layer_state is not None:
                 x, ns = res
                 next_states.append(ns)
             else:
                 x = res
+
 
         x = self.norm_f(x)
         if not x.is_cuda and self.lm_head.weight.dtype == torch.bfloat16:
@@ -463,3 +561,11 @@ class ASDAGLanguageModel(nn.Module):
             generated.append(next_token)
 
         return torch.cat([curr_ids] + generated, dim=1)
+
+    def reset_context(self):
+        """
+        Resets any cached states or context buffers to ensure no remnants of previous data.
+        """
+        if getattr(self, 'hybrid', None) is not None and hasattr(self.hybrid, 'reset_context'):
+            self.hybrid.reset_context()
+

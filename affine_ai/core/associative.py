@@ -177,11 +177,6 @@ class FusedMonarchChain(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_monarch_chain
             return asdag_cpu_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
-        try:
-            from affine_ai.kernels.triton_gla import triton_fused_monarch_chain
-            return triton_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
-        except Exception:
-            pass
         from affine_ai.kernels.triton_monarch import triton_fused_monarch_chain
         return triton_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
@@ -233,6 +228,13 @@ class PermutationProjection(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_perm_proj
             out = asdag_cpu_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
             return out[0].reshape(*orig_shape)
+
+        try:
+            from affine_ai.kernels.triton_perm_proj import triton_fused_perm_proj
+            out = triton_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
+            return out[0].reshape(*orig_shape)
+        except Exception:
+            pass
 
         x_gathered = torch.gather(
             x_flat.unsqueeze(1).expand(-1, self.num_perms, -1),
@@ -291,6 +293,14 @@ class FusedPermutationProjection(nn.Module):
             branch_outs = tuple(out[m].reshape(*orig_shape) for m in range(self.num_branches))
             return branch_outs
 
+        try:
+            from affine_ai.kernels.triton_perm_proj import triton_fused_perm_proj
+            out = triton_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
+            branch_outs = tuple(out[m].reshape(*orig_shape) for m in range(self.num_branches))
+            return branch_outs
+        except Exception:
+            pass
+
         x_gathered = torch.gather(
             x_flat.unsqueeze(1).expand(-1, self.num_perms, -1),
             dim=-1,
@@ -308,15 +318,16 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         C_eff = min(C, T)
         NC = T // C_eff
         dtype = q.dtype
+        eps = 1e-4 if dtype == torch.float16 else 1e-5
         
         qc = q.view(B, H, NC, C_eff, D)
         kc = k.view(B, H, NC, C_eff, D)
         vc = v.view(B, H, NC, C_eff, D)
         gc = gamma.view(B, H, NC, C_eff)
         
-        log_gc = torch.log(gc.float().clamp(min=1e-5))
+        log_gc = torch.log(gc.float().clamp(min=1e-5, max=1.0))
         cum_log_c = torch.cumsum(log_gc, dim=-1)
-        decay_intra = (cum_log_c.unsqueeze(-1) - cum_log_c.unsqueeze(-2)).clamp(max=0.0)
+        decay_intra = (cum_log_c.unsqueeze(-1) - cum_log_c.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
         mask_intra = torch.tril(torch.ones(C_eff, C_eff, device=q.device, dtype=torch.bool))
         decay_mat_intra = torch.where(mask_intra, torch.exp(decay_intra), torch.zeros_like(decay_intra)).to(dtype)
         
@@ -331,11 +342,12 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         S_local = torch.matmul(kw.transpose(-1, -2), vc)  # [B, H, NC, D, D]
         z_local = kw.sum(dim=-2)                          # [B, H, NC, D]
         
-        # Vectorized inter-chunk associative scan without Python loop
+        # Vectorized inter-chunk associative scan using cumulative log-decay formulation (Issue 12)
         if NC > 1:
             c = cum_log_c[:, :, :, -1]  # [B, H, NC]
-            c_prev = torch.cat([torch.zeros(B, H, 1, device=c.device, dtype=c.dtype), c[:, :, :-1]], dim=-1)
-            diff = c_prev.unsqueeze(-1) - c.unsqueeze(-2)
+            c_cum = torch.cumsum(c, dim=-1)
+            c_cum_prev = torch.cat([torch.zeros(B, H, 1, device=c.device, dtype=c.dtype), c_cum[:, :, :-1]], dim=-1)
+            diff = (c_cum_prev.unsqueeze(-1) - c_cum.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
             strict_tril = torch.tril(torch.ones(NC, NC, device=c.device, dtype=torch.bool), diagonal=-1)
             M_mat = torch.where(strict_tril, torch.exp(diff), torch.zeros_like(diff)).to(dtype)
             S_all = torch.matmul(M_mat, S_local.view(B, H, NC, D * D)).view(B, H, NC, D, D)
@@ -351,22 +363,34 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         den_inter = torch.matmul(q_cur, z_all.unsqueeze(-1))
         
         num_total = num_intra + num_inter
-        den_total = (den_intra + den_inter).clamp(min=1e-5)
+        den_total = (den_intra + den_inter).clamp(min=eps)
         y = (num_total / den_total).view(B, H, T, D)
         
-        ctx.save_for_backward(qc, kc, vc, gc, y.view(B, H, NC, C_eff, D), num_total, den_total, scores_intra, decay_mat_intra, S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start, M_mat)
+        ctx.save_for_backward(
+            qc, kc, vc, gc, y.view(B, H, NC, C_eff, D),
+            num_total, den_total, scores_intra, decay_mat_intra,
+            S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start,
+            M_mat, kw, S_local, z_local
+        )
         ctx.orig_dtype = dtype
         ctx.C_eff = C_eff
         ctx.NC = NC
+        ctx.eps = eps
         return y
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        qc, kc, vc, gc, y, num_tot, den_tot, scores_intra, decay_mat_intra, S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start, M_mat = ctx.saved_tensors
+        (
+            qc, kc, vc, gc, y,
+            num_tot, den_tot, scores_intra, decay_mat_intra,
+            S_all, z_all, cum_log_c, decay_chunk_tot, weight_to_end, weight_from_start,
+            M_mat, kw, S_local, z_local
+        ) = ctx.saved_tensors
         B, H, NC, C_eff, D = qc.shape
         T = NC * C_eff
         go = grad_out.view(B, H, NC, C_eff, D)
         dtype = qc.dtype
+        eps = ctx.eps
         
         d_num = go / den_tot
         d_den = -(go * y).sum(dim=-1, keepdim=True) / den_tot
@@ -378,9 +402,16 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         if ctx.NC > 1 and M_mat is not None:
             d_S_local = torch.matmul(M_mat.transpose(-1, -2), d_S_all.view(B, H, NC, D * D)).view(B, H, NC, D, D)
             d_z_local = torch.matmul(M_mat.transpose(-1, -2), d_z_all)
+            d_M_mat = torch.matmul(d_S_all.view(B, H, NC, D * D), S_local.view(B, H, NC, D * D).transpose(-1, -2)) + torch.matmul(d_z_all, z_local.transpose(-1, -2))
+            d_diff = d_M_mat * M_mat
+            g_c_cum_prev = d_diff.sum(dim=-1)
+            g_c_cum = -d_diff.sum(dim=-2)
+            g_c_cum[:, :, :-1] += g_c_cum_prev[:, :, 1:]
+            g_c = g_c_cum.flip(-1).cumsum(-1).flip(-1)
         else:
             d_S_local = torch.zeros_like(d_S_all)
             d_z_local = torch.zeros_like(d_z_all)
+            g_c = torch.zeros(B, H, NC, device=go.device, dtype=cum_log_c.dtype)
             
         d_kw = torch.matmul(vc, d_S_local.transpose(-1, -2)) + d_z_local.unsqueeze(-2)
         d_vc_inter = torch.matmul(kc * weight_to_end, d_S_local)
@@ -396,7 +427,26 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         g_q = (d_q_inter + d_qc_intra).view(B, H, T, D)
         g_k = (d_kc_inter + d_kc_intra).view(B, H, T, D)
         g_v = (d_vc_inter + d_vc_intra).view(B, H, T, D)
-        g_gamma = torch.zeros(B, H, T, device=go.device, dtype=dtype)
+        
+        # Analytical recurrence adjoint gradient for gamma (Issue 13)
+        G_intra = d_scores * scores_intra
+        g_cum_intra = G_intra.sum(dim=-1) - G_intra.sum(dim=-2)
+        
+        d_q_cur = torch.matmul(d_num, S_all.transpose(-1, -2)) + d_den * z_all.unsqueeze(-2)
+        g_cum_start = (d_q_cur * (qc * weight_from_start)).sum(dim=-1)
+        
+        A = (d_kw * kw).sum(dim=-1)
+        g_cum_to_end = -A
+        g_cum_to_end[:, :, :, -1] += A.sum(dim=-1)
+        
+        g_cum_total = g_cum_intra + g_cum_start + g_cum_to_end
+        g_cum_total[:, :, :, -1] += g_c
+        
+        g_log_gc = g_cum_total.flip(-1).cumsum(-1).flip(-1)
+        g_gc = g_log_gc / gc.float().clamp(min=1e-5)
+        mask_clamp = (gc >= 1e-5) & (gc <= 1.0)
+        g_gc = torch.where(mask_clamp, g_gc, torch.zeros_like(g_gc)).to(dtype)
+        g_gamma = g_gc.view(B, H, T)
         
         return g_q, g_k, g_v, g_gamma, None
 
@@ -579,6 +629,18 @@ class NativeASDAGAssociativeMixer(nn.Module):
                 return self.out_proj(out * g), (state_S, state_z)
             else:
                 # Native PyTorch CUDA recurrent step
+                if T == 1:
+                    q_t = phi_q[:, :, 0]
+                    k_t = phi_k[:, :, 0]
+                    v_t = v[:, :, 0]
+                    gam_t = gamma[:, :, 0]
+                    state_S = state_S * gam_t.unsqueeze(-1).unsqueeze(-1) + (k_t.unsqueeze(-1) * v_t.unsqueeze(-2))
+                    state_z = state_z * gam_t.unsqueeze(-1) + k_t
+                    num = torch.matmul(q_t.unsqueeze(-2), state_S).squeeze(-2)
+                    den = (q_t * state_z).sum(dim=-1, keepdim=True).clamp(min=1e-5)
+                    out = (num / den).unsqueeze(2).transpose(1, 2).reshape(B, 1, C).to(orig_dtype)
+                    return self.out_proj(out * g), (state_S, state_z)
+
                 outs = []
                 for t in range(T):
                     q_t = phi_q[:, :, t]
@@ -624,26 +686,53 @@ class NativeASDAGAssociativeMixer(nn.Module):
             y = y_scan.transpose(1, 2).reshape(B, T, C).to(orig_dtype)
             return self.out_proj(y * g), None
 
-        # Chunked fast path requires T to divide evenly into C_eff-sized chunks
-        if x.is_cuda and not return_state and T % 64 == 0:
-            y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma).transpose(1, 2).reshape(B, T, C)
-            return self.out_proj(y * g), None
-
-        cum_log_gam = None
-        try:
-            from affine_ai.kernels.triton_gla import triton_gla_decay
-            decay_mat = triton_gla_decay(gamma)
-        except Exception:
-            log_gam = torch.log(gamma.clamp(min=1e-5))                       # [B, H, T]
-            cum_log_gam = torch.cumsum(log_gam, dim=-1)                      # [B, H, T]
-            decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(max=0.0) # [B, H, T, T]
+        eps = 1e-4 if orig_dtype == torch.float16 else 1e-5
+        # Chunked fast path on CUDA avoids materializing dense [B, H, T, T] tensors (Issue 18)
+        # When reset_mask is passed, route to exact same_doc masked path to guarantee zero cross-doc attention
+        if reset_mask is not None:
+            # Exact document boundary masking: guarantees 0.0 attention/decay across document boundaries
+            doc_id = torch.cumsum(reset_mask.long(), dim=-1)  # [B, T]
+            same_doc = (doc_id.unsqueeze(-1) == doc_id.unsqueeze(-2)).unsqueeze(1)  # [B, 1, T, T]
+            log_gam = torch.log(gamma.clamp(min=1e-5, max=1.0))
+            cum_log_gam = torch.cumsum(log_gam, dim=-1)
+            decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
             causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
             decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+            decay_mat = decay_mat * same_doc
+            scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat
+            scores = scores * same_doc
+        elif x.is_cuda and not return_state:
+            if T <= 64:
+                y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma, T).transpose(1, 2).reshape(B, T, C)
+                return self.out_proj(y * g), None
+            elif T % 64 == 0:
+                y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma, 64).transpose(1, 2).reshape(B, T, C)
+                return self.out_proj(y * g), None
+            else:
+                pad_len = 64 - (T % 64)
+                phi_q_pad = F.pad(phi_q, (0, 0, 0, pad_len))
+                phi_k_pad = F.pad(phi_k, (0, 0, 0, pad_len))
+                v_pad = F.pad(v, (0, 0, 0, pad_len))
+                gamma_pad = F.pad(gamma, (0, pad_len), value=1.0)
+                y_pad = FusedGLAAnalyticalCUDA.apply(phi_q_pad, phi_k_pad, v_pad, gamma_pad, 64)
+                y = y_pad[:, :, :T, :].transpose(1, 2).reshape(B, T, C)
+                return self.out_proj(y * g), None
+        else:
+            try:
+                from affine_ai.kernels.triton_gla import triton_gla_decay
+                decay_mat = triton_gla_decay(gamma)
+            except Exception:
+                log_gam = torch.log(gamma.clamp(min=1e-5, max=1.0))              # [B, H, T]
+                cum_log_gam = torch.cumsum(log_gam, dim=-1)                      # [B, H, T]
+                decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=-30.0, max=0.0) # [B, H, T, T]
+                causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+                decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+            scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat    # [B, H, T, T]
 
-        scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat    # [B, H, T, T]
         num = torch.matmul(scores, v)                                        # [B, H, T, D]
-        den = scores.sum(dim=-1, keepdim=True).clamp(min=1e-5)               # [B, H, T, 1]
+        den = scores.sum(dim=-1, keepdim=True).clamp(min=eps)                # [B, H, T, 1]
         y = (num / den).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+
 
         next_state = None
         if return_state:

@@ -88,3 +88,57 @@ def test_triton_router_backward():
     assert not torch.isnan(x_flat.grad).any()
     assert not torch.isnan(hyperplanes.grad).any()
     assert not torch.isnan(biases.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_ROUTER_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("B,D,tree_depth,top_k,num_leaves", [
+    (16, 32, 4, 2, 16),
+    (32, 64, 3, 2, 6),
+    (8, 128, 5, 4, 24),
+])
+def test_triton_router_backward_parity(B, D, tree_depth, top_k, num_leaves):
+    torch.manual_seed(123)
+    device = "cuda"
+    I = (1 << tree_depth) - 1
+
+    x_flat = torch.randn(B, D, device=device, requires_grad=True)
+    hyperplanes = torch.randn(I, D, device=device, requires_grad=True)
+    biases = torch.randn(I, device=device, requires_grad=True)
+
+    xr = x_flat.detach().clone().requires_grad_(True)
+    hr = hyperplanes.detach().clone().requires_grad_(True)
+    br = biases.detach().clone().requires_grad_(True)
+
+    # Reference implementation using PyTorch autograd
+    from affine_ai.core.ast_dag import ternarize
+    W_route = ternarize(hr)
+    node_logits = F.linear(xr.reshape(-1, xr.shape[-1]).float(), W_route.float(), br.float())
+    logit_root = node_logits[:, 0:1]
+    p_right = torch.sigmoid(logit_root * 2.0)
+    current_level_probs = torch.cat([1.0 - p_right, p_right], dim=-1)
+    B_nodes = node_logits.shape[0]
+    for depth in range(1, tree_depth):
+        start_node = (1 << depth) - 1
+        num_nodes = 1 << depth
+        level_logits = node_logits[:, start_node:start_node + num_nodes]
+        pr = torch.sigmoid(level_logits * 2.0)
+        pl = 1.0 - pr
+        current_level_probs = torch.stack([current_level_probs * pl, current_level_probs * pr], dim=-1).view(B_nodes, -1)
+    leaf_probs = current_level_probs
+    routing_probs = leaf_probs[:, :num_leaves]
+    routing_probs = routing_probs / routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    actual_top_k = min(top_k, num_leaves)
+    top_vals, _ = torch.topk(routing_probs, k=actual_top_k, dim=-1)
+    top_weights = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    grad_w = torch.randn_like(top_weights)
+    top_weights.backward(grad_w)
+
+    # Triton implementation
+    top_idx, triton_top_w = triton_router_topk(x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves)
+    triton_top_w.backward(grad_w)
+
+    assert torch.allclose(x_flat.grad, xr.grad, atol=1e-5), f"x_flat.grad mismatch: {(x_flat.grad - xr.grad).abs().max()}"
+    assert torch.allclose(hyperplanes.grad, hr.grad, atol=1e-5), f"hyperplanes.grad mismatch: {(hyperplanes.grad - hr.grad).abs().max()}"
+    assert torch.allclose(biases.grad, br.grad, atol=1e-5), f"biases.grad mismatch: {(biases.grad - br.grad).abs().max()}"
+

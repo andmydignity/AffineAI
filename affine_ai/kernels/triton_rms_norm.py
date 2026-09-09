@@ -8,7 +8,7 @@ via float32 row-reduction and fused autograd backward passes with hardware autot
 import torch
 import triton
 import triton.language as tl
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 def _prune_fwd_bwd_configs(configs: List[triton.Config], named_args: dict, **kwargs) -> List[triton.Config]:
@@ -31,11 +31,11 @@ def _prune_fwd_bwd_configs(configs: List[triton.Config], named_args: dict, **kwa
 
 def _get_fwd_bwd_autotune_configs() -> List[triton.Config]:
     """
-    Generates autotune configurations covering hidden dimensions D in {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}.
+    Generates autotune configurations covering hidden dimensions D in {16, 32, ..., 65536}.
     Varies num_warps (1, 2, 4, 8, 16) and num_stages (1, 2, 3, 4) for optimal occupancy and instruction pipelining.
     """
     configs = []
-    for BLOCK_SIZE in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
+    for BLOCK_SIZE in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
         if BLOCK_SIZE <= 64:
             for nw in [1, 2]:
                 for ns in [1, 2]:
@@ -92,26 +92,46 @@ def _rms_norm_fwd_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < D
-
-    x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
-    x = tl.load(x_ptrs, mask=mask, other=0.0)
-
-    # Convert to float32/float64 before squaring to prevent FP16/BF16 overflow (max FP16 is 65,504)
-    x_dtype = x.dtype
+    x_dtype = X_ptr.dtype.element_ty
     acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
-    x_acc = x.to(acc_dtype)
 
-    var = tl.sum(x_acc * x_acc, axis=0) / D
+    if D <= BLOCK_SIZE:
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
+        var = tl.sum(x * x, axis=0) / D
+        rsqrt = tl.rsqrt(var + eps)
+        tl.store(Rsqrt_ptr + row_idx, rsqrt)
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
+        y = (x * rsqrt * scale).to(x_dtype)
+        out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
+        tl.store(out_ptrs, y, mask=mask)
+        return
+
+    # Pass 1: Accumulate sum of squares in FP32/FP64 across chunks (D > BLOCK_SIZE fallback)
+    sum_sq = 0.0
+    for d_start in range(0, D, BLOCK_SIZE):
+        cols = d_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    var = sum_sq / D
     rsqrt = tl.rsqrt(var + eps)
     tl.store(Rsqrt_ptr + row_idx, rsqrt)
 
-    scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
-    y = (x_acc * rsqrt * scale).to(x_dtype)
-
-    out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
-    tl.store(out_ptrs, y, mask=mask)
+    # Pass 2: Normalize and write output across chunks
+    for d_start in range(0, D, BLOCK_SIZE):
+        cols = d_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
+        y = (x * rsqrt * scale).to(x_dtype)
+        out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
+        tl.store(out_ptrs, y, mask=mask)
 
 
 @triton.autotune(
@@ -130,27 +150,45 @@ def _rms_norm_bwd_dx_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < D
+    x_dtype = X_ptr.dtype.element_ty
+    acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
+    rsqrt = tl.load(Rsqrt_ptr + row_idx).to(acc_dtype)
 
-    dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0)
-    x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0)
-    scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0)
-    rsqrt = tl.load(Rsqrt_ptr + row_idx)
+    if D <= BLOCK_SIZE:
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
+        x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
+        dy_scale = dy * scale
+        inner = tl.sum(dy_scale * x, axis=0)
+        coeff = (inner * rsqrt * rsqrt) / D
+        dx = (dy_scale - x * coeff) * rsqrt
+        tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
+        return
 
-    # Cast to float32/float64 for intermediate gradient math to prevent precision loss and underflow
-    acc_dtype = tl.float64 if x.dtype == tl.float64 else tl.float32
-    dy_acc = dy.to(acc_dtype)
-    x_acc = x.to(acc_dtype)
-    scale_acc = scale.to(acc_dtype)
-    rsqrt_acc = rsqrt.to(acc_dtype)
+    # Pass 1: Accumulate inner product across chunks (D > BLOCK_SIZE fallback)
+    inner = 0.0
+    for d_start in range(0, D, BLOCK_SIZE):
+        cols = d_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
+        x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
+        inner += tl.sum(dy * scale * x, axis=0)
 
-    dy_scale = dy_acc * scale_acc
-    inner = tl.sum(dy_scale * x_acc, axis=0)
-    coeff = (inner * rsqrt_acc * rsqrt_acc) / D
-    dx = (dy_scale - x_acc * coeff) * rsqrt_acc
+    coeff = (inner * rsqrt * rsqrt) / D
 
-    tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x.dtype), mask=mask)
+    # Pass 2: Compute dx and store across chunks
+    for d_start in range(0, D, BLOCK_SIZE):
+        cols = d_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
+        x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
+        dy_scale = dy * scale
+        dx = (dy_scale - x * coeff) * rsqrt
+        tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
 
 
 @triton.autotune(
@@ -202,6 +240,56 @@ def _rms_norm_bwd_dscale_kernel(
         tl.atomic_add(DScale_ptr + offs_d, acc, mask=mask_d)
 
 
+def _get_fused_bwd_autotune_configs() -> List[triton.Config]:
+    return [
+        triton.Config({'BLOCK_ROW': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_ROW': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_ROW': 16}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_ROW': 32}, num_warps=8, num_stages=2),
+    ]
+
+
+@triton.autotune(
+    configs=_get_fused_bwd_autotune_configs(),
+    key=['D'],
+    reset_to_zero=['DScale_ptr']
+)
+@triton.jit
+def _rms_norm_bwd_fused_kernel(
+    DY_ptr, X_ptr, Scale_ptr, Rsqrt_ptr, DX_ptr, DScale_ptr,
+    stride_dyb, stride_dyd,
+    stride_xb, stride_xd,
+    stride_sb,
+    stride_dxb, stride_dxd,
+    N: tl.constexpr, D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_ROW: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < N
+    mask_d = offs_d < D
+    mask_2d = mask_m[:, None] & mask_d[None, :]
+
+    x_dtype = X_ptr.dtype.element_ty
+    acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
+
+    rsqrt = tl.load(Rsqrt_ptr + offs_m, mask=mask_m, other=0.0).to(acc_dtype)
+    scale = tl.load(Scale_ptr + offs_d * stride_sb, mask=mask_d, other=0.0).to(acc_dtype)
+    dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
+    x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
+
+    dscale_part = tl.sum(dy * (x * rsqrt[:, None]), axis=0)
+    tl.atomic_add(DScale_ptr + offs_d, dscale_part, mask=mask_d)
+
+    dy_scale = dy * scale[None, :]
+    inner = tl.sum(dy_scale * x, axis=1)
+    coeff = (inner * rsqrt * rsqrt) / D
+    dx = (dy_scale - x * coeff[:, None]) * rsqrt[:, None]
+    tl.store(DX_ptr + offs_m[:, None] * stride_dxb + offs_d[None, :] * stride_dxd, dx.to(x_dtype), mask=mask_2d)
+
+
 class TritonRMSNormFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6):
@@ -209,6 +297,7 @@ class TritonRMSNormFunc(torch.autograd.Function):
         x_flat = x.reshape(-1, orig_shape[-1]).contiguous()
         scale_contig = scale.view(-1).contiguous()
         N, D = x_flat.shape
+        assert scale_contig.numel() == D, f"scale dimension mismatch: scale.numel()={scale_contig.numel()} != D={D}"
         out = torch.empty_like(x_flat)
         calc_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
         rsqrt = torch.empty(N, device=x.device, dtype=calc_dtype)
@@ -233,32 +322,52 @@ class TritonRMSNormFunc(torch.autograd.Function):
         dy_flat = dy.reshape(-1, ctx.D).contiguous()
         N = x_flat.shape[0]
         D = ctx.D
+        need_dx = ctx.needs_input_grad[0]
+        need_dscale = ctx.needs_input_grad[1]
 
         dx = None
-        if ctx.needs_input_grad[0]:
+        dscale = None
+
+        if need_dx and need_dscale and D <= 4096:
             dx = torch.empty_like(x_flat)
-            _rms_norm_bwd_dx_kernel[(N,)](
-                dy_flat, x_flat, scale, rsqrt, dx,
+            calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
+            dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
+            BLOCK_D = max(16, triton.next_power_of_2(D))
+            grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
+            _rms_norm_bwd_fused_kernel[grid](
+                dy_flat, x_flat, scale, rsqrt, dx, dscale_acc,
                 dy_flat.stride(0), dy_flat.stride(1),
                 x_flat.stride(0), x_flat.stride(1),
                 scale.stride(0),
                 dx.stride(0), dx.stride(1),
-                D=D
+                N=N, D=D, BLOCK_D=BLOCK_D
             )
             dx = dx.reshape(*ctx.orig_shape)
-
-        dscale = None
-        if ctx.needs_input_grad[1]:
-            calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
-            dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-            grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
-            _rms_norm_bwd_dscale_kernel[grid](
-                dy_flat, x_flat, rsqrt, dscale_acc,
-                dy_flat.stride(0), dy_flat.stride(1),
-                x_flat.stride(0), x_flat.stride(1),
-                N=N, D=D
-            )
             dscale = dscale_acc.to(scale.dtype).view(ctx.scale_shape)
+        else:
+            if need_dx:
+                dx = torch.empty_like(x_flat)
+                _rms_norm_bwd_dx_kernel[(N,)](
+                    dy_flat, x_flat, scale, rsqrt, dx,
+                    dy_flat.stride(0), dy_flat.stride(1),
+                    x_flat.stride(0), x_flat.stride(1),
+                    scale.stride(0),
+                    dx.stride(0), dx.stride(1),
+                    D=D
+                )
+                dx = dx.reshape(*ctx.orig_shape)
+
+            if need_dscale:
+                calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
+                dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
+                grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+                _rms_norm_bwd_dscale_kernel[grid](
+                    dy_flat, x_flat, rsqrt, dscale_acc,
+                    dy_flat.stride(0), dy_flat.stride(1),
+                    x_flat.stride(0), x_flat.stride(1),
+                    N=N, D=D
+                )
+                dscale = dscale_acc.to(scale.dtype).view(ctx.scale_shape)
 
         return dx, dscale, None
 
@@ -284,40 +393,76 @@ def _fused_add_rms_norm_fwd_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < D
-
-    x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
-    res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
-
-    x = tl.load(x_ptrs, mask=mask, other=0.0)
-    res = tl.load(res_ptrs, mask=mask, other=0.0)
-
-    x_dtype = x.dtype
+    x_dtype = X_ptr.dtype.element_ty
     acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
-    res_acc = x.to(acc_dtype) + res.to(acc_dtype)
-    res_out = res_acc.to(x_dtype)
-    tl.store(Res_out_ptr + row_idx * stride_rob + cols * stride_rod, res_out, mask=mask)
 
-    var = tl.sum(res_acc * res_acc, axis=0) / D
+    if D <= BLOCK_SIZE:
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        res = tl.load(res_ptrs, mask=mask, other=0.0)
+        res_acc = x.to(acc_dtype) + res.to(acc_dtype)
+        tl.store(Res_out_ptr + row_idx * stride_rob + cols * stride_rod, res_acc.to(x_dtype), mask=mask)
+        var = tl.sum(res_acc * res_acc, axis=0) / D
+        rsqrt = tl.rsqrt(var + eps)
+        tl.store(Rsqrt_ptr + row_idx, rsqrt)
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
+        y = (res_acc * rsqrt * scale).to(x_dtype)
+        out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
+        tl.store(out_ptrs, y, mask=mask)
+        return
+
+    # Pass 1: Compute res_out = x + res, store res_out, and accumulate sum of squares (D > BLOCK_SIZE fallback)
+    sum_sq = 0.0
+    for d_start in range(0, D, BLOCK_SIZE):
+        cols = d_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        res = tl.load(res_ptrs, mask=mask, other=0.0)
+
+        res_acc = x.to(acc_dtype) + res.to(acc_dtype)
+        res_out = res_acc.to(x_dtype)
+        tl.store(Res_out_ptr + row_idx * stride_rob + cols * stride_rod, res_out, mask=mask)
+        sum_sq += tl.sum(res_acc * res_acc, axis=0)
+
+    var = sum_sq / D
     rsqrt = tl.rsqrt(var + eps)
     tl.store(Rsqrt_ptr + row_idx, rsqrt)
 
-    scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
-    y = (res_acc * rsqrt * scale).to(x_dtype)
+    # Pass 2: Normalize and write to out
+    for d_start in range(0, D, BLOCK_SIZE):
+        cols = d_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
 
-    out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
-    tl.store(out_ptrs, y, mask=mask)
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        res = tl.load(res_ptrs, mask=mask, other=0.0)
+        res_acc = x.to(acc_dtype) + res.to(acc_dtype)
+
+        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
+        y = (res_acc * rsqrt * scale).to(x_dtype)
+
+        out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
+        tl.store(out_ptrs, y, mask=mask)
 
 
 class TritonFusedAddRMSNormFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, residual: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6):
         orig_shape = x.shape
+        assert residual.shape == orig_shape, f"residual shape mismatch: residual.shape={residual.shape} != x.shape={orig_shape}"
         x_flat = x.reshape(-1, orig_shape[-1]).contiguous()
         res_flat = residual.reshape(-1, orig_shape[-1]).contiguous()
         scale_contig = scale.view(-1).contiguous()
         N, D = x_flat.shape
+        assert scale_contig.numel() == D, f"scale dimension mismatch: scale.numel()={scale_contig.numel()} != D={D}"
 
         out = torch.empty_like(x_flat)
         res_out = torch.empty_like(x_flat)
@@ -347,34 +492,61 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
         N = res_out.shape[0]
         D = ctx.D
 
-        dx = torch.empty_like(res_out)
-        _rms_norm_bwd_dx_kernel[(N,)](
-            dy_flat, res_out, scale, rsqrt, dx,
-            dy_flat.stride(0), dy_flat.stride(1),
-            res_out.stride(0), res_out.stride(1),
-            scale.stride(0),
-            dx.stride(0), dx.stride(1),
-            D=D
-        )
+        need_dx = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+        need_dscale = ctx.needs_input_grad[2]
 
-        if dres_out is not None:
-            dx = dx + dres_out.reshape(-1, ctx.D)
-
-        dx_out = dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[0] else None
-        dres_out_val = dx.clone().reshape(*ctx.orig_shape) if (ctx.needs_input_grad[0] and ctx.needs_input_grad[1]) else (dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[1] else None)
-
+        dx_out = None
+        dres_out_val = None
         dscale = None
-        if ctx.needs_input_grad[2]:
+
+        if need_dx and need_dscale and D <= 4096:
+            dx = torch.empty_like(res_out)
             calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-            grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
-            _rms_norm_bwd_dscale_kernel[grid](
-                dy_flat, res_out, rsqrt, dscale_acc,
+            BLOCK_D = max(16, triton.next_power_of_2(D))
+            grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
+            _rms_norm_bwd_fused_kernel[grid](
+                dy_flat, res_out, scale, rsqrt, dx, dscale_acc,
                 dy_flat.stride(0), dy_flat.stride(1),
                 res_out.stride(0), res_out.stride(1),
-                N=N, D=D
+                scale.stride(0),
+                dx.stride(0), dx.stride(1),
+                N=N, D=D, BLOCK_D=BLOCK_D
             )
+            if dres_out is not None:
+                dx = dx + dres_out.reshape(-1, ctx.D)
+
+            dx_out = dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[0] else None
+            dres_out_val = dx.clone().reshape(*ctx.orig_shape) if (ctx.needs_input_grad[0] and ctx.needs_input_grad[1]) else (dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[1] else None)
             dscale = dscale_acc.to(scale.dtype).view(ctx.scale_shape)
+        else:
+            if need_dx:
+                dx = torch.empty_like(res_out)
+                _rms_norm_bwd_dx_kernel[(N,)](
+                    dy_flat, res_out, scale, rsqrt, dx,
+                    dy_flat.stride(0), dy_flat.stride(1),
+                    res_out.stride(0), res_out.stride(1),
+                    scale.stride(0),
+                    dx.stride(0), dx.stride(1),
+                    D=D
+                )
+                if dres_out is not None:
+                    dx = dx + dres_out.reshape(-1, ctx.D)
+
+                dx_out = dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[0] else None
+                dres_out_val = dx.clone().reshape(*ctx.orig_shape) if (ctx.needs_input_grad[0] and ctx.needs_input_grad[1]) else (dx.reshape(*ctx.orig_shape) if ctx.needs_input_grad[1] else None)
+
+            if need_dscale:
+                calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
+                dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
+                grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+                _rms_norm_bwd_dscale_kernel[grid](
+                    dy_flat, res_out, rsqrt, dscale_acc,
+                    dy_flat.stride(0), dy_flat.stride(1),
+                    res_out.stride(0), res_out.stride(1),
+                    N=N, D=D
+                )
+                dscale = dscale_acc.to(scale.dtype).view(ctx.scale_shape)
 
         return dx_out, dres_out_val, dscale, None
 

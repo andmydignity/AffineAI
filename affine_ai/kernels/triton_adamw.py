@@ -29,14 +29,20 @@ def _adamw_kernel(
     step_size: tl.float32,
     bc2_sqrt: tl.float32,
     N,                  # Total number of elements
-    BLOCK_SIZE: tl.constexpr
+    Master_ptr = None,  # Optional master parameter pointer (FP32)
+    HAS_MASTER: tl.constexpr = False,
+    BLOCK_SIZE: tl.constexpr = 1024
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
 
     # 1. Load parameter, gradient, and moment states into registers
-    p = tl.load(P_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    if HAS_MASTER:
+        p = tl.load(Master_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    else:
+        p = tl.load(P_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
     g = tl.load(Grad_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     m = tl.load(Exp_avg_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     v = tl.load(Exp_avg_sq_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -55,6 +61,8 @@ def _adamw_kernel(
     p = p - step
 
     # 5. Store updated states back to global VRAM
+    if HAS_MASTER:
+        tl.store(Master_ptr + offs, p, mask=mask)
     tl.store(P_ptr + offs, p.to(P_ptr.dtype.element_ty), mask=mask)
     tl.store(Exp_avg_ptr + offs, m, mask=mask)
     tl.store(Exp_avg_sq_ptr + offs, v, mask=mask)
@@ -64,6 +72,7 @@ class TritonAdamW(Optimizer):
     """
     High-Throughput Fused In-Place AdamW Optimizer in Triton.
     Drop-in replacement for torch.optim.AdamW on CUDA.
+    Supports FP32 master weights for half-precision (FP16/BF16) parameters to prevent mantissa underflow.
     """
     def __init__(
         self,
@@ -72,7 +81,8 @@ class TritonAdamW(Optimizer):
         betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
-        correct_bias: bool = True
+        correct_bias: bool = True,
+        master_weights: bool = True
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -90,7 +100,8 @@ class TritonAdamW(Optimizer):
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            correct_bias=correct_bias
+            correct_bias=correct_bias,
+            master_weights=master_weights
         )
         super().__init__(params, defaults)
 
@@ -107,6 +118,7 @@ class TritonAdamW(Optimizer):
             eps = group['eps']
             weight_decay = group['weight_decay']
             correct_bias = group.get('correct_bias', True)
+            use_master = group.get('master_weights', True)
 
             for p in group['params']:
                 if p.grad is None:
@@ -116,11 +128,18 @@ class TritonAdamW(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("TritonAdamW does not support sparse gradients")
 
+                # Issue 39: Enforce contiguous tensors to prevent flat pointer memory corruption
+                p_data = p if p.is_contiguous() else p.contiguous()
+                grad_data = grad if grad.is_contiguous() else grad.contiguous()
+
                 state = self.state[p]
                 if len(state) == 0:
                     state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
-                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
+                    state['exp_avg'] = torch.zeros_like(p_data, dtype=torch.float32, device=p.device)
+                    state['exp_avg_sq'] = torch.zeros_like(p_data, dtype=torch.float32, device=p.device)
+                    # Issue 40: Support FP32 master weights for half-precision (FP16/BF16)
+                    if use_master and p.dtype in (torch.float16, torch.bfloat16):
+                        state['master_param'] = p_data.detach().clone().to(torch.float32)
 
                 state['step'] += 1
                 step_val = state['step']
@@ -129,29 +148,48 @@ class TritonAdamW(Optimizer):
                 step_size = lr / bias_correction1
                 bc2_sqrt = math.sqrt(bias_correction2)
 
+                has_master = 'master_param' in state
+                master_p = state['master_param'] if has_master else p_data
+
                 if p.is_cuda:
-                    N = p.numel()
+                    N = p_data.numel()
                     BLOCK_SIZE = 1024
                     grid = (triton.cdiv(N, BLOCK_SIZE),)
                     _adamw_kernel[grid](
-                        p,
-                        grad,
+                        p_data,
+                        grad_data,
                         state['exp_avg'],
                         state['exp_avg_sq'],
                         lr, beta1, beta2, eps, weight_decay,
                         step_size, bc2_sqrt,
                         N,
+                        master_p,
+                        HAS_MASTER=has_master,
                         BLOCK_SIZE=BLOCK_SIZE
                     )
                 else:
                     # CPU Fallback
-                    if weight_decay != 0.0:
-                        p.data.mul_(1.0 - lr * weight_decay)
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
-                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                    denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
-                    p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                    if has_master:
+                        if weight_decay != 0.0:
+                            master_p.mul_(1.0 - lr * weight_decay)
+                        grad_f32 = grad_data.float()
+                        exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)
+                        exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
+                        denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
+                        master_p.addcdiv_(exp_avg, denom, value=-step_size)
+                        p_data.copy_(master_p)
+                    else:
+                        if weight_decay != 0.0:
+                            p_data.mul_(1.0 - lr * weight_decay)
+                        exp_avg.mul_(beta1).add_(grad_data, alpha=1.0 - beta1)
+                        exp_avg_sq.mul_(beta2).addcmul_(grad_data, grad_data, value=1.0 - beta2)
+                        denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
+                        p_data.addcdiv_(exp_avg, denom, value=-step_size)
+
+                # If p was non-contiguous, copy back the updated contiguous buffer
+                if not p.is_contiguous():
+                    p.copy_(p_data)
 
         return loss

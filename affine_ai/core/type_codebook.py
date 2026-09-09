@@ -53,12 +53,12 @@ class LatentTypeCodebook(nn.Module):
         if birth_mask.any():
             birth_idx = torch.where(birth_mask)[0]
             n_birth = min(int(birth_mask.sum().item()), self.max_types - active)
-            for j in range(n_birth):
-                idx = int(birth_idx[j].item())
-                self.means[active] = flat[idx]
-                self.counts[active] = 1.0
-                active += 1
-            self.num_types.fill_(active)
+            if n_birth > 0:
+                chosen_idx = birth_idx[:n_birth]
+                self.means[active:active + n_birth] = flat[chosen_idx]
+                self.counts[active:active + n_birth] = 1.0
+                active += n_birth
+                self.num_types.fill_(active)
             if n_birth > 0 and n_birth < flat.shape[0]:
                 dists = torch.cdist(flat.float(), self.means[:active].float())
                 min_dist, nearest = dists.min(dim=-1)
@@ -67,19 +67,22 @@ class LatentTypeCodebook(nn.Module):
         if mask.any():
             flat_rem = flat[mask]
             nearest_rem = nearest[mask]
-            for k in range(active):
-                sel = nearest_rem == k
-                if not sel.any():
-                    continue
-                cnt_add = int(sel.sum().item())
-                sum_k = flat_rem[sel].sum(dim=0)
-                old_c = float(self.counts[k].item())
-                new_c = old_c + cnt_add
-                if old_c == 0:
-                    self.means[k] = sum_k / cnt_add
-                else:
-                    self.means[k] = (self.means[k] * old_c + sum_k) / new_c
-                self.counts[k] = new_c
+            counts_add = torch.bincount(nearest_rem, minlength=active).float()
+            sums = torch.zeros(active, self.dim, dtype=flat_rem.dtype, device=flat_rem.device)
+            sums.scatter_add_(0, nearest_rem.unsqueeze(1).expand(-1, self.dim), flat_rem)
+
+            old_c = self.counts[:active].unsqueeze(1)
+            cnt_add_col = counts_add.unsqueeze(1)
+            new_c = old_c + cnt_add_col
+
+            active_means = self.means[:active]
+            updated_means = torch.where(
+                cnt_add_col > 0,
+                torch.where(old_c == 0, sums / cnt_add_col.clamp(min=1), (active_means * old_c + sums) / new_c.clamp(min=1)),
+                active_means
+            )
+            self.means[:active] = updated_means
+            self.counts[:active] = new_c.squeeze(1)
 
     @torch.no_grad()
     def bmr_merge(self) -> int:

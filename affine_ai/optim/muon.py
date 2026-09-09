@@ -27,17 +27,23 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
 
     a, b, c = (3.4445, -4.7750, 2.0315)
     orig_dtype = G.dtype
-    X = G.bfloat16() if (orig_dtype == torch.bfloat16 or torch.cuda.is_bf16_supported()) else G.float()
+    X = G.bfloat16() if (orig_dtype == torch.bfloat16 or (G.is_cuda and torch.cuda.is_bf16_supported())) else G.float()
     X = X / (X.norm() + eps)  # Spectral norm normalization
     
     transposed = X.size(0) > X.size(1)
     if transposed:
         X = X.T
         
+    m = X.size(0)
+    A = torch.empty((m, m), device=X.device, dtype=X.dtype)
+    B = torch.empty((m, m), device=X.device, dtype=X.dtype)
+    X_buf = torch.empty_like(X)
+
     for _ in range(steps):
-        A = X @ X.T
-        B = torch.addmm(A, A, A, beta=b, alpha=c)
-        X = torch.addmm(X, B, X, beta=a, alpha=1.0)
+        torch.mm(X, X.T, out=A)
+        torch.addmm(A, A, A, beta=b, alpha=c, out=B)
+        torch.addmm(X, B, X, beta=a, alpha=1.0, out=X_buf)
+        X, X_buf = X_buf, X
         
     if transposed:
         X = X.T
@@ -53,7 +59,7 @@ def zeropower_via_newtonschulz5_batched(G: torch.Tensor, steps: int = 5, eps: fl
     assert len(G.shape) == 3, f"Expected 3D tensor, got shape {G.shape}"
     a, b, c = (3.4445, -4.7750, 2.0315)
     orig_dtype = G.dtype
-    X = G.bfloat16() if (orig_dtype == torch.bfloat16 or torch.cuda.is_bf16_supported()) else G.float()
+    X = G.bfloat16() if (orig_dtype == torch.bfloat16 or (G.is_cuda and torch.cuda.is_bf16_supported())) else G.float()
     norms = torch.linalg.vector_norm(X, dim=(1, 2), keepdim=True)
     X = X / (norms + eps)
     
@@ -61,10 +67,16 @@ def zeropower_via_newtonschulz5_batched(G: torch.Tensor, steps: int = 5, eps: fl
     if transposed:
         X = X.transpose(1, 2)
         
+    batch_size, m, _ = X.shape
+    A = torch.empty((batch_size, m, m), device=X.device, dtype=X.dtype)
+    B = torch.empty((batch_size, m, m), device=X.device, dtype=X.dtype)
+    X_buf = torch.empty_like(X)
+
     for _ in range(steps):
-        A = torch.bmm(X, X.transpose(1, 2))
-        B = torch.baddbmm(A, A, A, beta=b, alpha=c)
-        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)
+        torch.bmm(X, X.transpose(1, 2), out=A)
+        torch.baddbmm(A, A, A, beta=b, alpha=c, out=B)
+        torch.baddbmm(X, B, X, beta=a, alpha=1.0, out=X_buf)
+        X, X_buf = X_buf, X
         
     if transposed:
         X = X.transpose(1, 2)
@@ -122,10 +134,14 @@ class Muon(torch.optim.Optimizer):
                 update_grad = g.add(buf, alpha=momentum) if nesterov else buf
 
                 if len(p.shape) == 2 and p.shape[0] > 1 and p.shape[1] > 1:
-                    key = (p.shape, p.device, p.dtype)
+                    orig_shape = p.shape
+                    needs_transpose = orig_shape[0] > orig_shape[1]
+                    canonical_shape = (min(orig_shape[0], orig_shape[1]), max(orig_shape[0], orig_shape[1]))
+                    g_can = update_grad.t().contiguous() if needs_transpose else update_grad
+                    key = (canonical_shape, p.device, p.dtype)
                     if key not in shape_to_params:
                         shape_to_params[key] = []
-                    shape_to_params[key].append((p, update_grad))
+                    shape_to_params[key].append((p, orig_shape, update_grad, g_can, needs_transpose))
                 else:
                     non_2d_params.append((p, update_grad))
 
@@ -133,18 +149,17 @@ class Muon(torch.optim.Optimizer):
                 p.data.add_(update_grad, alpha=-lr)
 
             for key, items in shape_to_params.items():
-                if len(items) == 1 or not items[0][0].is_cuda:
-                    for p, g in items:
-                        orig_shape = p.shape
-                        g_2d = g.view(orig_shape[0], -1)
-                        update = zeropower_via_newtonschulz5(g_2d, steps=ns_steps).view(orig_shape)
-                        p.data.add_(update, alpha=-lr)
+                if len(items) == 1:
+                    p, orig_shape, update_grad, _, _ = items[0]
+                    g_2d = update_grad.view(orig_shape[0], -1)
+                    update = zeropower_via_newtonschulz5(g_2d, steps=ns_steps).view(orig_shape)
+                    p.data.add_(update, alpha=-lr)
                 else:
-                    params_list, grads_list = zip(*items)
-                    G_batch = torch.stack(grads_list, dim=0)
+                    G_batch = torch.stack([item[3] for item in items], dim=0)
                     updates_batch = zeropower_via_newtonschulz5_batched(G_batch, steps=ns_steps)
-                    for i, p in enumerate(params_list):
-                        p.data.add_(updates_batch[i], alpha=-lr)
+                    for i, (p, orig_shape, _, _, needs_transpose) in enumerate(items):
+                        update = updates_batch[i].t() if needs_transpose else updates_batch[i]
+                        p.data.add_(update.view(orig_shape), alpha=-lr)
 
         return loss
 
@@ -162,8 +177,10 @@ class HybridMuonAdamW:
         muon_momentum: float = 0.95,
         adamw_weight_decay: float = 0.01,
         muon_weight_decay: float = 0.0,
-        fused: bool = True
+        fused: bool = True,
+        capturable: bool = False,
     ):
+        self.capturable = capturable
         muon_params = []
         adamw_decay_params = []
         adamw_nodecay_params = []
@@ -209,13 +226,16 @@ class HybridMuonAdamW:
 
         if len(adamw_groups) > 0:
             is_cuda = next(model.parameters()).is_cuda if list(model.parameters()) else False
+            adamw_kwargs: Dict[str, Any] = {"lr": adamw_lr}
+            if capturable:
+                adamw_kwargs["capturable"] = True
             if is_cuda and fused:
                 try:
-                    self.adamw_opt = torch.optim.AdamW(adamw_groups, lr=adamw_lr, fused=True)
+                    self.adamw_opt = torch.optim.AdamW(adamw_groups, fused=True, **adamw_kwargs)
                 except Exception:
-                    self.adamw_opt = torch.optim.AdamW(adamw_groups, lr=adamw_lr)
+                    self.adamw_opt = torch.optim.AdamW(adamw_groups, **adamw_kwargs)
             else:
-                self.adamw_opt = torch.optim.AdamW(adamw_groups, lr=adamw_lr)
+                self.adamw_opt = torch.optim.AdamW(adamw_groups, **adamw_kwargs)
             self.optimizers.append(self.adamw_opt)
         else:
             self.adamw_opt = None

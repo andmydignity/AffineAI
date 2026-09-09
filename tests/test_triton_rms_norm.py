@@ -98,3 +98,68 @@ def test_triton_fused_add_rms_norm_fp16_overflow():
     y, res_out = triton_fused_add_rms_norm(x, res, scale, eps=1e-6)
     assert not torch.isnan(y).any()
     assert not torch.isinf(y).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_rms_norm_backward_branches():
+    """Verify dx-only, dscale-only, and fused both-grad backward branches."""
+    torch.manual_seed(42)
+    B, T, D = 2, 8, 64
+
+    # 1. Only x requires grad
+    x = torch.randn(B, T, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    scale = torch.randn(D, device="cuda", dtype=torch.float32, requires_grad=False)
+    y = triton_rms_norm(x, scale)
+    y.sum().backward()
+    assert x.grad is not None
+    assert scale.grad is None
+
+    # 2. Only scale requires grad
+    x = torch.randn(B, T, D, device="cuda", dtype=torch.float32, requires_grad=False)
+    scale = torch.randn(D, device="cuda", dtype=torch.float32, requires_grad=True)
+    y = triton_rms_norm(x, scale)
+    y.sum().backward()
+    assert x.grad is None
+    assert scale.grad is not None
+
+    # 3. Both require grad (fused path)
+    x = torch.randn(B, T, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    scale = torch.randn(D, device="cuda", dtype=torch.float32, requires_grad=True)
+    y = triton_rms_norm(x, scale)
+    y.sum().backward()
+    assert x.grad is not None
+    assert scale.grad is not None
+
+    ref_x = x.detach().clone().requires_grad_(True)
+    ref_s = scale.detach().clone().requires_grad_(True)
+    ref_y = ref_rms_norm(ref_x, ref_s)
+    ref_y.sum().backward()
+
+    assert torch.allclose(x.grad, ref_x.grad, atol=1e-4)
+    assert torch.allclose(scale.grad, ref_s.grad, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_rms_norm_various_shapes_and_dtypes():
+    """Verify numerical parity across various shapes and dtypes."""
+    torch.manual_seed(42)
+    for D in [48, 64, 96, 128, 384]:
+        for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            x = torch.randn(4, 16, D, device="cuda", dtype=dtype, requires_grad=True)
+            scale = torch.randn(D, device="cuda", dtype=dtype, requires_grad=True)
+
+            y = triton_rms_norm(x, scale)
+            y.sum().backward()
+
+            ref_x = x.detach().float().clone().requires_grad_(True)
+            ref_s = scale.detach().float().clone().requires_grad_(True)
+            ref_y = ref_rms_norm(ref_x, ref_s)
+            ref_y.sum().backward()
+
+            if dtype == torch.float32:
+                assert torch.allclose(x.grad, ref_x.grad, atol=1e-4, rtol=1e-4)
+                assert torch.allclose(scale.grad, ref_s.grad, atol=1e-4, rtol=1e-4)
+            else:
+                assert torch.allclose(x.grad.float(), ref_x.grad, atol=2e-2, rtol=2e-2)
+                assert torch.allclose(scale.grad.float(), ref_s.grad, atol=2e-2, rtol=2e-2)
+

@@ -23,6 +23,7 @@ NOT addressed in this file:
   - Dynamic topology (growing/pruning leaves at runtime) is not implemented.
 """
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -86,6 +87,10 @@ def ternary_ste(w: torch.Tensor, threshold_frac: float = 0.7,
 
 class FusedSparseBackpressureTreeV3(nn.Module):
     """
+    .. deprecated:: 0.2.0
+        `FusedSparseBackpressureTreeV3` (and `AdaptiveBackpressureTreeLayer`) is deprecated.
+        Use `AdaptiveSparseTreeDAGLayer` or `ASTDAGLayer` from `affine_ai.core.ast_dag` instead.
+
     Ultra-Fast Contiguous Sibling-Aware Sparse Hydraulic Tree (v3).
 
     Adds ternary QAT (leaf-only) and optional structural sparsity on top of
@@ -181,6 +186,12 @@ class FusedSparseBackpressureTreeV3(nn.Module):
                                           # stack wants.
 	):
         super().__init__()
+        warnings.warn(
+            "FusedSparseBackpressureTreeV3 (and AdaptiveBackpressureTreeLayer) is deprecated and will be removed in a future release. "
+            "Use AdaptiveSparseTreeDAGLayer or ASTDAGLayer from affine_ai.core.ast_dag instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.in_features = in_features
         self.out_features = out_features
         self.depth = depth

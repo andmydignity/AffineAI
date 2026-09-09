@@ -43,8 +43,11 @@ def _popc_dot_kernel(
     stride_xm, stride_xk,
     stride_wn, stride_wk,
     stride_om, stride_on,
-    M, N, K_words, D,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+    M, N,
+    K_WORDS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -58,11 +61,11 @@ def _popc_dot_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     rem = D % 32
 
-    for k in range(K_words):
+    for k in range(K_WORDS):
         x = tl.load(X_bits_ptr + offs_m[:, None] * stride_xm + k * stride_xk, mask=mask_m[:, None], other=0)
         w = tl.load(W_bits_ptr + offs_n[None, :] * stride_wn + k * stride_wk, mask=mask_n[None, :], other=0)
         diff = x ^ w
-        if (k == K_words - 1) and (rem != 0):
+        if (k == K_WORDS - 1) and (rem != 0):
             mask = (1 << rem) - 1
             diff = diff & mask
             pop = tl.inline_asm_elementwise(
@@ -150,7 +153,9 @@ def triton_popc_sign_similarity(
         x_flat.stride(0), x_flat.stride(1),
         w_flat.stride(0), w_flat.stride(1),
         out.stride(0), out.stride(1),
-        M, N, K_words, actual_D,
+        M, N,
+        K_WORDS=K_words,
+        D=actual_D,
         BLOCK_M=BM, BLOCK_N=BN
     )
 

@@ -55,11 +55,12 @@ def test_hierarchical_router_popc():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for hardware ALU tests")
-def test_triton_int8_imma_parity():
+@pytest.mark.parametrize("M", [1, 16, 64, 128])
+def test_triton_int8_imma_parity(M):
     from affine_ai.kernels.triton_int8_imma import triton_int8_imma_linear
 
     device = torch.device("cuda")
-    M, K, N = 128, 96, 64
+    K, N = 96, 64
     torch.manual_seed(42)
 
     x = torch.randn(M, K, device=device, requires_grad=True)
@@ -69,20 +70,36 @@ def test_triton_int8_imma_parity():
     out = triton_int8_imma_linear(x, weight, bias)
     assert out.shape == (M, N)
 
-    # Verify backward pass
+    # PyTorch reference
+    sx = (x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1)
+    x_int8 = (x / sx.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
+    sw = (weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1)
+    w_int8 = (weight / sw.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
+    ref_out = (torch.matmul(x_int8.float(), w_int8.float().t()) * sx.unsqueeze(-1) * sw.unsqueeze(0)) + bias
+
+    diff = (out - ref_out).abs().max().item()
+    assert diff < 1e-3, f"INT8 IMMA forward parity mismatch: max diff={diff}"
+
+    # Verify backward pass mathematical parity
     loss = out.sum()
     loss.backward()
-    assert x.grad is not None
-    assert weight.grad is not None
-    assert bias.grad is not None
+
+    ref_gx = torch.matmul(torch.ones_like(ref_out), weight)
+    ref_gw = torch.matmul(torch.ones_like(ref_out).t(), x)
+    ref_gb = torch.ones_like(ref_out).sum(dim=0)
+
+    assert torch.allclose(x.grad, ref_gx, atol=1e-4), "x.grad mismatch"
+    assert torch.allclose(weight.grad, ref_gw, atol=1e-4), "weight.grad mismatch"
+    assert torch.allclose(bias.grad, ref_gb, atol=1e-4), "bias.grad mismatch"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for hardware ALU tests")
-def test_triton_bitlinear_swiglu_no_stalls():
+@pytest.mark.parametrize("M", [1, 16, 64])
+def test_triton_bitlinear_swiglu_no_stalls(M):
     from affine_ai.kernels.triton_bitlinear import triton_bitlinear_swiglu
 
     device = torch.device("cuda")
-    M, D, hidden = 64, 96, 192
+    D, hidden = 96, 192
     torch.manual_seed(42)
 
     x = torch.randn(M, D, device=device, requires_grad=True)
@@ -91,6 +108,19 @@ def test_triton_bitlinear_swiglu_no_stalls():
 
     out = triton_bitlinear_swiglu(x, w_gv, w_d)
     assert out.shape == (M, D)
+
+    # PyTorch reference with ternary quantization
+    gamma_gv = w_gv.abs().mean().clamp(min=1e-5)
+    gamma_d = w_d.abs().mean().clamp(min=1e-5)
+    w_gv_q = torch.round(torch.clamp(w_gv / gamma_gv, -1.0, 1.0))
+    w_d_q = torch.round(torch.clamp(w_d / gamma_d, -1.0, 1.0))
+
+    gv = torch.matmul(x, w_gv_q.t()) * gamma_gv
+    g, v = gv[:, :hidden], gv[:, hidden:]
+    h_act = (g.sigmoid() * g) * v
+    ref = torch.matmul(h_act, w_d_q.t()) * gamma_d
+
+    assert torch.allclose(out, ref, atol=0.5, rtol=1e-3), f"Bitlinear SwiGLU M={M} parity mismatch"
 
     loss = out.sum()
     loss.backward()

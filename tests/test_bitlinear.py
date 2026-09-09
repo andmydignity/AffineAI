@@ -71,17 +71,33 @@ def test_full_option_b_language_model():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_triton_swiglu_cuda_parity_and_backward():
+@pytest.mark.parametrize("M", [1, 16, 64, 128])
+def test_triton_swiglu_cuda_parity_and_backward(M):
     from affine_ai.kernels.triton_bitlinear import triton_bitlinear_swiglu
 
     torch.manual_seed(42)
-    M, K, N = 128, 64, 128
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    w_gv = torch.randn(2 * N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    w_d = torch.randn(K, N, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    K, N = 64, 128
+    dtype = torch.float32  # Test mathematical parity accurately
+    x = torch.randn(M, K, device="cuda", dtype=dtype, requires_grad=True)
+    w_gv = torch.randn(2 * N, K, device="cuda", dtype=dtype, requires_grad=True)
+    w_d = torch.randn(K, N, device="cuda", dtype=dtype, requires_grad=True)
 
     out = triton_bitlinear_swiglu(x, w_gv, w_d)
     assert out.shape == (M, K)
+
+    # PyTorch reference with ternary quantization
+    gamma_gv = w_gv.abs().mean().clamp(min=1e-5)
+    gamma_d = w_d.abs().mean().clamp(min=1e-5)
+    w_gv_q = torch.round(torch.clamp(w_gv / gamma_gv, -1.0, 1.0))
+    w_d_q = torch.round(torch.clamp(w_d / gamma_d, -1.0, 1.0))
+
+    gv = torch.matmul(x, w_gv_q.t()) * gamma_gv
+    g = gv[:, :N]
+    v = gv[:, N:]
+    h_act = (g.sigmoid() * g) * v
+    ref = torch.matmul(h_act, w_d_q.t()) * gamma_d
+
+    assert torch.allclose(out, ref, atol=0.5, rtol=1e-3), f"SwiGLU M={M} parity mismatch: max diff={(out - ref).abs().max().item()}"
 
     loss = out.sum()
     loss.backward()

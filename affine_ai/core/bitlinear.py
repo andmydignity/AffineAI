@@ -28,7 +28,30 @@ class BitLinear(nn.Module):
         )
         self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype)) if bias else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def quantize_input_and_weight(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantizes inputs to 8-bit integers (STE) and weights to INT8 (on CUDA) or ternary (on CPU)."""
+        x_in = x.to(self.weight.dtype)
+        if x.is_cuda:
+            sx = (x_in.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0)
+            x_int8_f = ((x_in.float() / sx).round().clamp(-128.0, 127.0) * sx).to(self.weight.dtype)
+            x_ste = x_in + (x_int8_f - x_in).detach()
+
+            sw = (self.weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0)
+            w_int8_f = ((self.weight.float() / sw).round().clamp(-128.0, 127.0) * sw).to(self.weight.dtype)
+            w_ste = self.weight + (w_int8_f - self.weight).detach()
+            return x_ste, w_ste
+
+        gamma = self.weight.abs().mean().clamp(min=1e-5)
+        w_scaled = self.weight / gamma
+        w_ternary = torch.round(w_scaled).clamp(-1.0, 1.0)
+        w_quant = self.weight + (w_ternary * gamma - self.weight).detach()
+
+        scale_x = 127.0 / x_in.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        x_quant = (torch.round(x_in * scale_x).clamp(-128.0, 127.0) / scale_x).to(self.weight.dtype)
+        x_ste = x_in + (x_quant - x_in).detach()
+        return x_ste, w_quant
+
+    def forward(self, x: torch.Tensor, use_tc: Optional[bool] = None) -> torch.Tensor:
         if not x.is_cuda:
             if not self.training:
                 from affine_ai.core.cpp_ops import asdag_cpu_bitlinear_ternary_int
@@ -41,26 +64,23 @@ class BitLinear(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_bitlinear
             return asdag_cpu_bitlinear(x, self.weight, self.bias)
 
-        try:
-            from affine_ai.kernels.triton_ternary import triton_ternary_linear
-            return triton_ternary_linear(x, self.weight, self.bias).to(x.dtype)
-        except Exception:
-            pass
+        if x.is_cuda:
+            try:
+                from affine_ai.kernels.triton_int8_imma import triton_int8_imma_linear
+                return triton_int8_imma_linear(x, self.weight, self.bias).to(x.dtype)
+            except Exception:
+                pass
 
-        orig_dtype = x.dtype
-        x_in = x.to(self.weight.dtype)
+            try:
+                from affine_ai.kernels.triton_ternary import triton_ternary_linear
+                return triton_ternary_linear(x, self.weight, self.bias, use_tc=use_tc).to(x.dtype)
+            except Exception:
+                pass
 
-        gamma = self.weight.abs().mean().clamp(min=1e-5)
-        w_scaled = self.weight / gamma
-        w_ternary = torch.round(w_scaled).clamp(-1.0, 1.0)
-        w_quant = self.weight + (w_ternary * gamma - self.weight).detach()
-
-        scale_x = 127.0 / x_in.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
-        x_quant = (torch.round(x_in * scale_x).clamp(-128.0, 127.0) / scale_x).to(self.weight.dtype)
-        x_ste = x_in + (x_quant - x_in).detach()
-
-        out = F.linear(x_ste, w_quant, self.bias)
-        return out.to(orig_dtype)
+            orig_dtype = x.dtype
+            x_ste, w_quant = self.quantize_input_and_weight(x)
+            out = F.linear(x_ste, w_quant, self.bias)
+            return out.to(orig_dtype)
 
 
 class TernaryBitLinearSwiGLU(nn.Module):

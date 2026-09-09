@@ -1,4 +1,5 @@
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -74,19 +75,13 @@ class CQAPv8Block(nn.Module):
         top_logits, top_indices = torch.topk(route_logits, self.top_k, dim=-1)
         top_weights = F.softmax(top_logits, dim=-1)
 
-        # 3. Direct Fused Leaf Computation
-        h_idx = torch.arange(self.n_heads, device=x.device).unsqueeze(0)
-        head_outs = torch.zeros(B_star, self.n_heads, self.d_head, device=x.device, dtype=x.dtype)
-
-        for k in range(self.top_k):
-            idx_k = top_indices[:, :, k]
-            wt_k = top_weights[:, :, k:k+1]
-            u_k = self.leaf_u[h_idx, idx_k]
-            b_k = self.leaf_biases[h_idx, idx_k]
-
-            low_rank = torch.matmul(x_heads.unsqueeze(-2), u_k).squeeze(-2)
-            leaf_out = torch.einsum('bhr, hrd -> bhd', low_rank, self.leaf_v) + b_k
-            head_outs = head_outs + wt_k * leaf_out
+        # 3. Direct Fused Leaf Computation (Vectorized across top-k)
+        h_idx = torch.arange(self.n_heads, device=x.device).unsqueeze(0).unsqueeze(-1)  # (1, H, 1)
+        u_k = self.leaf_u[h_idx, top_indices]      # (B_star, H, K, d_head, rank)
+        b_k = self.leaf_biases[h_idx, top_indices]  # (B_star, H, K, d_head)
+        low_rank = torch.einsum('bhd, bhkdr -> bhkr', x_heads, u_k)
+        leaf_out = torch.einsum('bhkr, hrd -> bhkd', low_rank, self.leaf_v) + b_k
+        head_outs = torch.einsum('bhk, bhkd -> bhd', top_weights, leaf_out)
 
         out = head_outs.reshape(B_star, self.d_model)
         return x + out.reshape(*orig_shape)
@@ -136,6 +131,12 @@ class AffineTreeBlock(nn.Module):
         )
         self.channel_norm = RMSNorm(d_model)
         if channel_mixer == "backpressure":
+            warnings.warn(
+                "channel_mixer='backpressure' (FusedSparseBackpressureTreeV3) is deprecated. "
+                "Use 'ast_dag' (AdaptiveSparseTreeDAGLayer) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             # Hydraulic tree with LOW-RANK leaves by default (rank=None here
             # coerces to 16, matching the module's own default -- full-rank
             # is available only by constructing the layer directly with

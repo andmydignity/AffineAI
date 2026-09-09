@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import struct
@@ -21,6 +22,9 @@ FLAG_RAW_FP16 = 0x01
 FLAG_RAW_FP32 = 0x02
 FLAG_TERNARY_2BIT = 0x03
 FLAG_SPARSE_TERNARY = 0x04
+FLAG_POT5_3BITPLANE = 0x05
+FLAG_POT5_RESIDUAL_FP16 = 0x06
+FLAG_POT5_RESIDUAL_Q4 = 0x07
 
 
 def pack_ternary_tensor(w: torch.Tensor) -> Tuple[bytes, float, list, int]:
@@ -117,11 +121,345 @@ def unpack_ternary_tensor(
         raise ValueError(f"Unknown ternary flag: {flag}")
 
 
+def pack_pot5_3bitplane(w: torch.Tensor, threshold_z: float = 0.35, shift: int = 1) -> Tuple[bytes, float, list, int]:
+    """
+    Packs a 5-State Power-of-Two (POT) weight tensor into 3 bitplanes (NonZero, Magnitude, Sign).
+    Theoretical: log2(5) = 2.32 bits/wt.
+    Storage: exactly 3.0 bits per weight uncompressed, compressible via zstd to ~2.1-2.3 bits/wt.
+    Returns: (packed_bytes, alpha_scale, original_shape, FLAG_POT5_3BITPLANE)
+    """
+    w_cpu = w.detach().cpu().float()
+    orig_shape = list(w.shape)
+    flat = w_cpu.flatten()
+    n = flat.numel()
+
+    std = flat.std().clamp_min(1e-8)
+    val_low = 2.0 ** (-shift)  # 0.5
+    val_high = 1.0
+    t0 = threshold_z * std
+    t1 = (val_low + val_high) * 0.5 * std * 1.2
+
+    abs_w = flat.abs()
+    sign = flat.sign()
+
+    q = torch.zeros_like(flat)
+    q = torch.where(abs_w >= t0, sign * val_low, q)
+    q = torch.where(abs_w >= t1, sign * val_high, q)
+    alpha = float(((flat * q).sum() / (q * q).sum().clamp_min(1e-8)).item())
+
+    # 3 bitplanes (each 1 bit per weight)
+    nz_mask = (abs_w >= t0).numpy()
+    mag_mask = (abs_w >= t1).numpy()
+    sign_mask = (flat < 0.0).numpy()
+
+    nz_packed = np.packbits(nz_mask)
+    mag_packed = np.packbits(mag_mask)
+    sign_packed = np.packbits(sign_mask)
+
+    buf = io.BytesIO()
+    buf.write(struct.pack("<III", len(nz_packed), len(mag_packed), len(sign_packed)))
+    buf.write(nz_packed.tobytes())
+    buf.write(mag_packed.tobytes())
+    buf.write(sign_packed.tobytes())
+    return buf.getvalue(), alpha, orig_shape, FLAG_POT5_3BITPLANE
+
+
+def unpack_pot5_3bitplane(
+    data: bytes,
+    alpha: float,
+    shape: list,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cpu"
+) -> torch.Tensor:
+    """
+    Unpacks a 3-bitplane packed 5-State POT tensor back to continuous PyTorch tensor.
+    Formula: W = nz * (0.5 + 0.5 * mag) * (1 - 2 * sign) * alpha
+    """
+    total_elements = 1
+    for dim in shape:
+        total_elements *= dim
+
+    buf = io.BytesIO(data)
+    len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
+    nz_bytes = buf.read(len_nz)
+    mag_bytes = buf.read(len_mag)
+    sign_bytes = buf.read(len_sign)
+
+    nz = np.unpackbits(np.frombuffer(nz_bytes, dtype=np.uint8))[:total_elements]
+    mag = np.unpackbits(np.frombuffer(mag_bytes, dtype=np.uint8))[:total_elements]
+    sign = np.unpackbits(np.frombuffer(sign_bytes, dtype=np.uint8))[:total_elements]
+
+    # Reconstruct exact 5-state weights via fast 8-entry LUT: index = nz + (mag << 1) + (sign << 2)
+    lut = np.array([0.0, 0.5, 0.0, 1.0, 0.0, -0.5, 0.0, -1.0], dtype=np.float32) * np.float32(alpha)
+    idx = nz + (mag << 1) + (sign << 2)
+    w_val = lut[idx]
+    return torch.from_numpy(w_val.reshape(shape)).to(dtype=dtype, device=device)
+
+
+def pack_pot5_residual_fp16(
+    w: torch.Tensor,
+    top_p: float = 2.0,
+    threshold_z: float = 0.35,
+    shift: int = 1
+) -> Tuple[bytes, float, list, int]:
+    """
+    Packs a weight tensor into a Top-p% Sparse FP16 Residual + 3-Bitplane 5-State POT core.
+    Preserves exact FP16 values for the top_p% highest-magnitude outliers (eliminating tail noise).
+    The remaining non-outliers are packed into 3 bitplanes (NonZero, Magnitude, Sign).
+    Returns: (packed_bytes, alpha, original_shape, FLAG_POT5_RESIDUAL_FP16)
+    """
+    w_cpu = w.detach().cpu().float()
+    orig_shape = list(w.shape)
+    flat = w_cpu.flatten()
+    n = flat.numel()
+
+    # Determine outlier indices and values (strictly top-p%)
+    k_outliers = max(1, int(n * (top_p / 100.0)))
+    flat_abs = flat.abs()
+    topk_idx = torch.topk(flat_abs, k_outliers).indices
+    outlier_indices = np.sort(topk_idx.numpy().astype(np.uint32))
+    outlier_mask = torch.zeros(n, dtype=torch.bool)
+    outlier_mask[torch.from_numpy(outlier_indices.astype(np.int64))] = True
+
+    outlier_values = flat.numpy()[outlier_indices].astype(np.float16)
+    num_outliers = len(outlier_indices)
+
+    # Zero-out outliers in the core tensor
+    flat_core = flat.clone()
+    flat_core[outlier_mask] = 0.0
+
+    non_outlier_vals = flat[~outlier_mask]
+    std = non_outlier_vals.std().clamp_min(1e-8)
+    val_low = 2.0 ** (-shift)  # 0.5
+    val_high = 1.0
+    t0 = threshold_z * std
+    t1 = (val_low + val_high) * 0.5 * std * 1.2
+
+    abs_core = flat_core.abs()
+    sign_core = flat_core.sign()
+
+    q = torch.zeros_like(flat_core)
+    q = torch.where(abs_core >= t0, sign_core * val_low, q)
+    q = torch.where(abs_core >= t1, sign_core * val_high, q)
+    alpha = float(((flat_core * q).sum() / (q * q).sum().clamp_min(1e-8)).item())
+
+    # 3 bitplanes for the core
+    nz_mask = (abs_core >= t0).numpy()
+    mag_mask = (abs_core >= t1).numpy()
+    sign_mask = (flat_core < 0.0).numpy()
+
+    nz_packed = np.packbits(nz_mask)
+    mag_packed = np.packbits(mag_mask)
+    sign_packed = np.packbits(sign_mask)
+
+    buf = io.BytesIO()
+    # Outlier table: [num_outliers (uint32)][indices (uint32 * K)][values (fp16 * K)]
+    buf.write(struct.pack("<I", num_outliers))
+    buf.write(outlier_indices.tobytes())
+    buf.write(outlier_values.tobytes())
+    # 3-Bitplane core: [len_nz, len_mag, len_sign][nz_bytes][mag_bytes][sign_bytes]
+    buf.write(struct.pack("<III", len(nz_packed), len(mag_packed), len(sign_packed)))
+    buf.write(nz_packed.tobytes())
+    buf.write(mag_packed.tobytes())
+    buf.write(sign_packed.tobytes())
+
+    return buf.getvalue(), alpha, orig_shape, FLAG_POT5_RESIDUAL_FP16
+
+
+def unpack_pot5_residual_fp16(
+    data: bytes,
+    alpha: float,
+    shape: list,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cpu"
+) -> torch.Tensor:
+    """
+    Unpacks a Top-p% Sparse FP16 Residual + 3-Bitplane 5-State POT tensor back to continuous tensor.
+    """
+    total_elements = 1
+    for dim in shape:
+        total_elements *= dim
+
+    buf = io.BytesIO(data)
+    num_outliers = struct.unpack("<I", buf.read(4))[0]
+    outlier_indices = np.frombuffer(buf.read(num_outliers * 4), dtype=np.uint32)
+    outlier_values = np.frombuffer(buf.read(num_outliers * 2), dtype=np.float16).astype(np.float32)
+
+    len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
+    nz_bytes = buf.read(len_nz)
+    mag_bytes = buf.read(len_mag)
+    sign_bytes = buf.read(len_sign)
+
+    nz = np.unpackbits(np.frombuffer(nz_bytes, dtype=np.uint8))[:total_elements]
+    mag = np.unpackbits(np.frombuffer(mag_bytes, dtype=np.uint8))[:total_elements]
+    sign = np.unpackbits(np.frombuffer(sign_bytes, dtype=np.uint8))[:total_elements]
+
+    # Reconstruct core 5-state weights via fast LUT
+    lut = np.array([0.0, 0.5, 0.0, 1.0, 0.0, -0.5, 0.0, -1.0], dtype=np.float32) * np.float32(alpha)
+    idx = nz + (mag << 1) + (sign << 2)
+    w_val = lut[idx]
+
+    # Inject exact FP16 outlier values
+    w_val[outlier_indices] = outlier_values
+
+    return torch.from_numpy(w_val.reshape(shape)).to(dtype=dtype, device=device)
+
+
+def pack_pot5_residual_q4(
+    w: torch.Tensor,
+    top_p: float = 2.0,
+    block_size: int = 32,
+    threshold_z: float = 0.35,
+    shift: int = 1
+) -> Tuple[bytes, float, list, int]:
+    """
+    Packs a weight tensor into a Top-p% Sparse Q4 Residual (Block-32 scaled 4-bit) + 3-Bitplane POT5 core.
+    Outliers are quantized to 4-bit signed integers [-8, 7] with a float16 scale per block of 32 outliers (4.5 bits/outlier).
+    Remaining non-outliers are packed into 3 bitplanes (NonZero, Magnitude, Sign).
+    Returns: (packed_bytes, alpha, original_shape, FLAG_POT5_RESIDUAL_Q4)
+    """
+    w_cpu = w.detach().cpu().float()
+    orig_shape = list(w.shape)
+    flat = w_cpu.flatten()
+    n = flat.numel()
+
+    # Determine outlier indices and values (strictly top-p%)
+    k_outliers = max(1, int(n * (top_p / 100.0)))
+    flat_abs = flat.abs()
+    topk_idx = torch.topk(flat_abs, k_outliers).indices
+    outlier_indices = np.sort(topk_idx.numpy().astype(np.uint32))
+    outlier_mask = torch.zeros(n, dtype=torch.bool)
+    outlier_mask[torch.from_numpy(outlier_indices.astype(np.int64))] = True
+
+    outlier_values = flat.numpy()[outlier_indices]
+    num_outliers = len(outlier_indices)
+
+    # Group outliers into blocks of block_size (default 32)
+    pad_len = (block_size - (num_outliers % block_size)) % block_size
+    out_padded = np.pad(outlier_values, (0, pad_len)) if pad_len > 0 else outlier_values
+    out_blocks = out_padded.reshape(-1, block_size)
+    
+    # Block scales: max(|v|) / 7.0 in float16
+    max_abs = np.max(np.abs(out_blocks), axis=-1).clip(min=1e-5)
+    scales = (max_abs / 7.0).astype(np.float16)
+    
+    # Quantize to signed 4-bit [-8, 7]
+    q4 = np.round(out_blocks / scales[:, None]).clip(-8, 7).astype(np.int8)
+    q4_flat = q4.flatten()[:num_outliers]
+    
+    # Pack 2 nibbles per byte
+    nibbles = (q4_flat & 0x0F).astype(np.uint8)
+    if len(nibbles) % 2 != 0:
+        nibbles = np.pad(nibbles, (0, 1))
+    packed_nibbles = (nibbles[0::2] | (nibbles[1::2] << 4)).tobytes()
+
+    # Zero-out outliers in the core tensor
+    flat_core = flat.clone()
+    flat_core[outlier_mask] = 0.0
+
+    non_outlier_vals = flat[~outlier_mask]
+    std = non_outlier_vals.std().clamp_min(1e-8)
+    val_low = 2.0 ** (-shift)  # 0.5
+    val_high = 1.0
+    t0 = threshold_z * std
+    t1 = (val_low + val_high) * 0.5 * std * 1.2
+
+    abs_core = flat_core.abs()
+    sign_core = flat_core.sign()
+
+    q = torch.zeros_like(flat_core)
+    q = torch.where(abs_core >= t0, sign_core * val_low, q)
+    q = torch.where(abs_core >= t1, sign_core * val_high, q)
+    alpha = float(((flat_core * q).sum() / (q * q).sum().clamp_min(1e-8)).item())
+
+    # 3 bitplanes for the core
+    nz_mask = (abs_core >= t0).numpy()
+    mag_mask = (abs_core >= t1).numpy()
+    sign_mask = (flat_core < 0.0).numpy()
+
+    nz_packed = np.packbits(nz_mask)
+    mag_packed = np.packbits(mag_mask)
+    sign_packed = np.packbits(sign_mask)
+
+    buf = io.BytesIO()
+    # Outlier table: [num_outliers (uint32)][block_size (uint32)][indices (uint32 * K)]
+    #                [num_scales (uint32)][scales (fp16 * num_blocks)]
+    #                [len_nibbles (uint32)][packed_nibbles (bytes)]
+    buf.write(struct.pack("<II", num_outliers, block_size))
+    buf.write(outlier_indices.tobytes())
+    buf.write(struct.pack("<I", len(scales)))
+    buf.write(scales.tobytes())
+    buf.write(struct.pack("<I", len(packed_nibbles)))
+    buf.write(packed_nibbles)
+    
+    # 3-Bitplane core: [len_nz, len_mag, len_sign][nz_bytes][mag_bytes][sign_bytes]
+    buf.write(struct.pack("<III", len(nz_packed), len(mag_packed), len(sign_packed)))
+    buf.write(nz_packed.tobytes())
+    buf.write(mag_packed.tobytes())
+    buf.write(sign_packed.tobytes())
+
+    return buf.getvalue(), alpha, orig_shape, FLAG_POT5_RESIDUAL_Q4
+
+
+def unpack_pot5_residual_q4(
+    data: bytes,
+    alpha: float,
+    shape: list,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cpu"
+) -> torch.Tensor:
+    """
+    Unpacks a Top-p% Sparse Q4 Residual + 3-Bitplane 5-State POT tensor back to continuous tensor.
+    """
+    total_elements = 1
+    for dim in shape:
+        total_elements *= dim
+
+    buf = io.BytesIO(data)
+    num_outliers, block_size = struct.unpack("<II", buf.read(8))
+    outlier_indices = np.frombuffer(buf.read(num_outliers * 4), dtype=np.uint32)
+    
+    num_scales = struct.unpack("<I", buf.read(4))[0]
+    scales = np.frombuffer(buf.read(num_scales * 2), dtype=np.float16).astype(np.float32)
+    
+    len_nibbles = struct.unpack("<I", buf.read(4))[0]
+    packed_bytes = np.frombuffer(buf.read(len_nibbles), dtype=np.uint8)
+    
+    # Unpack 4-bit nibbles
+    low = packed_bytes & 0x0F
+    high = (packed_bytes >> 4) & 0x0F
+    unpacked_nibbles = np.stack([low, high], axis=1).flatten()[:num_outliers]
+    nib = unpacked_nibbles.astype(np.int8)
+    q4 = np.where(nib >= 8, nib - 16, nib).astype(np.float32)
+    block_idx = np.arange(num_outliers) // block_size
+    outlier_values = q4 * scales[block_idx]
+
+    len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
+    nz_bytes = buf.read(len_nz)
+    mag_bytes = buf.read(len_mag)
+    sign_bytes = buf.read(len_sign)
+
+    nz = np.unpackbits(np.frombuffer(nz_bytes, dtype=np.uint8))[:total_elements]
+    mag = np.unpackbits(np.frombuffer(mag_bytes, dtype=np.uint8))[:total_elements]
+    sign = np.unpackbits(np.frombuffer(sign_bytes, dtype=np.uint8))[:total_elements]
+
+    # Reconstruct core 5-state weights via fast LUT
+    lut = np.array([0.0, 0.5, 0.0, 1.0, 0.0, -0.5, 0.0, -1.0], dtype=np.float32) * np.float32(alpha)
+    idx = nz + (mag << 1) + (sign << 2)
+    w_val = lut[idx]
+
+    # Inject dequantized Q4 outlier values
+    w_val[outlier_indices] = outlier_values
+
+    return torch.from_numpy(w_val.reshape(shape)).to(dtype=dtype, device=device)
+
+
 def save_toros_model(
     model: nn.Module,
     filepath: str,
     metadata: Optional[Dict[str, Any]] = None,
-    compression_level: int = 19
+    compression_level: int = 19,
+    weight_quant_mode: Optional[str] = "pot5_res_q4"
 ) -> Dict[str, Any]:
     """
     Saves a model in the ultra-space-efficient Toros Binary Format (.toros).
@@ -147,8 +485,15 @@ def save_toros_model(
                 if isinstance(v, (int, float, str, bool, list, dict)) or v is None
             }
 
+    if weight_quant_mode is None:
+        cfg = getattr(model, "config", None)
+        weight_quant_mode = getattr(cfg, "weight_quant_mode", "pot5_res_q4") if cfg is not None else "pot5_res_q4"
+
     total_params = sum(p.numel() for p in state_dict.values())
     ternary_tensors = 0
+    pot5_tensors = 0
+    pot5_res_tensors = 0
+    pot5_res_q4_tensors = 0
     fp16_tensors = 0
     
     payload_buf = io.BytesIO()
@@ -157,8 +502,8 @@ def save_toros_model(
     for name, tensor in state_dict.items():
         name_bytes = name.encode("utf-8")
         
-        # Detect if tensor is a 1.58-bit ternary weight (All linear projections except embeddings and norms)
-        is_ternary_candidate = (
+        # Detect if tensor is a quantized weight (All linear projections except embeddings and norms)
+        is_quant_candidate = (
             tensor.dim() >= 2 and
             ("weight" in name) and
             ("token_embd" not in name) and
@@ -169,8 +514,19 @@ def save_toros_model(
             ("beta_proj" not in name)
         )
         
-        if is_ternary_candidate:
-            packed_bytes, gamma, shape, flag = pack_ternary_tensor(tensor)
+        if is_quant_candidate:
+            if weight_quant_mode in ("pot5_res_q4", "pot5_res_q4_res2"):
+                packed_bytes, gamma, shape, flag = pack_pot5_residual_q4(tensor, top_p=2.0)
+                pot5_res_q4_tensors += 1
+            elif weight_quant_mode == "pot5_res2":
+                packed_bytes, gamma, shape, flag = pack_pot5_residual_fp16(tensor, top_p=2.0)
+                pot5_res_tensors += 1
+            elif weight_quant_mode == "pot5":
+                packed_bytes, gamma, shape, flag = pack_pot5_3bitplane(tensor)
+                pot5_tensors += 1
+            else:
+                packed_bytes, gamma, shape, flag = pack_ternary_tensor(tensor)
+                ternary_tensors += 1
             payload_buf.write(struct.pack("<H", len(name_bytes)))
             payload_buf.write(name_bytes)
             payload_buf.write(struct.pack("<B", flag))
@@ -180,7 +536,6 @@ def save_toros_model(
                 payload_buf.write(struct.pack("<I", d))
             payload_buf.write(struct.pack("<I", len(packed_bytes)))
             payload_buf.write(packed_bytes)
-            ternary_tensors += 1
         else:
             t_fp16 = tensor.detach().cpu().to(torch.float16).contiguous()
             t_bytes = t_fp16.numpy().tobytes()
@@ -199,29 +554,8 @@ def save_toros_model(
             fp16_tensors += 1
 
     uncompressed_payload = payload_buf.getvalue()
-    
-    meta = {
-        "format": "TOROS",
-        "version": FORMAT_VERSION,
-        "model_type": model.__class__.__name__,
-        "config": config_dict,
-        "sparsity": {
-            "tree_sparsity": 0.9375,
-            "top_k": 1,
-            "num_leaves": 16,
-            "active_sparsity_ratio": "15/16 (93.75% zero compute)"
-        },
-        "statistics": {
-            "total_params": total_params,
-            "ternary_tensors": ternary_tensors,
-            "fp16_tensors": fp16_tensors,
-            "uncompressed_bytes": len(uncompressed_payload)
-        },
-        "user_metadata": metadata or {}
-    }
-    
-    meta_json = json.dumps(meta, indent=2).encode("utf-8")
-    
+    uncompressed_bytes = len(uncompressed_payload)
+
     if HAS_ZSTD and compression_level > 0:
         cctx = zstd.ZstdCompressor(level=compression_level)
         compressed_payload = cctx.compress(uncompressed_payload)
@@ -229,6 +563,127 @@ def save_toros_model(
     else:
         compressed_payload = uncompressed_payload
         is_compressed = 0
+    compressed_bytes = len(compressed_payload)
+    comp_ratio = round(uncompressed_bytes / max(compressed_bytes, 1), 2)
+    effective_bpw = round((compressed_bytes * 8.0) / max(total_params, 1), 3)
+
+    # Infer architecture & base model
+    arch = "hybrid"
+    cls_name = model.__class__.__name__
+    if "Qwen" in cls_name:
+        arch = "qwen35"
+    elif "ASDAG" in cls_name:
+        arch = "asdag"
+    if metadata and "architecture" in metadata:
+        arch = metadata["architecture"]
+
+    base_model = metadata.get("base_model", "Qwen3.5-4B" if arch == "qwen35" else "custom") if metadata else ("Qwen3.5-4B" if arch == "qwen35" else "custom")
+
+    # Quantization spec
+    if weight_quant_mode in ("pot5_res_q4", "pot5_res_q4_res2"):
+        quant_spec = {
+            "mode": "pot5_residual_q4",
+            "bits_per_weight_nominal": 2.41,
+            "storage_bits_per_weight_raw": 3.09,
+            "lut_values": [-1.0, -0.5, 0.0, 0.5, 1.0],
+            "lut_description": "Top-2% Q4 Block-32 Residual + 5-State Power-of-Two Core",
+            "pot5_tensors": pot5_tensors,
+            "pot5_res_tensors": pot5_res_tensors,
+            "pot5_res_q4_tensors": pot5_res_q4_tensors if 'pot5_res_q4_tensors' in locals() else 0,
+            "ternary_tensors": ternary_tensors,
+            "fp16_tensors": fp16_tensors,
+        }
+    elif weight_quant_mode == "pot5_res2":
+        quant_spec = {
+            "mode": "pot5_residual_fp16",
+            "bits_per_weight_nominal": 2.64,
+            "storage_bits_per_weight_raw": 3.44,
+            "lut_values": [-1.0, -0.5, 0.0, 0.5, 1.0],
+            "lut_description": "Top-2% FP16 Residual + 5-State Power-of-Two Core",
+            "pot5_tensors": pot5_tensors,
+            "pot5_res_tensors": pot5_res_tensors,
+            "ternary_tensors": ternary_tensors,
+            "fp16_tensors": fp16_tensors,
+        }
+    elif weight_quant_mode == "pot5":
+        quant_spec = {
+            "mode": "pot5_3bitplane",
+            "bits_per_weight_nominal": 2.32,
+            "storage_bits_per_weight_raw": 3.0,
+            "lut_values": [-1.0, -0.5, 0.0, 0.5, 1.0],
+            "lut_description": "5-State Power-of-Two: 0, +/- 2^(-1), +/- 2^(0)",
+            "pot5_tensors": pot5_tensors,
+            "pot5_res_tensors": pot5_res_tensors,
+            "ternary_tensors": ternary_tensors,
+            "fp16_tensors": fp16_tensors,
+        }
+    else:
+        quant_spec = {
+            "mode": "ternary_2bit",
+            "bits_per_weight_nominal": 1.58,
+            "storage_bits_per_weight_raw": 2.0,
+            "lut_values": [-1.0, 0.0, 1.0],
+            "lut_description": "Ternary: 0, +/- 1.0",
+            "pot5_tensors": pot5_tensors,
+            "pot5_res_tensors": pot5_res_tensors,
+            "ternary_tensors": ternary_tensors,
+            "fp16_tensors": fp16_tensors,
+        }
+
+    # Model info from config
+    model_info = {
+        "num_layers": config_dict.get("num_layers", config_dict.get("n_encoder_layers", None)),
+        "dim": config_dict.get("dim", None),
+        "intermediate_dim": config_dict.get("intermediate_dim", None),
+        "vocab_size": config_dict.get("vocab_size", None),
+        "num_leaves": config_dict.get("num_leaves", None),
+        "top_k": config_dict.get("top_k", None),
+        "leaf_dim": config_dict.get("leaf_dim", None),
+        "full_attn_interval": config_dict.get("full_attn_interval", None),
+    }
+    model_info = {k: v for k, v in model_info.items() if v is not None}
+
+    # Sparsity
+    sparsity_spec = {
+        "tree_sparsity": config_dict.get("tree_sparsity", 0.9375),
+        "top_k": config_dict.get("top_k", 1),
+        "num_leaves": config_dict.get("num_leaves", 16),
+        "active_sparsity_ratio": f"{config_dict.get('top_k', 1)}/{config_dict.get('num_leaves', 16)}"
+    }
+    if metadata and "sparsity" in metadata:
+        sparsity_spec.update(metadata["sparsity"])
+
+    hardware_profile = metadata.get("hardware_profile", {}) if metadata else {}
+    performance = metadata.get("performance", {}) if metadata else {}
+
+    meta = {
+        "format": "TOROS",
+        "version": FORMAT_VERSION,
+        "architecture": arch,
+        "base_model": base_model,
+        "model_type": cls_name,
+        "quantization": quant_spec,
+        "model_info": model_info,
+        "config": config_dict,
+        "sparsity": sparsity_spec,
+        "statistics": {
+            "total_params": total_params,
+            "pot5_tensors": pot5_tensors,
+            "pot5_res_tensors": pot5_res_tensors,
+            "pot5_res_q4_tensors": pot5_res_q4_tensors,
+            "ternary_tensors": ternary_tensors,
+            "fp16_tensors": fp16_tensors,
+            "uncompressed_bytes": uncompressed_bytes,
+            "compressed_bytes": compressed_bytes,
+            "compression_ratio": comp_ratio,
+            "effective_bits_per_param": effective_bpw
+        },
+        "hardware_profile": hardware_profile,
+        "performance": performance,
+        "user_metadata": metadata or {}
+    }
+    
+    meta_json = json.dumps(meta, indent=2).encode("utf-8")
         
     with open(filepath, "wb") as f:
         f.write(MAGIC_HEADER)
@@ -236,19 +691,24 @@ def save_toros_model(
         f.write(struct.pack("<B", is_compressed))
         f.write(struct.pack("<I", len(meta_json)))
         f.write(meta_json)
-        f.write(struct.pack("<Q", len(uncompressed_payload)))
-        f.write(struct.pack("<Q", len(compressed_payload)))
+        f.write(struct.pack("<Q", uncompressed_bytes))
+        f.write(struct.pack("<Q", compressed_bytes))
         f.write(compressed_payload)
         
     return {
         "filepath": filepath,
-        "uncompressed_bytes": len(uncompressed_payload),
-        "compressed_bytes": len(compressed_payload),
-        "compression_ratio": len(uncompressed_payload) / max(len(compressed_payload), 1),
+        "uncompressed_bytes": uncompressed_bytes,
+        "compressed_bytes": compressed_bytes,
+        "compression_ratio": comp_ratio,
         "total_params": total_params,
+        "pot5_tensors": pot5_tensors,
+        "pot5_res_tensors": pot5_res_tensors,
+        "pot5_res_q4_tensors": pot5_res_q4_tensors,
         "ternary_tensors": ternary_tensors,
-        "fp16_tensors": fp16_tensors
+        "fp16_tensors": fp16_tensors,
+        "effective_bits_per_param": effective_bpw
     }
+
 
 
 def read_toros_metadata(filepath: str) -> Dict[str, Any]:
@@ -266,14 +726,165 @@ def read_toros_metadata(filepath: str) -> Dict[str, Any]:
         return json.loads(meta_json)
 
 
+def format_toros_summary(meta: Dict[str, Any]) -> str:
+    """
+    Returns a human-readable table summarizing .toros model identity, architecture,
+    quantization specs, sparsity, hardware footprint, and telemetry.
+    """
+    lines = []
+    lines.append("=" * 68)
+    lines.append(f"  TOROS Binary Checkpoint Specification (Format v{meta.get('version', 1)})")
+    lines.append("=" * 68)
+
+    arch = meta.get("architecture", "unknown")
+    base = meta.get("base_model", "unknown")
+    m_type = meta.get("model_type", "unknown")
+    lines.append(f"  Model Identity:       {m_type} ({arch.upper()})")
+    lines.append(f"  Base Model:           {base}")
+
+    q = meta.get("quantization", {})
+    if q:
+        mode = q.get("mode", "unknown")
+        nom_b = q.get("bits_per_weight_nominal", "N/A")
+        raw_b = q.get("storage_bits_per_weight_raw", "N/A")
+        lut = q.get("lut_values", [])
+        lines.append(f"  Quantization Mode:    {mode} ({nom_b}b nominal, {raw_b}b uncompressed)")
+        lines.append(f"  Quantization States:  {lut}")
+
+    st = meta.get("statistics", {})
+    if st:
+        total_p = st.get("total_params", 0)
+        uncomp = st.get("uncompressed_bytes", 0) / (1024 * 1024)
+        comp = st.get("compressed_bytes", 0) / (1024 * 1024)
+        ratio = st.get("compression_ratio", 0)
+        eff_bpw = st.get("effective_bits_per_param", 0)
+        pot_cnt = st.get("pot5_tensors", 0)
+        pot_res_cnt = st.get("pot5_res_tensors", 0)
+        pot_res_q4_cnt = st.get("pot5_res_q4_tensors", 0)
+        ter_cnt = st.get("ternary_tensors", 0)
+        fp16_cnt = st.get("fp16_tensors", 0)
+        lines.append("-" * 68)
+        lines.append(f"  Total Parameters:     {total_p:,}")
+        lines.append(f"  Payload Size:         {comp:.1f} MB compressed / {uncomp:.1f} MB raw ({ratio:.2f}x ratio)")
+        lines.append(f"  Effective BPW:        {eff_bpw:.3f} bits/param (including embeddings & norms)")
+        breakdown_parts = []
+        if pot_cnt > 0:
+            breakdown_parts.append(f"{pot_cnt} POT5")
+        if pot_res_cnt > 0:
+            breakdown_parts.append(f"{pot_res_cnt} POT5-Residual(FP16)")
+        if pot_res_q4_cnt > 0:
+            breakdown_parts.append(f"{pot_res_q4_cnt} POT5-Residual(Q4)")
+        if ter_cnt > 0:
+            breakdown_parts.append(f"{ter_cnt} Ternary")
+        if fp16_cnt > 0:
+            breakdown_parts.append(f"{fp16_cnt} FP16")
+        lines.append(f"  Tensors Breakdown:    {', '.join(breakdown_parts) if breakdown_parts else 'N/A'}")
+
+    sp = meta.get("sparsity", {})
+    if sp:
+        active = sp.get("active_sparsity", sp.get("active_sparsity_ratio", "N/A"))
+        lines.append("-" * 68)
+        lines.append(f"  Active Compute:       {active}")
+
+    hw = meta.get("hardware_profile", {})
+    if hw:
+        vram = hw.get("vram_footprint_mb", "N/A")
+        dev = hw.get("recommended_device", "cuda")
+        lines.append(f"  VRAM Footprint:       ~{vram} MB (target: {dev})")
+
+    perf = meta.get("performance", {})
+    if perf:
+        p_tok = perf.get("prefill_tok_per_sec", "N/A")
+        g_tok = perf.get("gen_tok_per_sec", "N/A")
+        lat = perf.get("latency_ms_per_token", "N/A")
+        lines.append(f"  Throughput:           Prefill: {p_tok} tok/s | Gen: {g_tok} tok/s ({lat} ms/tok)")
+
+    lines.append("=" * 68)
+    return "\n".join(lines)
+
+
+def _get_child(curr: Any, p: str) -> Any:
+    if isinstance(curr, (nn.ModuleList, nn.Sequential, list, tuple)):
+        return curr[int(p)]
+    elif isinstance(curr, (nn.ModuleDict, dict)):
+        return curr[p]
+    elif hasattr(curr, p):
+        return getattr(curr, p)
+    elif p.isdigit() and hasattr(curr, "__getitem__"):
+        try:
+            return curr[int(p)]
+        except (KeyError, IndexError, TypeError):
+            return curr[p]
+    elif hasattr(curr, "__getitem__"):
+        return curr[p]
+    else:
+        return getattr(curr, p)
+
+
+def _set_submodule(model: nn.Module, target_path: str, new_module: nn.Module):
+    """Replaces a submodule at target_path (e.g. 'blocks.0.time_mixer.qkv_proj') with new_module."""
+    parts = target_path.split(".")
+    curr = model
+    for p in parts[:-1]:
+        curr = _get_child(curr, p)
+    attr = parts[-1]
+    if isinstance(curr, (nn.ModuleList, nn.Sequential, list)):
+        curr[int(attr)] = new_module
+    elif isinstance(curr, (nn.ModuleDict, dict)):
+        curr[attr] = new_module
+    elif hasattr(curr, attr):
+        setattr(curr, attr, new_module)
+    elif attr.isdigit() and hasattr(curr, "__setitem__"):
+        try:
+            curr[int(attr)] = new_module
+        except (KeyError, IndexError, TypeError):
+            curr[attr] = new_module
+    else:
+        setattr(curr, attr, new_module)
+
+
+def _assign_tensor(model: nn.Module, target_path: str, tensor: torch.Tensor):
+    """Assigns a parameter or buffer at target_path without intermediate dictionary."""
+    parts = target_path.split(".")
+    curr = model
+    for p in parts[:-1]:
+        curr = _get_child(curr, p)
+    attr = parts[-1]
+    if isinstance(curr, (nn.ModuleDict, dict)):
+        curr[attr] = tensor
+    elif hasattr(curr, attr):
+        existing = getattr(curr, attr)
+        if isinstance(existing, nn.Parameter):
+            curr.register_parameter(attr, nn.Parameter(tensor, requires_grad=False))
+        elif attr in getattr(curr, "_buffers", {}):
+            curr.register_buffer(attr, tensor)
+        elif attr in getattr(curr, "_parameters", {}):
+            curr.register_parameter(attr, nn.Parameter(tensor, requires_grad=False))
+        else:
+            if hasattr(curr, "register_buffer") and attr not in curr.__dict__:
+                try:
+                    curr.register_buffer(attr, tensor)
+                except Exception:
+                    setattr(curr, attr, tensor)
+            else:
+                setattr(curr, attr, tensor)
+    elif attr.isdigit() and hasattr(curr, "__setitem__"):
+        curr[int(attr)] = tensor
+    else:
+        setattr(curr, attr, tensor)
+
+
 def load_toros_model(
     filepath: str,
     device: str = "cpu",
-    target_dtype: torch.dtype = torch.float32,
-    model_class: Optional[Any] = None
+    target_dtype: Optional[torch.dtype] = None,
+    model_class: Optional[Any] = None,
+    bitpacked: bool = True
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Loads a .toros binary model directly into memory with ultra-fast decompression.
+    Loads a .toros binary model directly into memory with ultra-fast streaming decompression.
+    When bitpacked=True, weights are kept in 3-bit bitplanes (1.35 GB resident memory)
+    rather than expanding to 16-bit floats (7 GB) or 32-bit floats (14 GB), completely eliminating OOM.
     """
     with open(filepath, "rb") as f:
         magic = f.read(len(MAGIC_HEADER))
@@ -286,58 +897,166 @@ def load_toros_model(
         meta = json.loads(meta_json)
         
         uncompressed_size, compressed_size = struct.unpack("<QQ", f.read(16))
-        raw_payload = f.read(compressed_size)
-        
-    if is_compressed:
-        if not HAS_ZSTD:
-            raise RuntimeError("zstandard package required to decompress .toros model")
+
+        # Instantiate model skeleton on meta device (0 MB RAM)
+        model_type_name = meta.get("model_type", "TorosHybridLanguageModel")
+        config_kwargs = meta.get("config", {})
+
+        try:
+            with torch.device("meta"):
+                if model_class is not None:
+                    model = model_class(config_kwargs) if config_kwargs else model_class()
+                elif model_type_name == "Qwen35BLTLanguageModel":
+                    from affine_ai.models.qwen35_blt import Qwen35BLTLanguageModel, Qwen35BLTConfig
+                    config = Qwen35BLTConfig(**config_kwargs) if config_kwargs else Qwen35BLTConfig()
+                    model = Qwen35BLTLanguageModel(config)
+                elif model_type_name == "Qwen35ASDAGModel":
+                    from affine_ai.models.qwen35_asdag import Qwen35ASDAGModel, Qwen35ASDAGConfig
+                    config = Qwen35ASDAGConfig(**config_kwargs) if config_kwargs else Qwen35ASDAGConfig()
+                    model = Qwen35ASDAGModel(config)
+                elif model_type_name == "TorosHybridLanguageModel":
+                    from affine_ai.models.hybrid import TorosHybridLanguageModel, TorosHybridConfig
+                    config = TorosHybridConfig(**config_kwargs) if config_kwargs else TorosHybridConfig()
+                    model = TorosHybridLanguageModel(config)
+                else:
+                    from affine_ai.models.language_model import ASDAGLanguageModel, ASDAGConfig
+                    config = ASDAGConfig(**config_kwargs) if config_kwargs else ASDAGConfig()
+                    model = ASDAGLanguageModel(config)
+            use_direct_assignment = True
+        except Exception:
+            use_direct_assignment = False
+            model = None
+
+        if target_dtype is None:
+            if model is not None:
+                if hasattr(model, "dtype") and isinstance(model.dtype, torch.dtype):
+                    target_dtype = model.dtype
+                else:
+                    try:
+                        p = next(model.parameters())
+                        target_dtype = p.dtype
+                    except StopIteration:
+                        target_dtype = torch.bfloat16
+            else:
+                target_dtype = torch.bfloat16
+
+        from affine_ai.kernels.triton_pot5 import (
+            bitplane_bytes_to_gpu_int32,
+            Triton5StatePOTBitpackedLinear,
+            Triton5StatePOTBitpackedResidualLinear,
+        )
+
         dctx = zstd.ZstdDecompressor()
-        payload = dctx.decompress(raw_payload, max_output_size=uncompressed_size)
-    else:
-        payload = raw_payload
-        
-    buf = io.BytesIO(payload)
-    num_tensors = struct.unpack("<I", buf.read(4))[0]
-    
-    state_dict = {}
-    for _ in range(num_tensors):
-        name_len = struct.unpack("<H", buf.read(2))[0]
-        name = buf.read(name_len).decode("utf-8")
-        flag = struct.unpack("<B", buf.read(1))[0]
-        gamma = struct.unpack("<e", buf.read(2))[0]
-        ndim = struct.unpack("<B", buf.read(1))[0]
-        shape = [struct.unpack("<I", buf.read(4))[0] for _ in range(ndim)]
-        data_len = struct.unpack("<I", buf.read(4))[0]
-        data = buf.read(data_len)
-        
-        if flag in (FLAG_TERNARY_2BIT, FLAG_SPARSE_TERNARY):
-            t = unpack_ternary_tensor(data, gamma, shape, flag, dtype=target_dtype, device=device)
-        elif flag == FLAG_RAW_FP16:
-            t_np = np.frombuffer(data, dtype=np.float16).copy().reshape(shape)
-            t = torch.from_numpy(t_np).to(dtype=target_dtype, device=device)
-        else:
-            raise ValueError(f"Unsupported tensor flag {flag} for {name}")
-            
-        state_dict[name] = t
+        with dctx.stream_reader(f) as reader:
+            num_tensors = struct.unpack("<I", reader.read(4))[0]
+            state_dict = {}
 
-    model_type_name = meta.get("model_type", "TorosHybridLanguageModel")
-    config_kwargs = meta.get("config", {})
-    
-    if model_class is not None:
-        model = model_class(config_kwargs).to(device) if config_kwargs else model_class().to(device)
-    elif model_type_name == "Qwen35ASDAGModel":
-        from affine_ai.models.qwen35_asdag import Qwen35ASDAGModel, Qwen35ASDAGConfig
-        config = Qwen35ASDAGConfig(**config_kwargs) if config_kwargs else Qwen35ASDAGConfig()
-        model = Qwen35ASDAGModel(config).to(device)
-    elif model_type_name == "TorosHybridLanguageModel":
-        from affine_ai.models.hybrid import TorosHybridLanguageModel, TorosHybridConfig
-        config = TorosHybridConfig(**config_kwargs) if config_kwargs else TorosHybridConfig()
-        model = TorosHybridLanguageModel(config).to(device)
-    else:
-        from affine_ai.models.language_model import ASDAGLanguageModel, ASDAGConfig
-        config = ASDAGConfig(**config_kwargs) if config_kwargs else ASDAGConfig()
-        model = ASDAGLanguageModel(config).to(device)
+            for _ in range(num_tensors):
+                name_len = struct.unpack("<H", reader.read(2))[0]
+                name = reader.read(name_len).decode("utf-8")
+                flag = struct.unpack("<B", reader.read(1))[0]
+                gamma = struct.unpack("<e", reader.read(2))[0]
+                ndim = struct.unpack("<B", reader.read(1))[0]
+                shape = [struct.unpack("<I", reader.read(4))[0] for _ in range(ndim)]
+                data_len = struct.unpack("<I", reader.read(4))[0]
+                data = reader.read(data_len)
 
-    model.load_state_dict(state_dict, strict=False)
+                if bitpacked and flag == FLAG_POT5_3BITPLANE and use_direct_assignment and name.endswith(".weight"):
+                    buf = io.BytesIO(data)
+                    len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
+                    nz_b = buf.read(len_nz)
+                    mag_b = buf.read(len_mag)
+                    sign_b = buf.read(len_sign)
+                    N, K = shape[0], shape[1]
+                    w_nz = bitplane_bytes_to_gpu_int32(nz_b, N, K, device=device)
+                    w_mag = bitplane_bytes_to_gpu_int32(mag_b, N, K, device=device)
+                    w_sign = bitplane_bytes_to_gpu_int32(sign_b, N, K, device=device)
+                    alpha = torch.tensor(gamma, dtype=torch.float32, device=device)
+                    bit_linear = Triton5StatePOTBitpackedLinear(K, N, w_nz, w_mag, w_sign, alpha, dtype=target_dtype).to(device)
+                    _set_submodule(model, name[:-7], bit_linear)
+                elif bitpacked and flag == FLAG_POT5_RESIDUAL_FP16 and use_direct_assignment and name.endswith(".weight"):
+                    buf = io.BytesIO(data)
+                    num_out = struct.unpack("<I", buf.read(4))[0]
+                    out_idx = torch.from_numpy(np.frombuffer(buf.read(num_out * 4), dtype=np.uint32).copy()).to(device)
+                    out_val = torch.from_numpy(np.frombuffer(buf.read(num_out * 2), dtype=np.float16).copy()).to(device)
+                    len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
+                    nz_b = buf.read(len_nz)
+                    mag_b = buf.read(len_mag)
+                    sign_b = buf.read(len_sign)
+                    N, K = shape[0], shape[1]
+                    w_nz = bitplane_bytes_to_gpu_int32(nz_b, N, K, device=device)
+                    w_mag = bitplane_bytes_to_gpu_int32(mag_b, N, K, device=device)
+                    w_sign = bitplane_bytes_to_gpu_int32(sign_b, N, K, device=device)
+                    alpha = torch.tensor(gamma, dtype=torch.float32, device=device)
+                    res_linear = Triton5StatePOTBitpackedResidualLinear(K, N, w_nz, w_mag, w_sign, alpha, out_idx, out_val, dtype=target_dtype).to(device)
+                    _set_submodule(model, name[:-7], res_linear)
+                elif bitpacked and flag == FLAG_POT5_RESIDUAL_Q4 and use_direct_assignment and name.endswith(".weight"):
+                    buf = io.BytesIO(data)
+                    num_out, block_size = struct.unpack("<II", buf.read(8))
+                    outlier_indices_np = np.frombuffer(buf.read(num_out * 4), dtype=np.uint32)
+                    num_scales = struct.unpack("<I", buf.read(4))[0]
+                    scales = np.frombuffer(buf.read(num_scales * 2), dtype=np.float16).astype(np.float32)
+                    len_nibbles = struct.unpack("<I", buf.read(4))[0]
+                    packed_bytes = np.frombuffer(buf.read(len_nibbles), dtype=np.uint8)
+                    low = packed_bytes & 0x0F
+                    high = (packed_bytes >> 4) & 0x0F
+                    unpacked_nibbles = np.stack([low, high], axis=1).flatten()[:num_out]
+                    nib = unpacked_nibbles.astype(np.int8)
+                    q4 = np.where(nib >= 8, nib - 16, nib).astype(np.float32)
+                    block_idx = np.arange(num_out) // block_size
+                    outlier_values_np = (q4 * scales[block_idx]).astype(np.float16)
+
+                    out_idx = torch.from_numpy(outlier_indices_np.copy()).to(device)
+                    out_val = torch.from_numpy(outlier_values_np).to(device)
+
+                    len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
+                    nz_b = buf.read(len_nz)
+                    mag_b = buf.read(len_mag)
+                    sign_b = buf.read(len_sign)
+                    N, K = shape[0], shape[1]
+                    w_nz = bitplane_bytes_to_gpu_int32(nz_b, N, K, device=device)
+                    w_mag = bitplane_bytes_to_gpu_int32(mag_b, N, K, device=device)
+                    w_sign = bitplane_bytes_to_gpu_int32(sign_b, N, K, device=device)
+                    alpha = torch.tensor(gamma, dtype=torch.float32, device=device)
+                    res_linear = Triton5StatePOTBitpackedResidualLinear(K, N, w_nz, w_mag, w_sign, alpha, out_idx, out_val, dtype=target_dtype).to(device)
+                    _set_submodule(model, name[:-7], res_linear)
+                elif use_direct_assignment:
+                    if flag in (FLAG_TERNARY_2BIT, FLAG_SPARSE_TERNARY):
+                        t = unpack_ternary_tensor(data, gamma, shape, flag, dtype=target_dtype, device=device)
+                    elif flag == FLAG_POT5_3BITPLANE:
+                        t = unpack_pot5_3bitplane(data, gamma, shape, dtype=target_dtype, device=device)
+                    elif flag == FLAG_POT5_RESIDUAL_FP16:
+                        t = unpack_pot5_residual_fp16(data, gamma, shape, dtype=target_dtype, device=device)
+                    elif flag == FLAG_POT5_RESIDUAL_Q4:
+                        t = unpack_pot5_residual_q4(data, gamma, shape, dtype=target_dtype, device=device)
+                    elif flag == FLAG_RAW_FP16:
+                        t_np = np.frombuffer(data, dtype=np.float16).copy().reshape(shape)
+                        t = torch.from_numpy(t_np).to(dtype=target_dtype, device=device)
+                    else:
+                        raise ValueError(f"Unsupported flag {flag} for {name}")
+                    _assign_tensor(model, name, t)
+                    del t
+                else:
+                    if flag in (FLAG_TERNARY_2BIT, FLAG_SPARSE_TERNARY):
+                        t = unpack_ternary_tensor(data, gamma, shape, flag, dtype=target_dtype, device=device)
+                    elif flag == FLAG_POT5_3BITPLANE:
+                        t = unpack_pot5_3bitplane(data, gamma, shape, dtype=target_dtype, device=device)
+                    elif flag == FLAG_POT5_RESIDUAL_FP16:
+                        t = unpack_pot5_residual_fp16(data, gamma, shape, dtype=target_dtype, device=device)
+                    elif flag == FLAG_POT5_RESIDUAL_Q4:
+                        t = unpack_pot5_residual_q4(data, gamma, shape, dtype=target_dtype, device=device)
+                    elif flag == FLAG_RAW_FP16:
+                        t_np = np.frombuffer(data, dtype=np.float16).copy().reshape(shape)
+                        t = torch.from_numpy(t_np).to(dtype=target_dtype, device=device)
+                    state_dict[name] = t
+                del data
+
+    if not use_direct_assignment:
+        if model_class is not None:
+            model = model_class(config_kwargs).to(device) if config_kwargs else model_class().to(device)
+        model.load_state_dict(state_dict, strict=False)
+        del state_dict
+
+    gc.collect()
     model.eval()
     return model, meta

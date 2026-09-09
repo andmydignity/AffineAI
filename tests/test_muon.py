@@ -71,3 +71,38 @@ def test_hybrid_muon_adamw_optimization_step():
     opt.step()
 
     assert not torch.isnan(loss)
+
+
+def test_muon_step_batched_grouping_parity():
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+
+    for device in devices:
+        torch.manual_seed(42)
+        shapes = [(32, 32), (32, 32), (32, 128), (128, 32), (32, 128), (16, 48)]
+        params_batched = [torch.nn.Parameter(torch.randn(s, device=device)) for s in shapes]
+        params_unbatched = [torch.nn.Parameter(p.clone().detach()) for p in params_batched]
+
+        for p_b, p_u in zip(params_batched, params_unbatched):
+            g = torch.randn_like(p_b)
+            p_b.grad = g.clone()
+            p_u.grad = g.clone()
+
+        opt_batched = Muon(params_batched, lr=0.02, momentum=0.95, nesterov=True)
+        opt_batched.step()
+
+        # Compute unbatched step manually
+        lr = 0.02
+        momentum = 0.95
+        for p in params_unbatched:
+            buf = torch.zeros_like(p.grad)
+            buf.mul_(momentum).add_(p.grad)
+            update_grad = p.grad.add(buf, alpha=momentum)
+            up = zeropower_via_newtonschulz5(update_grad, steps=5)
+            p.data.add_(up, alpha=-lr)
+
+        for i, (p_b, p_u) in enumerate(zip(params_batched, params_unbatched)):
+            diff = (p_b - p_u).abs().max().item()
+            assert diff < 1e-2, f"Parity mismatch on {device} for shape {shapes[i]}: diff {diff}"
+

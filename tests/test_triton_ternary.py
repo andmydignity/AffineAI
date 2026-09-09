@@ -160,3 +160,47 @@ def test_triton_popc_unpadded_parity():
         assert out_dot.shape == (M, N)
         diff = (out_dot - ref_dot).abs().max().item()
         assert diff == 0, f"Unpadded POPC dot diff for D={D}: max diff={diff}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton ternary tests")
+def test_triton_quantize_x_and_fast_gw():
+    from affine_ai.kernels.triton_ternary import (
+        triton_quantize_x,
+        triton_row_amax,
+        triton_ternary_linear_gw,
+        _ternary_gw_kernel,
+        _grid,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    M, N, K = 128, 96, 64
+    go = torch.randn(M, N, device=device)
+    x = torch.randn(M, K, device=device)
+    amax = triton_row_amax(x)
+
+    # 1. Test pre-quantization
+    xq = triton_quantize_x(x, amax)
+    assert xq.shape == (M, K)
+    assert not torch.isnan(xq).any()
+
+    # 2. Test triton_ternary_linear_gw with x_q
+    gw_prequant = triton_ternary_linear_gw(go, None, None, N, K, x_q=xq)
+
+    # 3. Test triton_ternary_linear_gw without x_q (internally quantizes)
+    gw_autoquant = triton_ternary_linear_gw(go, x, amax, N, K)
+    assert torch.equal(gw_prequant, gw_autoquant)
+
+    # 4. Compare against legacy _ternary_gw_kernel
+    gw_legacy = torch.empty((N, K), device=device, dtype=torch.float32)
+    _ternary_gw_kernel[_grid(N, K, 32, 64)](
+        go, x, amax, gw_legacy,
+        go.stride(0), go.stride(1), x.stride(0), x.stride(1),
+        gw_legacy.stride(0), gw_legacy.stride(1),
+        M, N, K, BLOCK_M=64, BLOCK_N=32, BLOCK_K=64,
+        num_warps=4, num_stages=2,
+    )
+    diff = (gw_prequant - gw_legacy).abs().max().item()
+    assert diff == 0.0, f"Discrepancy between fast prequant gw and legacy gw: {diff}"
+

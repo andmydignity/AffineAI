@@ -36,8 +36,12 @@ class TorosHybridConfig:
     n_heads: int = 4
     target_patch_size: int = 16
     channel_mixer_type: str = "asdag_tree"
+    mlp_hidden_dim: int = 84
     time_mixer_rule: str = "gla"
     gen_loss_weight: float = 1.0
+    use_conv_prefix: bool = True
+    conv_kernel_size: int = 4
+    use_dense_readout: bool = True
     # Stripped JEPA/System-2 fields kept for checkpoint compat (ignored):
     # n_predictor_layers, jepa_loss_weight, sigreg_*, mask_* are deprecated.
     # Unlikelihood (objective anti-repetition, not System-2) kept behind flag:
@@ -60,10 +64,17 @@ class TorosHybridConfig:
     num_mtp_heads: int = 2
     compile_forward: bool = False
     mtp_lambda: float = 0.3
+    context_window: int = 2048
+    max_seq_len: int = 2048
     dtype: Any = torch.bfloat16
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
     def __init__(self, **kwargs):
+        if "context_window" in kwargs and "max_seq_len" not in kwargs:
+            kwargs["max_seq_len"] = kwargs["context_window"]
+        elif "max_seq_len" in kwargs and "context_window" not in kwargs:
+            kwargs["context_window"] = kwargs["max_seq_len"]
+
         for f in fields(self):
             if f.name in kwargs:
                 setattr(self, f.name, kwargs[f.name])
@@ -78,9 +89,81 @@ class TorosHybridConfig:
 # Keep a module-level alias for old imports: TorosHybridConfig fields are superset-compat.
 # Old checkpoints may contain jepa_loss_weight etc.; __init__ above ignores them.
 
+
+
+_EOS_TENSOR_CACHE: Dict[Tuple[bytes, str, int, torch.dtype], torch.Tensor] = {}
+
+def _get_eos_tensor(eos_bytes: bytes, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    dev_type = device.type
+    dev_idx = device.index if device.index is not None else 0
+    key = (eos_bytes, dev_type, dev_idx, dtype)
+    t = _EOS_TENSOR_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(list(eos_bytes), dtype=dtype, device=device)
+        _EOS_TENSOR_CACHE[key] = t
+    return t
+
+def compute_document_reset_mask(
+    byte_ids: torch.Tensor,
+    patch_size: int = 16,
+    pad_id: int = 0,
+    eos_token: Any = "<|endoftext|>",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes boolean reset masks to ensure zero state remnants across documents.
+    100% static tensor ops without CPU-GPU synchronization, safe for CUDA Graph capture.
+    Returns:
+        byte_reset_mask: [B, T] True at the first byte of every new document/data segment.
+        patch_reset_mask: [B, M] True at every patch belonging to a new document boundary.
+    """
+    B, T = byte_ids.shape
+    device = byte_ids.device
+    M = (T + patch_size - 1) // patch_size
+    byte_reset = torch.zeros((B, T), dtype=torch.bool, device=device)
+
+    # Position 0 of any independent sequence is a fresh document start
+    byte_reset[:, 0] = True
+
+    # Detect pad_id or byte 0 transitions
+    is_pad_or_zero = (byte_ids == pad_id) | (byte_ids == 0)
+    if T > 1:
+        starts_after_pad = is_pad_or_zero[:, :-1] & (~is_pad_or_zero[:, 1:])
+        byte_reset[:, 1:] = byte_reset[:, 1:] | starts_after_pad
+
+    # Detect <|endoftext|> sequence marker if present
+    if isinstance(eos_token, str):
+        eos_bytes = eos_token.encode("utf-8")
+    elif isinstance(eos_token, (bytes, bytearray)):
+        eos_bytes = bytes(eos_token)
+    elif isinstance(eos_token, int):
+        eos_bytes = bytes([eos_token % 256])
+    else:
+        eos_bytes = b"<|endoftext|>"
+
+    L = len(eos_bytes)
+    if 1 < L <= T:
+        eos_t = _get_eos_tensor(eos_bytes, device, byte_ids.dtype)
+        match = (byte_ids[:, :T - L + 1] == eos_t[0])
+        for i in range(1, L):
+            match = match & (byte_ids[:, i : T - L + 1 + i] == eos_t[i])
+        if T > L:
+            byte_reset[:, L:] = byte_reset[:, L:] | match[:, :T - L]
+
+    if T == M * patch_size:
+        patch_reset = byte_reset.view(B, M, patch_size).any(dim=-1)
+    else:
+        pad_len = M * patch_size - T
+        byte_reset_padded = F.pad(byte_reset, (0, pad_len), value=False)
+        patch_reset = byte_reset_padded.view(B, M, patch_size).any(dim=-1)
+    patch_reset[:, 0] = True
+
+    return byte_reset, patch_reset
+
+
 class TorosHybridLanguageModel(nn.Module):
     """
     Stripped Toros-Hybrid: patch-latent encoder + causal byte decoder.
+
     No predictor, no latent local heads, no masked JEPA. Use
     affine_ai.core.lpc.LocalPredictiveLanguageModel for System-1 LPC training
     if local per-layer updates are desired.
@@ -92,6 +175,9 @@ class TorosHybridLanguageModel(nn.Module):
             allowed = {f.name for f in fields(TorosHybridConfig)}
             config = TorosHybridConfig(**{k: v for k, v in config.items() if k in allowed})
         self.config = config or TorosHybridConfig()
+        if self.config.dtype == torch.bfloat16 and torch.cuda.is_available():
+            if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+                self.config.dtype = torch.float16
         
         jepa_cfg = TorosJEPAConfig(
             dim=self.config.dim,
@@ -100,7 +186,10 @@ class TorosHybridLanguageModel(nn.Module):
             n_heads=self.config.n_heads,
             target_patch_size=self.config.target_patch_size,
             channel_mixer_type=self.config.channel_mixer_type,
+            mlp_hidden_dim=getattr(self.config, 'mlp_hidden_dim', 84),
             time_mixer_rule=getattr(self.config, 'time_mixer_rule', 'gla'),
+            use_conv_prefix=getattr(self.config, 'use_conv_prefix', True),
+            conv_kernel_size=getattr(self.config, 'conv_kernel_size', 4),
             dtype=self.config.dtype
         )
         self.context_encoder = TorosEncoder(jepa_cfg)
@@ -113,6 +202,13 @@ class TorosHybridLanguageModel(nn.Module):
         )
         self.sos_patch = nn.Parameter(torch.zeros(1, 1, self.config.dim))
         nn.init.normal_(self.sos_patch, mean=0.0, std=0.02)
+        self.vocab_size = getattr(self.config, 'vocab_size', 256)
+
+        if getattr(self.config, 'use_dense_readout', True):
+            self.layer_readout_weights = nn.Parameter(torch.zeros(self.config.n_encoder_layers + 1))
+            with torch.no_grad():
+                self.layer_readout_weights.fill_(0.0)
+                self.layer_readout_weights[-1] = 1.5
 
         if getattr(self.config, 'use_rls_heads', False):
             from affine_ai.core.rls_head import RLSPredictiveHead
@@ -156,6 +252,62 @@ class TorosHybridLanguageModel(nn.Module):
             except Exception:
                 pass
 
+    @property
+    def context_window(self) -> int:
+        return getattr(self.config, 'context_window', getattr(self.config, 'max_seq_len', 2048))
+
+    @context_window.setter
+    def context_window(self, val: int):
+        self.config.context_window = int(val)
+        self.config.max_seq_len = int(val)
+
+    @property
+    def channel_mixer_type(self) -> str:
+        return getattr(self.config, 'channel_mixer_type', 'asdag_tree')
+
+    @channel_mixer_type.setter
+    def channel_mixer_type(self, val: str):
+        self.config.channel_mixer_type = str(val)
+
+    @property
+    def time_mixer_rule(self) -> str:
+        return getattr(self.config, 'time_mixer_rule', 'gla')
+
+    @time_mixer_rule.setter
+    def time_mixer_rule(self, val: str):
+        self.config.time_mixer_rule = str(val)
+
+    def enable_mtp(self, num_mtp_heads: int = 2, mtp_lambda: float = 0.3):
+        """Enables Multi-Token Prediction (MTP) with auxiliary heads."""
+        self.config.use_mtp = True
+        self.config.num_mtp_heads = int(num_mtp_heads)
+        self.config.mtp_lambda = float(mtp_lambda)
+        from affine_ai.models.mtp import ASDAGMTPModule
+        dev = next(self.parameters()).device
+        self.mtp = ASDAGMTPModule(
+            d_model=self.config.d_byte,
+            vocab_size=256,
+            num_mtp_heads=self.config.num_mtp_heads,
+            mtp_lambda=self.config.mtp_lambda,
+            dtype=self.config.dtype,
+        ).to(dev)
+        return self.mtp
+
+    def disable_mtp(self):
+        """Disables Multi-Token Prediction."""
+        self.config.use_mtp = False
+        if hasattr(self, 'mtp'):
+            delattr(self, 'mtp')
+
+    def reset_context(self):
+        """
+        Resets any cached states or context buffers to ensure no remnants of previous data.
+        Flushes cached LPC CUDA Graph runners so new shapes/contexts compile cleanly.
+        """
+        self._lpc_graph_runner = None
+
+
+
     def get_default_optimizers(
         self,
         lr: float = 1e-3,
@@ -174,6 +326,12 @@ class TorosHybridLanguageModel(nn.Module):
                     nn.ModuleList(mods), muon_lr=muon_lr, adamw_lr=lr, adamw_weight_decay=weight_decay
                 ))
             tail_mods = [self.byte_decoder]
+            tail_params = [self.sos_patch]
+            if hasattr(self, 'layer_readout_weights'):
+                tail_params.append(self.layer_readout_weights)
+            tail_mods.append(nn.ParameterList(tail_params))
+            if hasattr(self, 'mtp'):
+                tail_mods.append(self.mtp)
             optimizers.append(HybridMuonAdamW(
                 nn.ModuleList(tail_mods), muon_lr=muon_lr, adamw_lr=lr, adamw_weight_decay=weight_decay
             ))
@@ -187,6 +345,8 @@ class TorosHybridLanguageModel(nn.Module):
             optimizers.append(torch.optim.AdamW(layer_params, lr=lr, weight_decay=weight_decay))
 
         tail_params = list(self.byte_decoder.parameters()) + [self.sos_patch]
+        if hasattr(self, 'layer_readout_weights'):
+            tail_params.append(self.layer_readout_weights)
         if hasattr(self, 'mtp'):
             tail_params += list(self.mtp.parameters())
         optimizers.append(torch.optim.AdamW(tail_params, lr=lr, weight_decay=weight_decay))
@@ -223,32 +383,64 @@ class TorosHybridLanguageModel(nn.Module):
         use_muon: bool = True,
         muon_lr: float = 0.02,
         muon_momentum: float = 0.95,
+        capturable: Optional[bool] = None,
     ) -> List[Any]:
         self.enable_lpc()
         assert self.local_heads is not None
+        if capturable is None:
+            try:
+                capturable = next(self.parameters()).is_cuda
+            except Exception:
+                capturable = False
         optimizers: List[Any] = []
         if use_muon:
             from affine_ai.optim.muon import HybridMuonAdamW
             for i, block in enumerate(self.context_encoder.blocks):
                 mods = [block, self.local_heads[i]]
-                if i == 0:
-                    mods += [self.context_encoder.byte_encoder, self.context_encoder.patcher]
-                optimizers.append(HybridMuonAdamW(nn.ModuleList(mods), muon_lr=muon_lr, adamw_lr=lr, adamw_weight_decay=weight_decay))
-            tail_mods: List[nn.Module] = [self.context_encoder.norm_out, self.byte_decoder]
+                optimizers.append(HybridMuonAdamW(
+                    nn.ModuleList(mods),
+                    muon_lr=muon_lr,
+                    adamw_lr=lr,
+                    adamw_weight_decay=weight_decay,
+                    capturable=capturable,
+                ))
+            enc_mods = nn.ModuleList([self.context_encoder.byte_encoder, self.context_encoder.patcher])
+            optimizers.append(HybridMuonAdamW(
+                enc_mods,
+                muon_lr=muon_lr,
+                adamw_lr=lr,
+                adamw_weight_decay=weight_decay,
+                capturable=capturable,
+            ))
+            tail_mods: List[Any] = [self.context_encoder.norm_out, self.byte_decoder]
+            tail_params = [self.sos_patch]
+            if hasattr(self, 'layer_readout_weights'):
+                tail_params.append(self.layer_readout_weights)
+            tail_mods.append(nn.ParameterList(tail_params))
             if hasattr(self, 'mtp'):
                 tail_mods.append(self.mtp)
-            optimizers.append(HybridMuonAdamW(nn.ModuleList(tail_mods), muon_lr=muon_lr, adamw_lr=lr, adamw_weight_decay=weight_decay))
+            optimizers.append(HybridMuonAdamW(
+                nn.ModuleList(tail_mods),
+                muon_lr=muon_lr,
+                adamw_lr=lr,
+                adamw_weight_decay=weight_decay,
+                capturable=capturable,
+            ))
             return optimizers
+        adamw_kwargs: Dict[str, Any] = {"lr": lr, "weight_decay": weight_decay}
+        if capturable:
+            adamw_kwargs["capturable"] = True
         for i, block in enumerate(self.context_encoder.blocks):
             params = list(block.parameters()) + list(self.local_heads[i].parameters())
-            if i == 0:
-                params += list(self.context_encoder.byte_encoder.parameters())
-                params += list(self.context_encoder.patcher.parameters())
-            optimizers.append(torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay))
+            optimizers.append(torch.optim.AdamW(params, **adamw_kwargs))
+        enc_params = list(self.context_encoder.byte_encoder.parameters()) + list(self.context_encoder.patcher.parameters())
+        optimizers.append(torch.optim.AdamW(enc_params, **adamw_kwargs))
         tail_params = list(self.context_encoder.norm_out.parameters()) + list(self.byte_decoder.parameters()) + [self.sos_patch]
+        if hasattr(self, 'layer_readout_weights'):
+            tail_params.append(self.layer_readout_weights)
         if hasattr(self, 'mtp'):
             tail_params += list(self.mtp.parameters())
-        optimizers.append(torch.optim.AdamW(tail_params, lr=lr, weight_decay=weight_decay))
+        optimizers.append(torch.optim.AdamW(tail_params, **adamw_kwargs))
         return optimizers
 
     def get_lpc_optimizers(self, *args, **kwargs) -> List[Any]:
@@ -262,55 +454,162 @@ class TorosHybridLanguageModel(nn.Module):
         grad_clip: float = 1.0,
         ignore_index: int = -100,
         stride: int = 1,
-        use_async_pipelining: bool = True,
+        use_async_pipelining: bool = False,
         sync_loss: bool = False,
+        return_sample_loss: bool = False,
+        use_cuda_graph: bool = True,
+        use_compiled_blocks: bool = False,
+        reset_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
+        if use_compiled_blocks and byte_ids.is_cuda:
+            try:
+                import torch as _torch
+                capable = True
+                try:
+                    capable = tuple(_torch.cuda.get_device_capability()) >= (8, 9)
+                except Exception:
+                    capable = False
+                if capable and not getattr(self, '_lpc_blocks_compiled', False):
+                    for blk in self.context_encoder.blocks:
+                        try:
+                            blk.forward = _torch.compile(blk.forward, mode="reduce-overhead", dynamic=False, fullgraph=False)
+                        except Exception:
+                            break
+                    self._lpc_blocks_compiled = True
+                    self._lpc_graph_runner = None
+            except Exception:
+                pass
+        # Fast path: Zero-overhead CUDA Graph replay when running on CUDA with static shapes
+        if use_cuda_graph and byte_ids.is_cuda and not return_sample_loss and not sync_loss:
+            runner = getattr(self, "_lpc_graph_runner", None)
+            if (
+                runner is not None
+                and runner.static_inputs[0].shape == byte_ids.shape
+                and runner.static_inputs[0].dtype == byte_ids.dtype
+            ):
+                return runner.step(byte_ids, targets)
+            else:
+                try:
+                    self._lpc_graph_runner = self.capture_lpc_graph(
+                        byte_ids, targets, optimizers,
+                        warmup_iters=3,
+                        grad_clip=grad_clip,
+                        ignore_index=ignore_index,
+                        stride=stride,
+                    )
+                    return self._lpc_graph_runner.step(byte_ids, targets)
+                except Exception:
+                    self._lpc_graph_runner = None
+                    # Fall through to eager execution
+
         self.enable_lpc()
         assert self.local_heads is not None
         B, T = byte_ids.shape
         P = self.config.target_patch_size
         h_byte, boundary = self.context_encoder.byte_encoder(byte_ids)
         latent_patches, patch_assignments = self.context_encoder.patcher(
-            h_byte, torch.zeros_like(boundary), fixed_patch_size=P
+            h_byte, None, fixed_patch_size=P
         )
         M = latent_patches.shape[1]
+
+        # Document boundary reset mask: Flush recurrent state & context remnants across documents
+        if reset_mask is None:
+            _, patch_reset_mask = compute_document_reset_mask(byte_ids, patch_size=P, pad_id=getattr(self.config, 'pad_id', 0))
+        else:
+            patch_reset_mask = reset_mask if reset_mask.shape[1] == M else reset_mask[:, ::P]
+
         tp = targets[:, ::P]
         if tp.shape[1] > M:
             tp = tp[:, :M]
         elif tp.shape[1] < M:
-            pad = torch.full((B, M - tp.shape[1]), ignore_index, device=tp.device, dtype=tp.dtype)
-            tp = torch.cat([tp, pad], dim=1)
+            tp_padded = targets.new_full((B, M), ignore_index)
+            tp_padded[:, :tp.shape[1]] = tp
+            tp = tp_padded
         sub_targets = tp[:, ::stride] if stride > 1 else tp
         is_cuda = byte_ids.is_cuda
+        if is_cuda and use_async_pipelining:
+            if getattr(self, '_opt_stream', None) is None or self._opt_stream.device != byte_ids.device:
+                self._opt_stream = torch.cuda.Stream(device=byte_ids.device)
+            opt_stream = self._opt_stream
+            bwd_done_event = torch.cuda.Event()
+        else:
+            opt_stream = None
+            bwd_done_event = None
+
         curr_h = latent_patches
         layer_losses: List[Any] = []
+        n_blocks = len(self.context_encoder.blocks)
+        has_enc_tail = len(optimizers) == n_blocks + 2
+        if has_enc_tail:
+            optimizers[n_blocks].zero_grad(set_to_none=is_cuda)
         for idx, block in enumerate(self.context_encoder.blocks):
             if idx == 0:
-                next_h = block(curr_h)
+                next_h = block(curr_h, reset_mask=patch_reset_mask)
             else:
                 curr_h = curr_h.detach()
                 curr_h_in = curr_h.requires_grad_(True)
-                next_h = block(curr_h_in)
+                next_h = block(curr_h_in, reset_mask=patch_reset_mask)
             h_sub = next_h[:, ::stride] if stride > 1 else next_h
             _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
             opt_i = optimizers[idx]
+
             opt_i.zero_grad(set_to_none=is_cuda)
             loss_i.backward()
             if grad_clip > 0:
-                params = []
-                for pg in opt_i.param_groups:
-                    params.extend(pg['params'])
-                torch.nn.utils.clip_grad_norm_(params, grad_clip)
-            opt_i.step()
-            opt_i.zero_grad(set_to_none=is_cuda)
+                opt_params = [p for pg in opt_i.param_groups for p in pg['params'] if p.grad is not None]
+                if opt_params:
+                    torch.nn.utils.clip_grad_norm_(opt_params, grad_clip, foreach=True)
+
+            if is_cuda and use_async_pipelining and opt_stream is not None:
+                bwd_done_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(opt_stream):
+                    opt_stream.wait_event(bwd_done_event)
+                    opt_i.step()
+                    opt_i.zero_grad(set_to_none=True)
+            else:
+                opt_i.step()
+                opt_i.zero_grad(set_to_none=is_cuda)
+
             layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
             curr_h = next_h.detach() if idx == 0 else next_h
+
+        if is_cuda and use_async_pipelining and opt_stream is not None:
+            torch.cuda.current_stream().wait_stream(opt_stream)
+
+        if has_enc_tail:
+            opt_enc = optimizers[n_blocks]
+            if grad_clip > 0:
+                enc_params = [p for pg in opt_enc.param_groups for p in pg['params'] if p.grad is not None]
+                if enc_params:
+                    torch.nn.utils.clip_grad_norm_(enc_params, grad_clip, foreach=True)
+            opt_enc.step()
+            opt_enc.zero_grad(set_to_none=is_cuda)
+
         curr_h_det = curr_h.detach().requires_grad_(True)
         final_h = self.context_encoder.norm_out(curr_h_det)
         causal = torch.cat([self.sos_patch.expand(B, 1, -1), final_h[:, :-1]], dim=1)
+        causal = torch.where(patch_reset_mask.unsqueeze(-1), self.sos_patch.expand(B, M, -1), causal)
+
         h_byte_det = h_byte.detach()
-        use_fused = not h_byte_det.is_cuda and torch.is_grad_enabled()
-        if use_fused:
+        use_fused = not h_byte_det.is_cuda and torch.is_grad_enabled() and not return_sample_loss
+        sample_losses = None
+        has_mtp = getattr(self.config, 'use_mtp', False) and hasattr(self, 'mtp')
+        mtp_loss = None
+        mtp_dict = {}
+        if has_mtp:
+            logits, h_decoded_mtp = self.byte_decoder(
+                h_byte_det, causal, patch_assignments, return_hidden=True
+            )
+            _, mtp_loss, mtp_dict = self.mtp(h_decoded_mtp, targets=targets, ignore_index=ignore_index)
+            if return_sample_loss:
+                sample_loss_raw = F.cross_entropy(logits.view(-1, 256), targets.view(-1), reduction='none', ignore_index=ignore_index).view(B, T)
+                loss_final = sample_loss_raw.mean()
+                sample_losses = sample_loss_raw.mean(dim=-1).detach()
+            else:
+                loss_final = F.cross_entropy(logits.view(-1, 256), targets.view(-1), ignore_index=ignore_index)
+            if mtp_loss is not None:
+                loss_final = loss_final + mtp_loss
+        elif use_fused:
             try:
                 from affine_ai.core.cpp_ops import asdag_cpu_blt_2layer_decoder_loss
                 loss_final = asdag_cpu_blt_2layer_decoder_loss(
@@ -328,34 +627,100 @@ class TorosHybridLanguageModel(nn.Module):
             except Exception:
                 logits = self.byte_decoder(h_byte_det, causal, patch_assignments)
                 loss_final = F.cross_entropy(logits.view(-1, 256), targets.view(-1), ignore_index=ignore_index)
+        elif h_byte_det.is_cuda and torch.is_grad_enabled() and not return_sample_loss:
+            try:
+                from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
+                _, h_decoded = self.byte_decoder(
+                    h_byte_det, causal, patch_assignments, return_hidden=True, return_logits=False
+                )
+                lm_head = self.byte_decoder.lm_head
+                if hasattr(lm_head, "quantize_input_and_weight"):
+                    h_in, w_in = lm_head.quantize_input_and_weight(h_decoded)
+                    loss_final = triton_fused_linear_cross_entropy(h_in, w_in, targets, ignore_index=ignore_index)
+                else:
+                    loss_final = triton_fused_linear_cross_entropy(h_decoded, lm_head.weight, targets, ignore_index=ignore_index)
+                # NaN guard: Triton kernel can overflow on wide BF16 models; fall through to fp32
+                if loss_final.isnan().any():
+                    raise RuntimeError("triton CE returned NaN")
+            except Exception:
+                logits = self.byte_decoder(h_byte_det, causal, patch_assignments)
+                loss_final = F.cross_entropy(logits.float().view(-1, 256), targets.view(-1), ignore_index=ignore_index)
         else:
             logits = self.byte_decoder(h_byte_det, causal, patch_assignments)
-            loss_final = F.cross_entropy(logits.view(-1, 256), targets.view(-1), ignore_index=ignore_index)
+            if return_sample_loss:
+                sample_loss_raw = F.cross_entropy(logits.float().view(-1, 256), targets.view(-1), reduction='none', ignore_index=ignore_index).view(B, T)
+                loss_final = sample_loss_raw.mean()
+                sample_losses = sample_loss_raw.mean(dim=-1).detach()
+            else:
+                loss_final = F.cross_entropy(logits.float().view(-1, 256), targets.view(-1), ignore_index=ignore_index)
         opt_final = optimizers[-1]
         opt_final.zero_grad(set_to_none=is_cuda)
         loss_final.backward()
         if grad_clip > 0:
-            params = []
-            for pg in opt_final.param_groups:
-                params.extend(pg['params'])
-            torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            final_params = [p for pg in opt_final.param_groups for p in pg['params'] if p.grad is not None]
+            if final_params:
+                torch.nn.utils.clip_grad_norm_(final_params, grad_clip, foreach=True)
         opt_final.step()
         opt_final.zero_grad(set_to_none=is_cuda)
         if sync_loss:
-            return {
+            res = {
                 "loss": loss_final.item(),
                 "layer_losses": layer_losses,
                 "mean_local_loss": sum(layer_losses) / len(layer_losses) if layer_losses else loss_final.item(),
-                "loss_total": loss_final.item()
+                "loss_total": loss_final.item(),
+                "sample_loss": sample_losses
             }
+            if mtp_loss is not None:
+                res["loss_mtp"] = mtp_loss.item()
+                res.update(mtp_dict)
+            return res
         else:
             loss_det = loss_final.detach()
-            return {
+            res = {
                 "loss": loss_det,
                 "layer_losses": layer_losses,
                 "mean_local_loss": torch.stack(layer_losses).mean() if layer_losses else loss_det,
-                "loss_total": loss_det
+                "loss_total": loss_det,
+                "sample_loss": sample_losses
             }
+            if mtp_loss is not None:
+                res["loss_mtp"] = mtp_loss.detach()
+                res.update(mtp_dict)
+            return res
+
+
+    def capture_lpc_graph(
+        self,
+        sample_byte_ids: torch.Tensor,
+        sample_targets: torch.Tensor,
+        optimizers: List[Any],
+        warmup_iters: int = 3,
+        grad_clip: float = 1.0,
+        ignore_index: int = -100,
+        stride: int = 1,
+    ) -> Any:
+        """
+        Captures the entire forward_lpc_step (forward + backward + optimizer updates)
+        into a dedicated CUDA Graph via CUDAGraphRunner for zero-overhead execution.
+        """
+        from affine_ai.core.cuda_graph import CUDAGraphRunner
+
+        def step_fn(bx: torch.Tensor, by: torch.Tensor):
+            return self.forward_lpc_step(
+                bx, by, optimizers,
+                grad_clip=grad_clip,
+                ignore_index=ignore_index,
+                stride=stride,
+                use_async_pipelining=False,
+                sync_loss=False,
+                use_cuda_graph=False,
+            )
+
+        return CUDAGraphRunner(
+            step_fn=step_fn,
+            sample_inputs=(sample_byte_ids, sample_targets),
+            warmup_iters=warmup_iters,
+        )
 
     def update_target_encoder(self, *args, **kwargs):
         """Deprecated stub: JEPA target encoder removed. No-op for checkpoint compat."""
@@ -404,6 +769,7 @@ class TorosHybridLanguageModel(nn.Module):
         byte_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         return_logits: bool = True,
+        reset_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
         B, T = byte_ids.shape
@@ -441,12 +807,27 @@ class TorosHybridLanguageModel(nn.Module):
                 h_byte, torch.zeros_like(boundary_logits), fixed_patch_size=self.config.target_patch_size
             )
         
+        # Document boundary reset mask: Flush recurrent state & context remnants across documents
+        if reset_mask is None:
+            _, patch_reset_mask = compute_document_reset_mask(
+                byte_ids, patch_size=self.config.target_patch_size, pad_id=getattr(self.config, 'pad_id', 0)
+            )
+        else:
+            patch_reset_mask = reset_mask if reset_mask.shape[1] == latent_patches.shape[1] else reset_mask[:, ::self.config.target_patch_size]
+
         hiddens = []
         h_latent = latent_patches
         for block in self.context_encoder.blocks:
-            h_latent = block(h_latent)
+            h_latent = block(h_latent, reset_mask=patch_reset_mask)
             hiddens.append(h_latent)
-        h_latent = self.context_encoder.norm_out(h_latent)
+
+        if getattr(self.config, 'use_dense_readout', True) and hasattr(self, 'layer_readout_weights'):
+            layer_outputs = [latent_patches] + hiddens
+            normed_weights = F.softmax(self.layer_readout_weights, dim=0)
+            h_dense = torch.tensordot(normed_weights, torch.stack(layer_outputs, dim=0), dims=([0], [0]))
+            h_latent = self.context_encoder.norm_out(h_dense)
+        else:
+            h_latent = self.context_encoder.norm_out(h_latent)
         if getattr(self.config, 'use_type_codebook', False) and hasattr(self, 'type_codebook'):
             h_latent, _ = self.type_codebook(h_latent)
             if self.training:
@@ -463,6 +844,10 @@ class TorosHybridLanguageModel(nn.Module):
                         pass
         
         causal_latent_patches = torch.cat([self.sos_patch.expand(B, 1, -1), h_latent[:, :-1]], dim=1)
+        causal_latent_patches = torch.where(
+            patch_reset_mask.unsqueeze(-1), self.sos_patch.expand(B, patch_reset_mask.shape[1], -1), causal_latent_patches
+        )
+
         h_decoded_for_mtp = None
         use_fused_dec = (
             targets is not None
@@ -470,6 +855,14 @@ class TorosHybridLanguageModel(nn.Module):
             and not getattr(self.config, 'use_mtp', False)
             and self.config.unlikelihood_weight <= 0.0
             and not h_byte.is_cuda
+            and torch.is_grad_enabled()
+        )
+        use_triton_fused_dec = (
+            targets is not None
+            and not return_logits
+            and not getattr(self.config, 'use_mtp', False)
+            and self.config.unlikelihood_weight <= 0.0
+            and h_byte.is_cuda
             and torch.is_grad_enabled()
         )
         if getattr(self.config, 'use_mtp', False) and hasattr(self, 'mtp'):
@@ -488,6 +881,18 @@ class TorosHybridLanguageModel(nn.Module):
                 dec.norm1.scale, dec.norm2.scale,
             )
             logits = None
+        elif use_triton_fused_dec:
+            from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
+            _, h_decoded = self.byte_decoder(
+                h_byte, causal_latent_patches, patch_assignments, return_hidden=True, return_logits=False
+            )
+            lm_head = self.byte_decoder.lm_head
+            if hasattr(lm_head, "quantize_input_and_weight"):
+                h_in, w_in = lm_head.quantize_input_and_weight(h_decoded)
+                loss_gen = triton_fused_linear_cross_entropy(h_in, w_in, targets)
+            else:
+                loss_gen = triton_fused_linear_cross_entropy(h_decoded, lm_head.weight, targets)
+            logits = None
         else:
             logits = self.byte_decoder(h_byte, causal_latent_patches, patch_assignments)
 
@@ -495,7 +900,7 @@ class TorosHybridLanguageModel(nn.Module):
         metrics = {}
 
         if targets is not None:
-            if use_fused_dec:
+            if use_fused_dec or use_triton_fused_dec:
                 loss_unl = loss_gen.new_zeros(())
             else:
                 loss_gen = F.cross_entropy(logits.view(-1, 256), targets.view(-1))
@@ -637,11 +1042,20 @@ class TorosHybridLanguageModel(nn.Module):
 
         if new_latents:
             h = torch.cat(new_latents, dim=1)                               # [B, m, dim]
+            layer_outputs = [h]
             for i, block in enumerate(ce.blocks):
                 h_out, st = block(h, state=gen_state["block_states"][i], return_state=True)
                 gen_state["block_states"][i] = st
                 h = h_out
-            h = ce.norm_out(h)
+                layer_outputs.append(h)
+
+            if getattr(self.config, 'use_dense_readout', True) and hasattr(self, 'layer_readout_weights'):
+                normed_weights = F.softmax(self.layer_readout_weights, dim=0)
+                h_dense = torch.tensordot(normed_weights, torch.stack(layer_outputs, dim=0), dims=([0], [0]))
+                h = ce.norm_out(h_dense)
+            else:
+                h = ce.norm_out(h)
+
             gen_state["h_cache"] = (
                 h if gen_state["h_cache"] is None
                 else torch.cat([gen_state["h_cache"], h], dim=1)

@@ -59,14 +59,15 @@ class ChunkedCrossEntropyLoss(nn.Module):
 
         # Standard unpatched sequence: N == T
         if hidden_states.is_cuda and lm_head_weight.is_cuda and targets.is_cuda:
-            # 1. For large vocabularies (unpatched), fuse linear projection & online LSE in Triton SRAM
-            if out_features > 256 and getattr(kernels, "TRITON_AVAILABLE", False) and self.ignore_index == -100:
-                return kernels.triton_fused_linear_cross_entropy(hidden_states, lm_head_weight, targets)
+            # 1. Fuse linear projection & online LSE in Triton SRAM directly
+            if getattr(kernels, "TRITON_AVAILABLE", False) and self.ignore_index == -100:
+                try:
+                    return kernels.triton_fused_linear_cross_entropy(hidden_states, lm_head_weight, targets)
+                except Exception:
+                    pass
 
-            # 2. For byte-level vocabularies (V <= 256), use monolithic cuBLAS Tensor Cores
-            elif out_features <= 256:
-                logits = F.linear(hidden_states, lm_head_weight)
-                return F.cross_entropy(logits.reshape(-1, out_features), targets.reshape(-1), ignore_index=self.ignore_index)
+            logits = F.linear(hidden_states, lm_head_weight)
+            return F.cross_entropy(logits.reshape(-1, out_features), targets.reshape(-1), ignore_index=self.ignore_index)
 
         # 3. CPU / Fallback micro-chunking to conserve RAM
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])

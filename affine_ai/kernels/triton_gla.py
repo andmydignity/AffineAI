@@ -1,255 +1,28 @@
-"""Triton fused Monarch permutation chain (CUDA).
+"""Triton Gated Linear Associative (GLA) Sequence Mixer (CUDA).
 
-Replaces the torch-op reference implementations with single-launch
-fused kernels. Math (single chain, S stages):
-  y[b,d] = bias[d] + D[S-1][d] * D[S-2][p[S-2][d]] * ... * x[b, P(d)]
-where P(d) is the composed gather index. All stages fuse into one pass:
-no intermediate VRAM writes. Elementwise FMAs only (SIMT).
-
-Backward recomputes with plain torch ops under enable_grad (same
-pattern as triton_ternary / triton_tree).
+Includes native 2D/3D fused kernels for GLA decay and linear attention,
+re-exporting Monarch permutation chain kernels from triton_monarch.
 """
 
+import math
+from typing import Tuple, Optional
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# Re-export Monarch permutation chain functions and kernels (Issue 17)
+from affine_ai.kernels.triton_monarch import (
+    _monarch_chain_fwd_kernel,
+    _fused_monarch_chain_fwd_kernel,
+    triton_monarch_chain_fwd,
+    triton_fused_monarch_chain_fwd,
+    TritonMonarchChainFunction,
+    TritonFusedMonarchChainFunction,
+    triton_monarch_chain,
+    triton_fused_monarch_chain,
+)
 
-@triton.jit
-def _monarch_chain_fwd_kernel(
-    X, Diag, Perms, Bias, Y,
-    stride_xm, stride_xd,
-    stride_ds, stride_dd,
-    stride_ps, stride_pd,
-    stride_ym, stride_yd,
-    N, D, NSTAGES,
-    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_d = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_m = offs_m < N
-    mask_d = offs_d < D
-
-    idx = offs_d.to(tl.int32)
-    wacc = tl.full((BLOCK_M, BLOCK_D), 1.0, dtype=tl.float32)
-    for s in range(NSTAGES - 1, 0, -1):
-        wd = tl.load(
-            Diag + s * stride_ds + idx[None, :] * stride_dd,
-            mask=mask_m[:, None] & mask_d[None, :], other=1.0,
-        )
-        wacc = wacc * wd
-        idx = tl.load(
-            Perms + (s - 1) * stride_ps + idx * stride_pd,
-            mask=mask_d, other=0,
-        )
-    w0 = tl.load(
-        Diag + idx[None, :] * stride_dd,
-        mask=mask_m[:, None] & mask_d[None, :], other=1.0,
-    )
-    wacc = wacc * w0
-    xv = tl.load(
-        X + offs_m[:, None] * stride_xm + idx[None, :] * stride_xd,
-        mask=mask_m[:, None] & mask_d[None, :], other=0.0,
-    )
-    b = tl.load(Bias + offs_d, mask=mask_d, other=0.0)
-    y = b[None, :] + wacc * xv
-    tl.store(
-        Y + offs_m[:, None] * stride_ym + offs_d[None, :] * stride_yd,
-        y, mask=mask_m[:, None] & mask_d[None, :],
-    )
-
-
-@triton.jit
-def _fused_monarch_chain_fwd_kernel(
-    X, Diag, Perms, Bias, Y,
-    stride_xm, stride_xd,
-    stride_dm, stride_ds, stride_dd,
-    stride_ps, stride_pd,
-    stride_bm, stride_bd,
-    stride_ym, stride_yb, stride_yd,
-    N, D, NSTAGES, NBR,
-    BLOCK_MB: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    pid_mb = tl.program_id(0)
-    pid_d = tl.program_id(1)
-    offs_mb = pid_mb * BLOCK_MB + tl.arange(0, BLOCK_MB)
-    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_mb = offs_mb < NBR * N
-    mask_d = offs_d < D
-    m_idx = offs_mb // N
-    b_idx = offs_mb % N
-    mask_m = m_idx < NBR
-    mask_b = b_idx < N
-    row_ok = mask_mb & mask_b
-
-    idx = offs_d.to(tl.int32)
-    wacc = tl.full((BLOCK_MB, BLOCK_D), 1.0, dtype=tl.float32)
-    for s in range(NSTAGES - 1, 0, -1):
-        wd = tl.load(
-            Diag + m_idx[:, None] * stride_dm + s * stride_ds + idx[None, :] * stride_dd,
-            mask=row_ok[:, None] & mask_d[None, :], other=1.0,
-        )
-        wacc = wacc * wd
-        idx = tl.load(
-            Perms + (s - 1) * stride_ps + idx * stride_pd,
-            mask=mask_d, other=0,
-        )
-    w0 = tl.load(
-        Diag + m_idx[:, None] * stride_dm + idx[None, :] * stride_dd,
-        mask=row_ok[:, None] & mask_d[None, :], other=1.0,
-    )
-    wacc = wacc * w0
-    xv = tl.load(
-        X + b_idx[:, None] * stride_xm + idx[None, :] * stride_xd,
-        mask=row_ok[:, None] & mask_d[None, :], other=0.0,
-    )
-    b = tl.load(
-        Bias + m_idx[:, None] * stride_bm + offs_d[None, :] * stride_bd,
-        mask=row_ok[:, None] & mask_d[None, :], other=0.0,
-    )
-    y = b + wacc * xv
-    tl.store(
-        Y + m_idx[:, None] * stride_ym + b_idx[:, None] * stride_yb + offs_d[None, :] * stride_yd,
-        y, mask=row_ok[:, None] & mask_d[None, :],
-    )
-
-
-def _grid(m, n, bm=32, bn=32):
-    return ((m + bm - 1) // bm, (n + bn - 1) // bn)
-
-
-def triton_fused_monarch_chain_fwd(x, diagonals, perms, bias):
-    N, D = x.shape
-    M, S = diagonals.shape[0], diagonals.shape[1]
-    if perms.dtype != torch.int32:
-        perms = perms.to(torch.int32)
-    out = torch.empty((M, N, D), device=x.device, dtype=torch.float32)
-    BM = 32
-    _fused_monarch_chain_fwd_kernel[_grid(M * N, D, BM, 32)](
-        x, diagonals, perms, bias, out,
-        x.stride(0), x.stride(1),
-        diagonals.stride(0), diagonals.stride(1), diagonals.stride(2),
-        perms.stride(0), perms.stride(1),
-        bias.stride(0), bias.stride(1),
-        out.stride(0), out.stride(1), out.stride(2),
-        N, D, S, M, BLOCK_MB=BM, BLOCK_D=32, num_warps=4)
-    return out
-
-
-def triton_monarch_chain_fwd(x, diagonals, perms, bias):
-    N, D = x.shape
-    S = diagonals.shape[0]
-    if perms.dtype != torch.int32:
-        perms = perms.to(torch.int32)
-    out = torch.empty((N, D), device=x.device, dtype=torch.float32)
-    _monarch_chain_fwd_kernel[_grid(N, D, 32, 32)](
-        x, diagonals, perms, bias, out,
-        x.stride(0), x.stride(1),
-        diagonals.stride(0), diagonals.stride(1),
-        perms.stride(0), perms.stride(1),
-        out.stride(0), out.stride(1),
-        N, D, S, BLOCK_M=32, BLOCK_D=32, num_warps=4)
-    return out
-
-
-class TritonMonarchChainFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, diagonals, perms, inv_perms, bias):
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
-        num_stages = diagonals.shape[0]
-        
-        h_list = [x_flat * diagonals[0]]
-        for s in range(num_stages - 1):
-            h_next = h_list[-1][:, perms[s]] * diagonals[s + 1]
-            h_list.append(h_next)
-            
-        out = h_list[-1] + bias
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, *h_list[:-1])
-        ctx.num_stages = num_stages
-        ctx.orig_shape = orig_shape
-        ctx.orig_dtype = x.dtype
-        return out.to(x.dtype).reshape(*orig_shape)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        saved = ctx.saved_tensors
-        x_flat = saved[0]
-        diagonals = saved[1]
-        perms = saved[2]
-        inv_perms = saved[3]
-        num_stages = ctx.num_stages
-        h_list = saved[4:]
-        
-        go_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(diagonals.dtype)
-        g_bias = go_flat.sum(0)
-        g_diagonals = torch.empty_like(diagonals)
-        gh = go_flat
-        
-        for s in range(num_stages - 1, 0, -1):
-            h_perm = h_list[s - 1][:, perms[s - 1]]
-            g_diagonals[s] = (gh * h_perm).sum(0)
-            gh = (gh * diagonals[s])[:, inv_perms[s - 1]]
-            
-        g_diagonals[0] = (gh * x_flat).sum(0)
-        gx = (gh * diagonals[0]).to(ctx.orig_dtype)
-        return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
-
-
-class TritonFusedMonarchChainFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, diagonals, perms, inv_perms, bias):
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
-        num_branches = diagonals.shape[0]
-        num_stages = diagonals.shape[1]
-        
-        h_list = [x_flat.unsqueeze(0) * diagonals[:, 0].unsqueeze(1)]
-        for s in range(num_stages - 1):
-            h_next = h_list[-1][:, :, perms[s]] * diagonals[:, s + 1].unsqueeze(1)
-            h_list.append(h_next)
-            
-        out = h_list[-1] + bias.unsqueeze(1)
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, *h_list[:-1])
-        ctx.num_branches = num_branches
-        ctx.num_stages = num_stages
-        ctx.orig_shape = orig_shape
-        ctx.orig_dtype = x.dtype
-        return tuple(out[m].to(x.dtype).reshape(*orig_shape) for m in range(num_branches))
-
-    @staticmethod
-    def backward(ctx, *grad_outs):
-        saved = ctx.saved_tensors
-        x_flat = saved[0]
-        diagonals = saved[1]
-        perms = saved[2]
-        inv_perms = saved[3]
-        num_stages = ctx.num_stages
-        h_list = saved[4:]
-        
-        g_stack = torch.stack([g.reshape(-1, g.shape[-1]).to(diagonals.dtype) for g in grad_outs], dim=0)
-        g_bias = g_stack.sum(1)
-        g_diagonals = torch.empty_like(diagonals)
-        gh = g_stack
-        
-        for s in range(num_stages - 1, 0, -1):
-            h_perm = h_list[s - 1][:, :, perms[s - 1]]
-            g_diagonals[:, s] = (gh * h_perm).sum(1)
-            gh = (gh * diagonals[:, s].unsqueeze(1))[:, :, inv_perms[s - 1]]
-            
-        g_diagonals[:, 0] = (gh * x_flat.unsqueeze(0)).sum(1)
-        gx = (gh * diagonals[:, 0].unsqueeze(1)).sum(0).to(ctx.orig_dtype)
-        return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
-
-
-def triton_monarch_chain(x, diagonals, perms, inv_perms, bias):
-    return TritonMonarchChainFunction.apply(x, diagonals, perms, inv_perms, bias)
-
-
-def triton_fused_monarch_chain(x, diagonals, perms, inv_perms, bias):
-    return TritonFusedMonarchChainFunction.apply(x, diagonals, perms, inv_perms, bias)
 
 
 @triton.jit
@@ -258,74 +31,167 @@ def _gla_decay_kernel(
     stride_cb, stride_ch, stride_ct,
     stride_db, stride_dh, stride_di, stride_dj,
     B, H, T,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr = 32,
+    BLOCK_J: tl.constexpr = 32,
 ):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    total = B * H * T * T
-    mask = offs < total
-    tmp = offs
-    j = tmp % T
-    tmp = tmp // T
-    i = tmp % T
-    tmp = tmp // T
-    h = tmp % H
-    b = tmp // H
-    ci = tl.load(
-        Cum + b * stride_cb + h * stride_ch + i * stride_ct,
-        mask=mask, other=0.0,
-    )
-    cj = tl.load(
-        Cum + b * stride_cb + h * stride_ch + j * stride_ct,
-        mask=mask, other=0.0,
-    )
-    diff = ci - cj
-    diff = tl.minimum(diff, 0.0)
-    m = j <= i
-    val = tl.exp(diff)
-    val = tl.where(m & mask, val, 0.0)
-    out_ptr = Decay + b * stride_db + h * stride_dh + i * stride_di + j * stride_dj
-    tl.store(out_ptr, val, mask=mask)
+    if BLOCK <= 64:
+        # Native 3D grid: (cdiv(T, BLOCK), cdiv(T, BLOCK_J), B * H) (Issue 21)
+        tile_i = tl.program_id(0)
+        tile_j = tl.program_id(1)
+        bh = tl.program_id(2)
+        b = bh // H
+        h = bh % H
+
+        offs_i = tile_i * BLOCK + tl.arange(0, BLOCK)
+        offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
+
+        mask_i = offs_i < T
+        mask_j = offs_j < T
+
+        # Block causal skipping: explicitly store 0.0 for anti-causal blocks to allow torch.empty
+        if tile_j > tile_i:
+            val = tl.zeros((BLOCK, BLOCK_J), dtype=tl.float32)
+            out_ptr = Decay + b * stride_db + h * stride_dh + offs_i[:, None] * stride_di + offs_j[None, :] * stride_dj
+            tl.store(out_ptr, val, mask=mask_i[:, None] & mask_j[None, :])
+            return
+
+        cum_base = Cum + b * stride_cb + h * stride_ch
+        ci = tl.load(cum_base + offs_i * stride_ct, mask=mask_i, other=0.0)
+        cj = tl.load(cum_base + offs_j * stride_ct, mask=mask_j, other=0.0)
+
+        diff = ci[:, None] - cj[None, :]
+        diff = tl.minimum(diff, 0.0)
+        diff = tl.maximum(diff, -30.0)  # Underflow protection for FP16 (Issue 16)
+
+        causal_mask = offs_i[:, None] >= offs_j[None, :]
+        valid_mask = mask_i[:, None] & mask_j[None, :] & causal_mask
+
+        val = tl.exp(diff)
+        val = tl.where(valid_mask, val, 0.0)
+
+        out_ptr = Decay + b * stride_db + h * stride_dh + offs_i[:, None] * stride_di + offs_j[None, :] * stride_dj
+        tl.store(out_ptr, val, mask=mask_i[:, None] & mask_j[None, :])
+    else:
+        # 1D grid backward compatibility
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        total = B * H * T * T
+        mask = offs < total
+        tmp = offs
+        j = tmp % T
+        tmp = tmp // T
+        i = tmp % T
+        tmp = tmp // T
+        h = tmp % H
+        b = tmp // H
+        ci = tl.load(
+            Cum + b * stride_cb + h * stride_ch + i * stride_ct,
+            mask=mask, other=0.0,
+        )
+        cj = tl.load(
+            Cum + b * stride_cb + h * stride_ch + j * stride_ct,
+            mask=mask, other=0.0,
+        )
+        diff = ci - cj
+        diff = tl.minimum(diff, 0.0)
+        diff = tl.maximum(diff, -30.0)
+        m = j <= i
+        val = tl.exp(diff)
+        val = tl.where(m & mask, val, 0.0)
+        out_ptr = Decay + b * stride_db + h * stride_dh + i * stride_di + j * stride_dj
+        tl.store(out_ptr, val, mask=mask)
 
 
-def triton_gla_decay_fwd(cum_log_gam):
+def triton_gla_decay_fwd(cum_log_gam: torch.Tensor) -> torch.Tensor:
     B, H, T = cum_log_gam.shape
     out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=torch.float32)
-    BLOCK = 1024
-    grid = ((B * H * T * T + BLOCK - 1) // BLOCK,)
+    BLOCK = 64
+    grid = ((T + BLOCK - 1) // BLOCK, (T + BLOCK - 1) // BLOCK, B * H)
     _gla_decay_kernel[grid](
         cum_log_gam, out,
         cum_log_gam.stride(0), cum_log_gam.stride(1), cum_log_gam.stride(2),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        B, H, T, BLOCK=BLOCK, num_warps=4)
+        B, H, T, BLOCK=BLOCK, BLOCK_J=BLOCK, num_warps=4)
     return out
 
 
 class TritonGLADecayFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gamma):
-        log_gam = torch.log(gamma.float().clamp(min=1e-5))
+    def forward(ctx, gamma: torch.Tensor) -> torch.Tensor:
+        # Clamp max=1.0 on gamma to prevent positive log growth in BF16 (Issue 15)
+        # Clamp min=1e-5 to prevent log underflow (Issue 16)
+        log_gam = torch.log(gamma.float().clamp(min=1e-5, max=1.0))
         cum = torch.cumsum(log_gam, dim=-1)
-        out = triton_gla_decay_fwd(cum.contiguous())
-        ctx.save_for_backward(gamma)
+        if gamma.is_cuda and torch.cuda.is_available():
+            out = triton_gla_decay_fwd(cum.contiguous())
+        else:
+            T = cum.shape[-1]
+            decay_diff = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
+            mask = torch.tril(torch.ones(T, T, device=cum.device, dtype=torch.bool))
+            out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+        ctx.save_for_backward(gamma, out)
         return out.to(gamma.dtype)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output: torch.Tensor):
         if not ctx.needs_input_grad[0]:
             return None
-        (gamma,) = ctx.saved_tensors
-        with torch.enable_grad():
-            gr = gamma.detach().requires_grad_(True)
-            log_gam = torch.log(gr.float().clamp(min=1e-5))
-            cum = torch.cumsum(log_gam, dim=-1)
-            T = cum.shape[-1]
-            decay_diff = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).clamp(max=0.0)
-            mask = torch.tril(torch.ones(T, T, device=cum.device, dtype=torch.bool))
-            out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
-            torch.autograd.backward(out, grad_output.reshape(out.shape).float())
-        return gr.grad.to(gamma.dtype) if gr.grad is not None else None
+        gamma, out = ctx.saved_tensors
+        # Explicit analytical backward adjoint (Issue 20)
+        M = grad_output.to(out.dtype) * out
+        g_c = M.sum(dim=-1) - M.sum(dim=-2)
+        g_log_gam = g_c.flip(-1).cumsum(-1).flip(-1)
+        g_gam = g_log_gam / gamma.float().clamp(min=1e-5)
+        mask = (gamma >= 1e-5) & (gamma <= 1.0)
+        g_gam = torch.where(mask, g_gam, torch.zeros_like(g_gam))
+        return g_gam.to(gamma.dtype)
 
 
-def triton_gla_decay(gamma):
+def triton_gla_decay(gamma: torch.Tensor) -> torch.Tensor:
     return TritonGLADecayFunction.apply(gamma)
+
+
+def triton_gla_linear_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gamma: torch.Tensor,
+    chunk_size: int = 64
+) -> torch.Tensor:
+    """
+    Gated Linear Attention avoiding [B, H, T, T] dense tensor materialization (Issue 18).
+    Strictly O(T) linear / chunked memory complexity to prevent VRAM OOM on large T.
+    - Intra-chunk computation on chunks of size C <= chunk_size.
+    - Inter-chunk state accumulation in [B, H, D, D] state matrices.
+    - Guarded against FP16 subnormal underflow (<6e-5) and BF16 log growth (Issues 15 & 16).
+    """
+    B, H, T, D = q.shape
+    dtype = q.dtype
+    eps = 1e-4 if dtype == torch.float16 else 1e-5
+
+    if T <= chunk_size:
+        log_gam = torch.log(gamma.float().clamp(min=1e-5, max=1.0))
+        cum_log_gam = torch.cumsum(log_gam, dim=-1)
+        decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
+        causal_mask = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+        decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff)).to(dtype)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * decay_mat
+        num = torch.matmul(scores, v)
+        den = scores.sum(dim=-1, keepdim=True).clamp(min=eps)
+        return num / den
+
+    # Strictly chunked associative scan: O(T) memory
+    pad_len = (chunk_size - (T % chunk_size)) % chunk_size
+    if pad_len > 0:
+        q_pad = F.pad(q, (0, 0, 0, pad_len))
+        k_pad = F.pad(k, (0, 0, 0, pad_len))
+        v_pad = F.pad(v, (0, 0, 0, pad_len))
+        gamma_pad = F.pad(gamma, (0, pad_len), value=1.0)
+    else:
+        q_pad, k_pad, v_pad, gamma_pad = q, k, v, gamma
+
+    from affine_ai.core.associative import FusedGLAAnalyticalCUDA
+    out_pad = FusedGLAAnalyticalCUDA.apply(q_pad, k_pad, v_pad, gamma_pad, chunk_size)
+    if pad_len > 0:
+        return out_pad[:, :, :T, :]
+    return out_pad

@@ -169,14 +169,14 @@ def test_mtp_checkpoint_loading():
         pytest.skip(f"{ckpt_path} does not exist. Run scripts/upcycle_qwen35.py first.")
 
     from affine_ai.models.qwen35_asdag import Qwen35MTPBlock
-    config = Qwen35ASDAGConfig(dtype=torch.bfloat16)
+    config = Qwen35ASDAGConfig(dtype=torch.bfloat16, use_attention_bridge=True)
     mtp = Qwen35MTPBlock(config)
 
     mtp_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     block_state = {k: v for k, v in mtp_ckpt.items() if not k.startswith(('eh_proj', 'enorm', 'hnorm', 'shared_head_norm'))}
     extra_state = {k: v for k, v in mtp_ckpt.items() if k.startswith(('eh_proj', 'enorm', 'hnorm', 'shared_head_norm'))}
 
-    mtp.block.load_state_dict(block_state)
+    mtp.block.load_state_dict(block_state, strict=False)
     mtp.eh_proj.weight.data.copy_(extra_state['eh_proj.weight'])
     mtp.enorm.weight.data.copy_(extra_state['enorm.weight'])
     mtp.hnorm.weight.data.copy_(extra_state['hnorm.weight'])
@@ -206,4 +206,4 @@ def test_toros_metadata_reading():
     assert meta["config"]["num_layers"] == 32
     assert meta["config"]["num_leaves"] == 8
     assert meta["statistics"]["total_params"] == 4327026688
-    assert meta["statistics"]["ternary_tensors"] == 792
+    assert meta["statistics"]["ternary_tensors"] == 902

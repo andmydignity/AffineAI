@@ -85,7 +85,7 @@ def test_local_predictive_language_model():
     lpc_model = LocalPredictiveLanguageModel(base_model).to(device)
     optimizers = lpc_model.get_default_lpc_optimizers(lr=1e-3)
 
-    assert len(optimizers) == 3 # 2 blocks + final head
+    assert len(optimizers) == 4 # 2 blocks + enc tail + final head
 
     x = torch.randint(0, 64, (4, 16), device=device)
     y = torch.randint(0, 64, (4, 16), device=device)
@@ -153,7 +153,7 @@ def test_lpc_with_muon_optimizers():
     lpc_model = LocalPredictiveLanguageModel(base_model).to(device)
     muon_optimizers = lpc_model.get_default_lpc_optimizers(use_muon=True, muon_lr=0.02, lr=3e-3)
 
-    assert len(muon_optimizers) == 3
+    assert len(muon_optimizers) == 4
 
     x = torch.randint(0, 32, (4, 16), device=device)
     y = torch.randint(0, 32, (4, 16), device=device)

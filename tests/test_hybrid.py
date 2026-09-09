@@ -87,7 +87,7 @@ def test_hybrid_native_lpc():
     model.enable_lpc()
     assert hasattr(model, "local_heads") and model.local_heads is not None
     lpc_opts = model.get_default_lpc_optimizers(lr=1e-3)
-    assert len(lpc_opts) == 3
+    assert len(lpc_opts) == 4
     res = model.forward_lpc_step(x, y, lpc_opts)
     assert "loss" in res and res["loss"] > 0
 
@@ -109,3 +109,65 @@ def test_hybrid_inference_export(tmp_path):
     loaded = torch.load(save_file, weights_only=False)
     assert loaded["scaffolding_stripped"] is True
     assert "model_state_dict" in loaded
+
+
+def test_hybrid_triton_fused_dec_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    config = TorosHybridConfig(
+        dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8, dtype=torch.bfloat16
+    )
+    model = TorosHybridLanguageModel(config).cuda()
+    x = torch.randint(0, 256, (2, 32), device="cuda")
+    y = torch.randint(0, 256, (2, 32), device="cuda")
+
+    # Non-fused path (return_logits=True)
+    logits, loss_std, _ = model(x, targets=y, return_logits=True)
+
+    # Fused path (return_logits=False)
+    _, loss_fused, _ = model(x, targets=y, return_logits=False)
+
+    assert loss_std is not None and loss_fused is not None
+    # Tolerance reflects hardware INT8 IMMA Tensor Core accumulation vs fused FP32 cross-entropy
+    assert torch.isclose(loss_std, loss_fused, atol=0.25, rtol=0.05)
+
+
+def test_hybrid_lpc_async_pipelining():
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+
+    for device in devices:
+        config = TorosHybridConfig(
+            dim=64, d_byte=32, n_encoder_layers=2, n_heads=2, target_patch_size=8
+        )
+        model = TorosHybridLanguageModel(config).to(device)
+        model.enable_lpc()
+
+        for use_muon in [False, True]:
+            opts = model.get_default_lpc_optimizers(lr=1e-3, use_muon=use_muon)
+            x = torch.randint(0, 256, (2, 32), device=device)
+            y = torch.randint(0, 256, (2, 32), device=device)
+
+            # Test sync_loss=False, use_async_pipelining=True
+            res_async = model.forward_lpc_step(
+                x, y, opts, use_async_pipelining=True, sync_loss=False, return_sample_loss=True
+            )
+            assert "loss" in res_async and res_async["loss"] > 0
+            assert "layer_losses" in res_async and len(res_async["layer_losses"]) == 2
+            assert "mean_local_loss" in res_async and res_async["mean_local_loss"] > 0
+            assert "loss_total" in res_async and res_async["loss_total"] > 0
+            assert "sample_loss" in res_async and res_async["sample_loss"] is not None
+            assert res_async["sample_loss"].shape == (2,)
+
+            # Test sync_loss=True, use_async_pipelining=False
+            opts2 = model.get_default_lpc_optimizers(lr=1e-3, use_muon=use_muon)
+            res_sync = model.forward_lpc_step(
+                x, y, opts2, use_async_pipelining=False, sync_loss=True, return_sample_loss=False
+            )
+            assert isinstance(res_sync["loss"], float) and res_sync["loss"] > 0
+            assert isinstance(res_sync["mean_local_loss"], float)
+            assert len(res_sync["layer_losses"]) == 2
+            assert isinstance(res_sync["layer_losses"][0], float)
+
+

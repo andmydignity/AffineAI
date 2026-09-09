@@ -639,6 +639,10 @@ class ASDAGTrainer:
                     if eval_metrics["val_loss"] < best_val_loss:
                         best_val_loss = eval_metrics["val_loss"]
                         if save_path:
+                            import os as _os
+                            _dir = _os.path.dirname(save_path)
+                            if _dir:
+                                _os.makedirs(_dir, exist_ok=True)
                             torch.save(self.model.state_dict(), save_path)
         finally:
             if gc_was_enabled:

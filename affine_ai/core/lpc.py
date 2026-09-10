@@ -47,17 +47,25 @@ class LocalPredictiveHead(nn.Module):
         if targets is not None:
             if h.is_cuda:
                 try:
-                    from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
-                    loss_t = triton_fused_lpc_head(h_norm, w_quant, targets, ignore_index=ignore_index)
-                    # Branchless NaN fallback: Triton can return NaN on wide BF16
-                    # models. torch.where on a tensor predicate needs no host
-                    # sync, keeping this capture-safe under CUDA graphs (a
-                    # .any()/bool check here would invalidate the capture).
-                    fb_logits = F.linear(h_norm, w_quant)
-                    loss_f = F.cross_entropy(fb_logits.float().view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index).to(loss_t.dtype)
-                    return h_norm, torch.where(loss_t.isnan(), loss_f, loss_t)
+                    from affine_ai.kernels import TRITON_AVAILABLE as _TA
                 except Exception:
-                    pass
+                    _TA = False
+                if _TA:
+                    try:
+                        from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
+                        loss_t = triton_fused_lpc_head(h_norm, w_quant, targets, ignore_index=ignore_index)
+                        return h_norm, loss_t
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
+                        loss_t = triton_fused_lpc_head(h_norm, w_quant, targets, ignore_index=ignore_index)
+                        fb_logits = F.linear(h_norm, w_quant)
+                        loss_f = F.cross_entropy(fb_logits.float().view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index).to(loss_t.dtype)
+                        return h_norm, torch.where(loss_t.isnan(), loss_f, loss_t)
+                    except Exception:
+                        pass
             # Cast logits to float32 before cross_entropy — prevents BF16 overflow (>65504)
             # in wide models (dim >= 512) where logit magnitudes can exceed BF16 range.
             logits = F.linear(h_norm, w_quant)

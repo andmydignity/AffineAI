@@ -51,12 +51,15 @@ from affine_ai.kernels.triton_monarch import (
 
 
 _GLA_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 16, "BLOCK_J": 16}, num_warps=4),
-    triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=4),
-    triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=8),
-    triton.Config({"BLOCK": 64, "BLOCK_J": 32}, num_warps=4),
-    triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8),
-    triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=4),
+    triton.Config({"BLOCK": 16, "BLOCK_J": 16}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK": 64, "BLOCK_J": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8, num_stages=4),
 ]
 
 # Turing sm_75: 64KB SMEM cap, BLOCK <=64, num_warps 2/4 max, avoid BLOCK 128.
@@ -68,7 +71,7 @@ if _is_turing():
     ]
 
 
-@triton.autotune(configs=_GLA_AUTOTUNE_CONFIGS, key=["T"])
+@triton.autotune(configs=_GLA_AUTOTUNE_CONFIGS, key=["T", "B", "H"])
 @triton.jit
 def _gla_decay_kernel(
     Cum, Decay,
@@ -77,83 +80,25 @@ def _gla_decay_kernel(
     B, H, T,
     BLOCK: tl.constexpr = 32,
     BLOCK_J: tl.constexpr = 32,
+    CLAMP_MIN: tl.constexpr = -30.0,
 ):
-    # Coalescing improvement: use tl.make_block_ptr for contiguous Cum/Decay where stride row==1.
-    # Cum is (B, H, T) with last dim contiguous when stride_ct==1; Decay last dim contiguous when stride_dj==1.
-    # Block_ptr gives hardware coalesced loads vs manual Cum+ b*stride_cb+h*stride_ch + offs*stride_ct.
-    # Fallback manual pointer arithmetic retained for non-contiguous/strided tensors (e.g., transposed views).
-    # Occupancy note: autotune selects BLOCK 32 for T<512 (keeps 3D grid occupancy high), 64 for larger T.
-    if BLOCK <= 64:
-        # 3D grid is (cdiv(T, BLOCK), cdiv(T, BLOCK_J), B*H); 1D fallback below uses flattened B*H*T*T
-        tile_i = tl.program_id(0)
-        tile_j = tl.program_id(1)
-        bh = tl.program_id(2)
-        b = bh // H
-        h = bh % H
-
-        offs_i = tile_i * BLOCK + tl.arange(0, BLOCK)
-        offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
-
-        mask_i = offs_i < T
-        mask_j = offs_j < T
-
-        # Block causal skipping: explicitly store 0.0 for anti-causal blocks to allow torch.empty
-        if tile_j > tile_i:
-            val = tl.zeros((BLOCK, BLOCK_J), dtype=tl.float32)
-            # Contiguous Decay block_ptr store when stride_dj==1 (row contiguous)
-            # Attempt block_ptr path; manual fallback: out_ptr = Decay + b*stride_db + h*stride_dh + offs_i[:,None]*stride_di + offs_j[None,:]*stride_dj
-            # Use block_ptr for better coalescing when last dim contiguous:
-            out_block_ptr = tl.make_block_ptr(
-                base=Decay + b * stride_db + h * stride_dh,
-                shape=(T, T),
-                strides=(stride_di, stride_dj),
-                offsets=(tile_i * BLOCK, tile_j * BLOCK_J),
-                block_shape=(BLOCK, BLOCK_J),
-                order=(1, 0),
-            )
-            tl.store(out_block_ptr, val, boundary_check=(0, 1))
-            # Fallback manual (kept for non-contiguous):
-            # out_ptr = Decay + b * stride_db + h * stride_dh + offs_i[:, None] * stride_di + offs_j[None, :] * stride_dj
-            # tl.store(out_ptr, val, mask=mask_i[:, None] & mask_j[None, :])
-            return
-
-        # Load Cum vectors via block_ptr when contiguous (stride_ct==1 gives coalesced vector load)
-        # Manual fallback: cum_base = Cum + b*stride_cb + h*stride_ch; ci = tl.load(cum_base + offs_i*stride_ct ...)
-        # Block_ptr path:
-        # For cum, base is per (b,h) vector of length T, contiguous when stride_ct==1
-        cum_block_ptr_i = tl.make_block_ptr(
-            base=Cum + b * stride_cb + h * stride_ch,
-            shape=(T,),
-            strides=(stride_ct,),
-            offsets=(tile_i * BLOCK,),
-            block_shape=(BLOCK,),
-            order=(0,),
-        )
-        cum_block_ptr_j = tl.make_block_ptr(
-            base=Cum + b * stride_cb + h * stride_ch,
-            shape=(T,),
-            strides=(stride_ct,),
-            offsets=(tile_j * BLOCK_J,),
-            block_shape=(BLOCK_J,),
-            order=(0,),
-        )
-        ci = tl.load(cum_block_ptr_i, boundary_check=(0,))
-        cj = tl.load(cum_block_ptr_j, boundary_check=(0,))
-        # Fallback manual (non-contiguous):
-        # cum_base = Cum + b * stride_cb + h * stride_ch
-        # ci = tl.load(cum_base + offs_i * stride_ct, mask=mask_i, other=0.0)
-        # cj = tl.load(cum_base + offs_j * stride_ct, mask=mask_j, other=0.0)
-
-        diff = ci[:, None] - cj[None, :]
-        diff = tl.minimum(diff, 0.0)
-        diff = tl.maximum(diff, -30.0)  # clamp_min; caller selects -11 for fp16 / -30 otherwise (see TritonGLADecayFunction); -30 kept for fp32/bf16, fp16 subnormal threshold is ~-11
-
-        causal_mask = offs_i[:, None] >= offs_j[None, :]
-        valid_mask = mask_i[:, None] & mask_j[None, :] & causal_mask
-
-        val = tl.exp(diff)
-        val = tl.where(valid_mask, val, 0.0)
-
+    """
+    3D-tiled GLA decay kernel: Decay[b,h,i,j] = exp(clamp(cum[i]-cum[j], CLAMP_MIN, 0)) * (i>=j).
+    Grid: (cdiv(T,BLOCK), cdiv(T,BLOCK_J), B*H). Uses tl.make_block_ptr for coalesced
+    Cum/Decay accesses; BLOCK/BLOCK_J <=64 required (64KB SMEM on sm_75, 99KB usable on sm_80+).
+    CLAMP_MIN is tl.constexpr: -11 for fp16 (subnormal threshold), -30 for fp32/bf16.
+    """
+    tile_i = tl.program_id(0)
+    tile_j = tl.program_id(1)
+    bh = tl.program_id(2)
+    b = bh // H
+    h = bh % H
+    offs_i = tile_i * BLOCK + tl.arange(0, BLOCK)
+    offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
+    mask_i = offs_i < T
+    mask_j = offs_j < T
+    if tile_j > tile_i:
+        val = tl.zeros((BLOCK, BLOCK_J), dtype=tl.float32)
         out_block_ptr = tl.make_block_ptr(
             base=Decay + b * stride_db + h * stride_dh,
             shape=(T, T),
@@ -163,70 +108,118 @@ def _gla_decay_kernel(
             order=(1, 0),
         )
         tl.store(out_block_ptr, val, boundary_check=(0, 1))
-        # Fallback manual:
-        # out_ptr = Decay + b * stride_db + h * stride_dh + offs_i[:, None] * stride_di + offs_j[None, :] * stride_dj
-        # tl.store(out_ptr, val, mask=mask_i[:, None] & mask_j[None, :])
-    else:
-        # 1D grid fallback — legacy path for BLOCK>64. Guarded; prefer 3D path.
-        # Int32 overflow risk for B*H*T*T: use int64 for total and decomposition.
-        # tl.int64 cast avoids wrap when T>2048 or B*H large.
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        # Use int64 for decomposition to avoid B*H*T*T int32 overflow (Python int total is 64-bit)
-        total = B * H * T * T  # Python int (unbounded) — no wrap; tl tensor path below uses int64
-        offs_i64 = offs.to(tl.int64)
-        mask = offs_i64 < total
-        tmp = offs_i64
-        j = (tmp % T).to(tl.int32)
-        tmp = tmp // T
-        i = (tmp % T).to(tl.int32)
-        tmp = tmp // T
-        h = (tmp % H).to(tl.int32)
-        b = (tmp // H).to(tl.int32)
-        ci = tl.load(
-            Cum + b * stride_cb + h * stride_ch + i * stride_ct,
-            mask=mask, other=0.0,
-        )
-        cj = tl.load(
-            Cum + b * stride_cb + h * stride_ch + j * stride_ct,
-            mask=mask, other=0.0,
-        )
-        diff = ci - cj
-        diff = tl.minimum(diff, 0.0)
-        diff = tl.maximum(diff, -30.0)
-        m = j <= i
-        val = tl.exp(diff)
-        val = tl.where(m & mask, val, 0.0)
-        out_ptr = Decay + b * stride_db + h * stride_dh + i * stride_di + j * stride_dj
-        tl.store(out_ptr, val, mask=mask)
+        return
+    cum_block_ptr_i = tl.make_block_ptr(
+        base=Cum + b * stride_cb + h * stride_ch,
+        shape=(T,),
+        strides=(stride_ct,),
+        offsets=(tile_i * BLOCK,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    cum_block_ptr_j = tl.make_block_ptr(
+        base=Cum + b * stride_cb + h * stride_ch,
+        shape=(T,),
+        strides=(stride_ct,),
+        offsets=(tile_j * BLOCK_J,),
+        block_shape=(BLOCK_J,),
+        order=(0,),
+    )
+    ci = tl.load(cum_block_ptr_i, boundary_check=(0,), eviction_policy="evict_last")
+    cj = tl.load(cum_block_ptr_j, boundary_check=(0,), eviction_policy="evict_last")
+    diff = ci[:, None] - cj[None, :]
+    diff = tl.minimum(diff, 0.0)
+    diff = tl.maximum(diff, CLAMP_MIN)
+    causal_mask = offs_i[:, None] >= offs_j[None, :]
+    valid_mask = mask_i[:, None] & mask_j[None, :] & causal_mask
+    val = tl.exp(diff)
+    val = tl.where(valid_mask, val, 0.0)
+    out_block_ptr = tl.make_block_ptr(
+        base=Decay + b * stride_db + h * stride_dh,
+        shape=(T, T),
+        strides=(stride_di, stride_dj),
+        offsets=(tile_i * BLOCK, tile_j * BLOCK_J),
+        block_shape=(BLOCK, BLOCK_J),
+        order=(1, 0),
+    )
+    tl.store(out_block_ptr, val, boundary_check=(0, 1))
 
 
-def triton_gla_decay_fwd(cum_log_gam: torch.Tensor) -> torch.Tensor:
+@triton.jit
+def _gla_decay_kernel_raw(
+    Cum, Decay,
+    stride_cb, stride_ch, stride_ct,
+    stride_db, stride_dh, stride_di, stride_dj,
+    B, H, T,
+    BLOCK: tl.constexpr = 32,
+    BLOCK_J: tl.constexpr = 32,
+    CLAMP_MIN: tl.constexpr = -30.0,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    total = B.to(tl.int64) * H.to(tl.int64) * T.to(tl.int64) * T.to(tl.int64)
+    offs_i64 = offs.to(tl.int64)
+    mask = offs_i64 < total
+    tmp = offs_i64
+    tj = (tmp % T.to(tl.int64)).to(tl.int32)
+    tmp = tmp // T.to(tl.int64)
+    ti = (tmp % T.to(tl.int64)).to(tl.int32)
+    tmp = tmp // T.to(tl.int64)
+    th = (tmp % H.to(tl.int64)).to(tl.int32)
+    tb = (tmp // H.to(tl.int64)).to(tl.int32)
+    ci = tl.load(Cum + tb * stride_cb + th * stride_ch + ti * stride_ct, mask=mask, other=0.0)
+    cj = tl.load(Cum + tb * stride_cb + th * stride_ch + tj * stride_ct, mask=mask, other=0.0)
+    diff = ci - cj
+    diff = tl.minimum(diff, 0.0)
+    diff = tl.maximum(diff, CLAMP_MIN)
+    m = tj <= ti
+    val = tl.exp(diff)
+    val = tl.where(m & mask, val, 0.0)
+    out_ptr = Decay + tb * stride_db + th * stride_dh + ti * stride_di + tj * stride_dj
+    tl.store(out_ptr, val, mask=mask)
+
+_gla_decay_kernel_tuned = _gla_decay_kernel
+
+
+class _GlaKernelDispatcher:
+    def __getitem__(self, grid):
+        def _run(*args, **kwargs):
+            block = kwargs.get("BLOCK", None)
+            if block is not None:
+                return _gla_decay_kernel_raw[grid](*args, **kwargs)
+            block_j = kwargs.get("BLOCK_J", None)
+            if block_j is not None:
+                return _gla_decay_kernel_raw[grid](*args, **kwargs)
+            return _gla_decay_kernel_tuned[grid](*args, **kwargs)
+        return _run
+
+
+_gla_decay_kernel = _GlaKernelDispatcher()
+
+
+def triton_gla_decay_fwd(cum_log_gam: torch.Tensor, clamp_min: float = -30.0) -> torch.Tensor:
     """
     Materializes dense decay matrix [B, H, T, T] (O(T^2) memory).
     Use only at short T (e.g. T <= 512); for long T use the chunked
-    linear-attention path (triton_gla_linear_attention).
-    Autotuned BLOCK 16/32/64 with warps 4/8 keyed on T; heuristic is BLOCK=32 for T<512 else 64.
-    Occupancy: small T gets 32 to keep 3D grid full; large T benefits from 64-wide tiles (fewer blocks, better coalescing).
-    Uses tl.make_block_ptr for contiguous Cum/Decay (last dim stride==1) for better coalescing; manual fallback kept.
+    linear-attention path. Limit: T<=1024 else O(T^2) alloc explodes
+    (B*H*T*T elements, e.g. B=8 H=8 T=2048 -> 2B floats ~8GB).
     """
+    assert cum_log_gam.ndim == 3, f"cum_log_gam must be [B,H,T], got {cum_log_gam.shape}"
+    assert cum_log_gam.is_contiguous() or cum_log_gam.stride(-1) == 1, "cum last dim should be contiguous for coalesced loads"
     B, H, T = cum_log_gam.shape
-    # BLOCK estimate overflow guard: B*H*T*T kept in Python int (64-bit); kernel uses int64 path if BLOCK>64
-    assert 32 <= 64, "BLOCK must be <=64 for 3D path; 1D fallback uses int64"
+    if T > 1024:
+        raise ValueError(f"T={T} exceeds 1024 limit for dense [B,H,T,T] ({B*H*T*T} floats); use chunked path")
+    if B * H > 65535 and (T + 32 - 1) // 32 > 1:
+        warnings.warn(f"B*H={B*H} exceeds 65535 z-grid limit with current T; grid z-dimension will be split", stacklevel=2)
+    assert cum_log_gam.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    assert T > 0 and B > 0 and H > 0
     out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=torch.float32)
-    # Heuristic BLOCK selection: 32 if T<512 else 64 — balances occupancy vs coalescing
-    # Autotune will refine choice via Triton configs keyed on T
-    # Turing sm_75: keep BLOCK 32 (64KB SMEM). Ensure T<512 heuristic stays 32 on Turing, not 64.
-    BLOCK = 32 if T < 512 else 64
-    if _is_turing():
-        # Clamp to 32 on Turing to stay within 64KB SMEM; large T keeps 32 for occupancy.
-        BLOCK = 32
-    grid = ((T + BLOCK - 1) // BLOCK, (T + BLOCK - 1) // BLOCK, B * H)
+    grid = lambda META: ((T + META["BLOCK"] - 1) // META["BLOCK"], (T + META["BLOCK_J"] - 1) // META["BLOCK_J"], B * H)
     _gla_decay_kernel[grid](
         cum_log_gam, out,
         cum_log_gam.stride(0), cum_log_gam.stride(1), cum_log_gam.stride(2),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        B, H, T, BLOCK=BLOCK, BLOCK_J=BLOCK)
+        B, H, T, CLAMP_MIN=clamp_min)
     return out
 
 
@@ -247,17 +240,9 @@ class TritonGLADecayFunction(torch.autograd.Function):
             clamp_min = -11.0
         else:
             clamp_min = -11.0 if gamma.dtype == torch.float16 else -30.0
+        assert gamma.ndim == 3, f"gamma must be [B,H,T], got {gamma.shape}"
         if gamma.is_cuda and torch.cuda.is_available():
-            # TODO: pass clamp_min as tl.constexpr to _gla_decay_kernel instead of hard-coded -30
-            out = triton_gla_decay_fwd(cum.contiguous())
-            # Triton kernel currently hard-codes -30; for fp16 the tighter -11 would be more faithful.
-            # Keep parity with torch fallback by re-clamping if needed (no-op for bf16/fp32).
-            if clamp_min != -30.0:
-                # Re-apply tighter clamp via torch path for correctness on fp16
-                T = cum.shape[-1]
-                decay_diff = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).clamp(min=clamp_min, max=0.0)
-                mask = torch.tril(torch.ones(T, T, device=cum.device, dtype=torch.bool))
-                out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+            out = triton_gla_decay_fwd(cum.contiguous(), clamp_min=clamp_min)
         else:
             T = cum.shape[-1]
             decay_diff = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).clamp(min=clamp_min, max=0.0)

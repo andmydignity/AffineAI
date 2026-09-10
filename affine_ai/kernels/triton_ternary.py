@@ -10,7 +10,7 @@ Forward dots default to bf16 Tensor Cores on Ampere+ bf16 inputs
 representable); all other dots stay fp32->fp32 SIMT.
 """
 
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 import warnings
 import torch
 import triton
@@ -43,6 +43,46 @@ def _prune_turing_block(block: int) -> int:
         return 64
     return block
 
+
+def _prune_turing_block_k(block_k: int) -> int:
+    """Turing K-dimension: 64 may still overflow SMEM for twin kernels, clamp to 32."""
+    if _is_turing() and block_k > 32:
+        warnings.warn(f"Turing sm_75: clamping BLOCK_K {block_k} -> 32 (64KB SMEM)", stacklevel=3)
+        return 32
+    return _prune_turing_block(block_k)
+
+
+# NOTE: autotune configs defined but not applied to kernels — reverted due to correctness regression (NaNs with BLOCK_M=128/BLOCK_N=128 on M=64,N=64). Kept for future tuning, but kernels use explicit BLOCK sizes for parity.
+# If re-enabling, remove explicit BLOCK_M/N/K from call sites and let autotune choose; ensure mask handling for large blocks.
+_ternary_gemm_configs = [
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 1, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+]
+def _turing_prune_gemm_configs(configs):
+    if not _is_turing():
+        return configs
+    pruned=[]
+    for c in configs:
+        bm=c.kwargs.get('BLOCK_M',32)
+        bn=c.kwargs.get('BLOCK_N',32)
+        bk=c.kwargs.get('BLOCK_K',32)
+        if bm<=64 and bn<=64 and bk<=32:
+            pruned.append(c)
+        else:
+            warnings.warn(f"Turing sm_75: pruning BLOCK config {c.kwargs} > Turing limit", stacklevel=2)
+    return pruned if pruned else configs
+_ternary_gemm_configs=_turing_prune_gemm_configs(_ternary_gemm_configs)
 
 @triton.jit
 def _row_amax_kernel(
@@ -103,7 +143,7 @@ def _ternary_fwd_kernel(
         f = tl.floor(av)
         frac = av - f
         odd = f - 2.0 * tl.floor(f * 0.5)
-        up = (frac > 0.5) | ((frac == 0.5) & (odd == 1.0))
+        up = (frac > 0.5 + 1e-6) | ((tl.abs(frac - 0.5) < 1e-6) & (odd == 1.0))
         mag = f + up.to(tl.float32)
         mag = tl.minimum(mag, 127.0)
         xq = tl.where(v < 0.0, -mag, mag)
@@ -193,7 +233,7 @@ def _quantize_x_kernel(
     f = tl.floor(av)
     frac = av - f
     odd = f - 2.0 * tl.floor(f * 0.5)
-    up = (frac > 0.5) | ((frac == 0.5) & (odd == 1.0))
+    up = (frac > 0.5 + 1e-6) | ((tl.abs(frac - 0.5) < 1e-6) & (odd == 1.0))
     mag = f + up.to(tl.float32)
     mag = tl.minimum(mag, 127.0)
     xq = tl.where(v < 0.0, -mag, mag) / sc[:, None]
@@ -204,6 +244,17 @@ def _quantize_x_kernel(
 
 
 def triton_quantize_x(x: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
+    if not x.is_cuda:
+        sc = (127.0 / amax.clamp(min=1e-5)).unsqueeze(-1)
+        v = x.float() * sc
+        av = v.abs()
+        f = torch.floor(av)
+        frac = av - f
+        odd = f - 2.0 * torch.floor(f * 0.5)
+        up = (frac > 0.5 + 1e-6) | ((torch.abs(frac - 0.5) < 1e-6) & (odd == 1.0))
+        mag = torch.clamp(f + up.float(), max=127.0)
+        xq = torch.where(v < 0.0, -mag, mag) / sc
+        return xq.to(torch.float32)
     M, K = x.shape
     xq = torch.empty((M, K), device=x.device, dtype=torch.float32)
     _quantize_x_kernel[_grid(M, K, 64, 64)](
@@ -271,7 +322,7 @@ def _ternary_twin_fwd_kernel(
     stride_xm, stride_xk,
     stride_wm, stride_wk,
     stride_ym, stride_yn,
-    M, O, K,
+    M, OutDim, K,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     USE_TC: tl.constexpr = False,
@@ -282,11 +333,11 @@ def _ternary_twin_fwd_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
-    mask_n = offs_n < 2 * O
+    mask_n = offs_n < 2 * OutDim
     amax = tl.load(AMAX + offs_m, mask=mask_m, other=1e-5)
     amax = tl.maximum(amax, 1e-5)
     sc = 127.0 / amax
-    first = offs_n < O
+    first = offs_n < OutDim
     gam = tl.where(first, gamma1, gamma2)
     # Gamma hoisted: accumulate raw dot without per-iteration FMUL, scale once after loop (saves BLOCK_N FMUL per K-block).
     # Twin assumes identical strides for W1/W2 (single stride_wm/stride_wk); separate strides would need stride_wm2 etc.
@@ -303,15 +354,14 @@ def _ternary_twin_fwd_kernel(
         f = tl.floor(av)
         frac = av - f
         odd = f - 2.0 * tl.floor(f * 0.5)
-        up = (frac > 0.5) | ((frac == 0.5) & (odd == 1.0))
+        up = (frac > 0.5 + 1e-6) | ((tl.abs(frac - 0.5) < 1e-6) & (odd == 1.0))
         mag = f + up.to(tl.float32)
         mag = tl.minimum(mag, 127.0)
         xq = tl.where(v < 0.0, -mag, mag)
-        offs_n_mod = offs_n % O
-        ptr1 = W1 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk
-        ptr2 = W2 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk
-        ptr = tl.where(first[:, None], ptr1, ptr2)
-        w = tl.load(ptr, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        offs_n_mod = offs_n % OutDim
+        w1 = tl.load(W1 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        w2 = tl.load(W2 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        w = tl.where(first[:, None], w1, w2)
         if USE_TC:
             acc_raw += tl.dot(xq.to(tl.bfloat16), tl.trans(w.to(tl.bfloat16)))
         else:
@@ -338,6 +388,8 @@ def _grid(m, n, bm=64, bn=64):
 
 
 def triton_row_amax(x: torch.Tensor) -> torch.Tensor:
+    if not x.is_cuda:
+        return x.float().abs().amax(dim=-1).clamp(min=1e-5).to(torch.float32)
     K = x.shape[-1]
     x2d = x.reshape(-1, K)
     M = x2d.shape[0]
@@ -393,14 +445,14 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
     # Turing BLOCK clamp to <=64 already autotuned; prune explicitly
     BLOCK_M_T = _prune_turing_block(64)
     BLOCK_N_T = _prune_turing_block(64)
-    BLOCK_K_T = _prune_turing_block(32)
+    BLOCK_K_T = _prune_turing_block_k(32)
     n_tiles = (N + BLOCK_N_T - 1) // BLOCK_N_T
-    if n_tiles > 2 and x2d.is_cuda:
+    if n_tiles > 2 and x2d.is_cuda and not tc:  # preserve bf16 TC vs fp32: skip fast path if TC requested
         try:
             x_q = triton_quantize_x(x2d, amax)
             w_scaled = (w_tern * float(gamma)).contiguous()
             _fp32_dot_kernel[_grid(M, N, BLOCK_M_T, BLOCK_N_T)](
-                x_q, w_scaled, out, bias if has_bias else x2d,  # HAS_BIAS guard eliminates load even though pointer is dummy x2d
+                x_q, w_scaled, out, bias if has_bias else x2d,
                 x_q.stride(0), x_q.stride(1), w_scaled.stride(0), w_scaled.stride(1),
                 out.stride(0), out.stride(1),
                 M, N, K,
@@ -411,21 +463,21 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
             warnings.warn(f"ternary fast path failed: {e}")
     try:
         _ternary_fwd_kernel[_grid(M, N)](
-            x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),  # HAS_BIAS guard eliminates load even though pointer is dummy x2d
+            x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),
             x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
             out.stride(0), out.stride(1),
             M, N, K,
-            BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32), HAS_BIAS=has_bias, USE_TC=tc,
+            BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block_k(32), HAS_BIAS=has_bias, USE_TC=tc,
             num_warps=4, num_stages=3)
     except Exception as e:
         warnings.warn(f"ternary fallback failed (USE_TC={tc}): {e}")
         if tc:
             _ternary_fwd_kernel[_grid(M, N)](
-                x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),  # HAS_BIAS guard eliminates load even though pointer is dummy x2d
+                x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),
                 x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
                 out.stride(0), out.stride(1),
                 M, N, K,
-                BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32), HAS_BIAS=has_bias, USE_TC=False,
+                BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block_k(32), HAS_BIAS=has_bias, USE_TC=False,
                 num_warps=4, num_stages=3)
         else:
             raise
@@ -452,10 +504,10 @@ def triton_fp32_linear(a, b, bias=None):
     out = torch.empty((M, N), device=a.device, dtype=torch.float32)
     has_bias = bias is not None
     _fp32_dot_kernel[_grid(M, N)](
-        x2d, b, out, bias if has_bias else x2d,  # HAS_BIAS guard eliminates load even though pointer is dummy x2d
+        x2d, b, out, bias if has_bias else x2d,
         x2d.stride(0), x2d.stride(1), b.stride(0), b.stride(1),
         out.stride(0), out.stride(1),
-        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32),
+        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block_k(32),
         HAS_BIAS=has_bias, num_warps=4, num_stages=3)
     return out.reshape(*a.shape[:-1], N)
 
@@ -507,7 +559,7 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
             x = x.to(torch.float16)
         orig_shape = x.shape
         in_dim = w1_latent.size(1)
-        O = w1_latent.size(0)
+        out_dim = w1_latent.size(0)
         x_flat = x.reshape(-1, in_dim).contiguous().float()
 
         def tern(w):
@@ -522,31 +574,31 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
         b = torch.cat([b1, b2], dim=0).float() if has_bias else torch.tensor([], device=x.device)
         amax = triton_row_amax(x_flat)
         M = x_flat.shape[0]
-        out = torch.empty((M, 2 * O), device=x.device, dtype=torch.float32)
+        out = torch.empty((M, 2 * out_dim), device=x.device, dtype=torch.float32)
         tc = _resolve_tc(use_tc, x_flat) and _tc_ok(x_flat)
         if _is_turing() and tc:
             warnings.warn("Turing sm_75: disabling bf16 TC (acc fp32)", stacklevel=2)
             tc = False
-        _ternary_twin_fwd_kernel[_grid(M, 2 * O)](
+        _ternary_twin_fwd_kernel[_grid(M, 2 * out_dim)](
             x_flat, w1t, w2t, b, out, amax, float(g1), float(g2),
             x_flat.stride(0), x_flat.stride(1), w1t.stride(0), w1t.stride(1),
             out.stride(0), out.stride(1),
-            M, O, in_dim, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32),
+            M, out_dim, in_dim, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block_k(32),
             HAS_BIAS=has_bias, USE_TC=tc, num_warps=4, num_stages=3)
         ctx.save_for_backward(x_flat, w1t, w2t, amax)
         ctx.g1, ctx.g2, ctx.has_bias = g1, g2, has_bias
         ctx.w1_dtype = w1_latent.dtype
         ctx.w2_dtype = w2_latent.dtype
-        return out.to(x.dtype).reshape(*orig_shape[:-1], 2 * O)
+        return out.to(x.dtype).reshape(*orig_shape[:-1], 2 * out_dim)
 
     @staticmethod
     def backward(ctx, grad_output):
         x_flat, w1t, w2t, amax = ctx.saved_tensors
         g1, g2, has_bias = ctx.g1, ctx.g2, ctx.has_bias
-        O = w1t.size(0)
+        out_dim = w1t.size(0)
         in_dim = w1t.size(1)
-        go_flat = grad_output.reshape(-1, 2 * O).contiguous().float()
-        go1, go2 = go_flat.split(O, dim=-1)
+        go_flat = grad_output.reshape(-1, 2 * out_dim).contiguous().float()
+        go1, go2 = go_flat.split(out_dim, dim=-1)
         gx = (triton_fp32_linear(go1, (w1t * g1).t().contiguous(), None)
               + triton_fp32_linear(go2, (w2t * g2).t().contiguous(), None)).to(grad_output.dtype).reshape(grad_output.shape[:-1] + (in_dim,)) if ctx.needs_input_grad[0] else None
         need_w1 = ctx.needs_input_grad[1]
@@ -555,8 +607,8 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
             x_q = triton_quantize_x(x_flat, amax)
         else:
             x_q = None
-        gw1 = (triton_ternary_linear_gw(go1.contiguous(), None, None, O, in_dim, x_q=x_q) * g1).to(ctx.w1_dtype) if need_w1 else None
-        gw2 = (triton_ternary_linear_gw(go2.contiguous(), None, None, O, in_dim, x_q=x_q) * g2).to(ctx.w2_dtype) if need_w2 else None
+        gw1 = (triton_ternary_linear_gw(go1.contiguous(), None, None, out_dim, in_dim, x_q=x_q) * g1).to(ctx.w1_dtype) if need_w1 else None
+        gw2 = (triton_ternary_linear_gw(go2.contiguous(), None, None, out_dim, in_dim, x_q=x_q) * g2).to(ctx.w2_dtype) if need_w2 else None
         gb1 = go1.sum(0).to(grad_output.dtype) if (has_bias and len(ctx.needs_input_grad) > 2 and ctx.needs_input_grad[2]) else None
         gb2 = go2.sum(0).to(grad_output.dtype) if (has_bias and len(ctx.needs_input_grad) > 4 and ctx.needs_input_grad[4]) else None
         return (gx,
@@ -583,7 +635,7 @@ def triton_ternary_linear_gw(go, x, amax, N, K, x_q=None):
         go, x_q, gw,
         go.stride(0), go.stride(1), x_q.stride(0), x_q.stride(1),
         gw.stride(0), gw.stride(1),
-        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(32), BLOCK_K=_prune_turing_block(64),
+        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(32), BLOCK_K=_prune_turing_block_k(64),
         num_warps=4, num_stages=2)
     return gw
 
@@ -613,7 +665,7 @@ def _unpack_2bit_kernel(
     packed_val = tl.load(Packed_ptr + row_idx * stride_packed_row + packed_col, mask=mask_col, other=0).to(tl.uint32)
     code = (packed_val >> bit_pos) & 3
     # code==3 (0b11) is unused/corrupted; maps to 0 to tolerate checkpoint corruption.
-    # Optionally enable tl.device_assert(code != 3) for debug.
+    # Debug: tl.device_assert(tl.sum((code == 3).to(tl.int32)) == 0, "packed ternary code 3 corrupted") — fallback maps to 0 for robustness.
     tern = tl.where(code == 1, 1.0, tl.where(code == 2, -1.0, 0.0))
 
     tl.store(Unpacked_ptr + row_idx * stride_unpacked_row + offs_col, tern.to(Unpacked_ptr.dtype.element_ty), mask=mask_col)
@@ -657,22 +709,13 @@ def _pack_2bit_kernel(
     mask_m = offs_m < Rows
     mask_p = offs_p < (Cols // 16)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    w_block_ptr = tl.make_block_ptr(
-        base=W_ptr,
-        shape=(Rows, Cols),
-        strides=(stride_wm, stride_wk),
-        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N * 16),
-        block_shape=(BLOCK_M, BLOCK_N * 16),
-        order=(1, 0),
-    )
-    w_tile = tl.load(w_block_ptr, boundary_check=(0, 1))
+    # Manual pointer arithmetic: load W slice via explicit pointers (fixes w_tile[:, idx-vector] gather)
     for i in range(16):
         shift = (i // 4) * 8 + (3 - (i % 4)) * 2
-        offs_bn = tl.arange(0, BLOCK_N)
-        idx = offs_bn * 16 + i
-        w = w_tile[:, idx]
-        mask_tile = mask_m[:, None] & mask_p[None, :]
-        w = tl.where(mask_tile, w, 0.0)
+        cols = pid_n * BLOCK_N * 16 + tl.arange(0, BLOCK_N) * 16 + i
+        mask_col = cols < Cols
+        w_ptrs = W_ptr + offs_m[:, None] * stride_wm + cols[None, :] * stride_wk
+        w = tl.load(w_ptrs, mask=mask_m[:, None] & mask_col[None, :], other=0.0)
         code = tl.where(w == 1.0, 1, tl.where(w == -1.0, 2, 0)).to(tl.int32)
         acc = acc | (code << shift)
     tl.store(

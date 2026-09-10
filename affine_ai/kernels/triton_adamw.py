@@ -8,9 +8,8 @@ Eliminates intermediate tensor allocations and multiple CUDA kernel launches.
 """
 
 import math
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Tuple
 import torch
-import torch.nn as nn
 from torch.optim.optimizer import Optimizer
 import triton
 import triton.language as tl
@@ -147,37 +146,45 @@ class TritonAdamW(Optimizer):
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state['step'] = 0  # A-06: int step, not tensor -> not capturable
-                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)  # A-01: shape matches p.shape exactly
-                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
-                    # Issue 40: Support FP32 master weights for half-precision (FP16/BF16)
-                    # Turing sm_75: uses fp16 master weights with fp32 accum (bf16 unsupported → fp16 fallback)
+                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
+                    moment_dtype = torch.float64 if p.dtype == torch.float64 else torch.float32
+                    state['exp_avg'] = torch.zeros_like(p, dtype=moment_dtype, device=p.device)
+                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=moment_dtype, device=p.device)
                     if use_master and p.dtype in (torch.float16, torch.bfloat16):
                         state['master_param'] = p_data.detach().clone().to(torch.float32)
 
-                state['step'] += 1
-                step_val = state['step']
-                # A-05: host beta**step breaks CUDA Graphs (host math not graph-capturable)
-                # TODO: compute bc on device for graph capture; keep host math but document.
-                # A-06: state['step'] is int not tensor, so not capturable for CUDA Graphs; documented.
-                bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
-                bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
+                try:
+                    if p.is_cuda and torch.cuda.is_available() and hasattr(torch.cuda, "is_current_stream_capturing") and torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError("TritonAdamW.step is not CUDA-graph capturable (host beta**step). Run outside graph or disable capture.")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+
+                state['step'].add_(1)
+                step_val = int(state['step'].item()) if not p.is_cuda else int(state['step'].cpu().item()) if state['step'].is_cuda else int(state['step'])
+                is_fp64_param = p.dtype == torch.float64
+                if is_fp64_param:
+                    bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
+                    bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
+                else:
+                    bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
+                    bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
                 step_size = lr / bias_correction1
                 bc2_sqrt = math.sqrt(bias_correction2)
 
                 has_master = 'master_param' in state
                 master_p = state['master_param'] if has_master else p_data
 
-                if p.is_cuda:
+                if p.is_cuda and not is_fp64_param:
                     N = p_data.numel()
-                    # larger BLOCK for big tensors to reduce launch overhead (capped at 1024 threads)
                     if N > 1 << 18:
                         BLOCK_SIZE = 1024
                     elif N > 1 << 14:
                         BLOCK_SIZE = 512
                     else:
                         BLOCK_SIZE = 256
-                    has_wd = weight_decay != 0.0  # A-03
+                    has_wd = weight_decay != 0.0
                     grid = (triton.cdiv(N, BLOCK_SIZE),)
                     _adamw_kernel[grid](
                         p_data,
@@ -189,28 +196,26 @@ class TritonAdamW(Optimizer):
                         N,
                         master_p,
                         HAS_MASTER=has_master,
-                        HAS_WD=has_wd,  # A-03
+                        HAS_WD=has_wd,
                         BLOCK_SIZE=BLOCK_SIZE
                     )
                 else:
-                    # CPU Fallback (handles fp16/bf16 via fp32 accum; Turing sm_75 uses fp16 master weights + fp32 moments)
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
-                    # A-02: CPU fallback must use fp32 grad unconditionally (bf16 grad loses precision)
-                    grad_f32 = grad_data.float()  # A-02 fix
+                    grad_acc = grad_data.double() if is_fp64_param else grad_data.float()
                     if has_master:
                         if weight_decay != 0.0:
                             master_p.mul_(1.0 - lr * weight_decay)
-                        exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)
-                        exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
+                        exp_avg.mul_(beta1).add_(grad_acc, alpha=1.0 - beta1)
+                        exp_avg_sq.mul_(beta2).addcmul_(grad_acc, grad_acc, value=1.0 - beta2)
                         denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
                         master_p.addcdiv_(exp_avg, denom, value=-step_size)
                         p_data.copy_(master_p)
                     else:
                         if weight_decay != 0.0:
                             p_data.mul_(1.0 - lr * weight_decay)
-                        exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)  # A-02: use grad_f32 not grad_data
-                        exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)  # A-02
+                        exp_avg.mul_(beta1).add_(grad_acc, alpha=1.0 - beta1)
+                        exp_avg_sq.mul_(beta2).addcmul_(grad_acc, grad_acc, value=1.0 - beta2)
                         denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
                         p_data.addcdiv_(exp_avg, denom, value=-step_size)
 

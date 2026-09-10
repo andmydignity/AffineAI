@@ -7,9 +7,9 @@ Note: No 2:4 structured sparsity mask is applied; earlier header overstated
 "Fused 2:4 Sparse" — this kernel is fused SiLU+Down only.
 """
 
-import math
+import math  # noqa: F401
 import warnings
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any  # noqa: F401
 import torch
 import triton
 import triton.language as tl
@@ -40,9 +40,23 @@ def _prune_turing_block(block: int) -> int:
 
 
 _swiglu_autotune_configs = [
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=2, num_stages=3),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_M': 1, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
 ]
 
 def _turing_prune_configs(configs):
@@ -62,6 +76,13 @@ def _turing_prune_configs(configs):
 _swiglu_autotune_configs = _turing_prune_configs(_swiglu_autotune_configs)
 
 
+def _sigmoid_fallback(x):
+    try:
+        return tl.sigmoid(x)
+    except Exception:
+        return 1.0 / (1.0 + tl.exp(-x))
+
+
 @triton.autotune(configs=_swiglu_autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
 def _swiglu_down_fwd_kernel(
@@ -70,11 +91,12 @@ def _swiglu_down_fwd_kernel(
     stride_wdk, stride_wdn,
     stride_outm, stride_outk,
     stride_hm, stride_hn,
-    Gamma_d_ptr,
+    Gamma_d,
     M, N, K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_STORE: tl.constexpr,
 ):
     """
     Intra-Kernel SRAM Fusion Forward:
@@ -90,39 +112,32 @@ def _swiglu_down_fwd_kernel(
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
     mask_k = offs_k < K
-
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-    gamma_d = tl.load(Gamma_d_ptr).to(tl.float32)
+    gamma_d = Gamma_d
 
     for n_start in range(0, N, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
 
-        gate_ptrs = GV + offs_m[:, None] * stride_gvm + offs_n[None, :] * stride_gvn
-        val_ptrs = GV + offs_m[:, None] * stride_gvm + (offs_n[None, :] + N) * stride_gvn
+        gv_gate_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, n_start), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+        gv_val_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, n_start + N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+        gate = tl.load(gv_gate_ptr, boundary_check=(0, 1))
+        val = tl.load(gv_val_ptr, boundary_check=(0, 1))
+        gate = tl.where(mask_m[:, None] & mask_n[None, :], gate, 0.0)
+        val = tl.where(mask_m[:, None] & mask_n[None, :], val, 0.0)
 
-        gate = tl.load(gate_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-        val = tl.load(val_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-
-        # Standard CUDA Core SIMT activation in SRAM registers
         gate_f = gate.to(tl.float32)
         val_f = val.to(tl.float32)
-        sig = tl.sigmoid(gate_f)
+        sig = 1.0 / (1.0 + tl.exp(-gate_f))
         h_act = (gate_f * sig) * val_f
 
-        # Save h_act to DRAM in fp32 for numerical stability (or recompute in bwd)
-        # Per-program host branch on pid_k==0 (constexpr per program); alternative is HAS_STORE constexpr or tl.where
-        if pid_k == 0:
-            h_ptrs = H_ACT + offs_m[:, None] * stride_hm + offs_n[None, :] * stride_hn
-            tl.store(h_ptrs, h_act.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :])
+        if HAS_STORE:
+            h_ptr = tl.make_block_ptr(base=H_ACT, shape=(M, N), strides=(stride_hm, stride_hn), offsets=(pid_m * BLOCK_M, n_start), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+            tl.store(h_ptr, h_act, boundary_check=(0, 1))
 
-        # Load W_down tile [K, N] transposed to [N, K]
-        wd_ptrs = W_D + offs_k[None, :] * stride_wdk + offs_n[:, None] * stride_wdn
-        wd = tl.load(wd_ptrs, mask=mask_k[None, :] & mask_n[:, None], other=0.0)
-
-        # Tensor Core dot-product accumulation in SRAM (ieee for fp32)
-        # Mixed precision: h_act fp32 cast to bf16 for dot gives ~1e-3 precision vs torch fp32; acceptable for SwiGLU path
-        acc += tl.dot(h_act.to(W_D.dtype.element_ty), wd, out_dtype=tl.float32, input_precision="ieee")
+        w_ptr = tl.make_block_ptr(base=W_D, shape=(K, N), strides=(stride_wdk, stride_wdn), offsets=(pid_k * BLOCK_K, n_start), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))
+        wd = tl.load(w_ptr, boundary_check=(0, 1))
+        acc += tl.dot(h_act, tl.trans(wd), out_dtype=tl.float32, input_precision="ieee")
 
     acc = acc * gamma_d
     out_ptrs = OUT + offs_m[:, None] * stride_outm + offs_k[None, :] * stride_outk
@@ -137,7 +152,7 @@ def _swiglu_bwd_kernel(
     stride_wdk, stride_wdn,
     stride_gvm, stride_gvn,
     stride_ggvm, stride_ggvn,
-    Gamma_d_ptr,
+    Gamma_d,
     M, N, K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -157,7 +172,7 @@ def _swiglu_bwd_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    gamma_d = tl.load(Gamma_d_ptr).to(tl.float32)
+    gamma_d = Gamma_d
 
     # Accumulate g_hact in SRAM via Tensor Cores: GO @ W_D
     g_hact = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -165,35 +180,34 @@ def _swiglu_bwd_kernel(
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
 
-        go_ptrs = GO + offs_m[:, None] * stride_gom + offs_k[None, :] * stride_gok
-        go = tl.load(go_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-
-        wd_ptrs = W_D + offs_k[:, None] * stride_wdk + offs_n[None, :] * stride_wdn
-        wd = tl.load(wd_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
-
+        go_ptr = tl.make_block_ptr(base=GO, shape=(M, K), strides=(stride_gom, stride_gok), offsets=(pid_m * BLOCK_M, k_start), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
+        go = tl.load(go_ptr, boundary_check=(0, 1))
+        go = tl.where(mask_m[:, None] & mask_k[None, :], go, 0.0)
+        wd_ptr = tl.make_block_ptr(base=W_D, shape=(K, N), strides=(stride_wdk, stride_wdn), offsets=(k_start, pid_n * BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))
+        wd = tl.load(wd_ptr, boundary_check=(0, 1))
+        wd = tl.where(mask_k[:, None] & mask_n[None, :], wd, 0.0)
         g_hact += tl.dot(go, wd, out_dtype=tl.float32, input_precision="ieee")
 
     g_hact = g_hact * gamma_d
 
     # Load gate & val in SRAM
-    gate_ptrs = GV + offs_m[:, None] * stride_gvm + offs_n[None, :] * stride_gvn
-    val_ptrs = GV + offs_m[:, None] * stride_gvm + (offs_n[None, :] + N) * stride_gvn
-    gate = tl.load(gate_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
-    val = tl.load(val_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
-
-    # CUDA Core SIMT activation gradient in SRAM
-    sig = tl.sigmoid(gate)
+    gv_gate_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+    gv_val_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N + N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+    gate = tl.load(gv_gate_ptr, boundary_check=(0, 1)).to(tl.float32)
+    val = tl.load(gv_val_ptr, boundary_check=(0, 1)).to(tl.float32)
+    gate = tl.where(mask_m[:, None] & mask_n[None, :], gate, 0.0)
+    val = tl.where(mask_m[:, None] & mask_n[None, :], val, 0.0)
+    sig = 1.0 / (1.0 + tl.exp(-gate))
     dsilu = sig * (1.0 + gate * (1.0 - sig))
 
     dval = g_hact * (gate * sig)
     dgate = g_hact * (val * dsilu)
 
     # Write out g_gate & g_val directly into G_GV [M, 2*N]
-    g_gate_ptrs = G_GV + offs_m[:, None] * stride_ggvm + offs_n[None, :] * stride_ggvn
-    g_val_ptrs = G_GV + offs_m[:, None] * stride_ggvm + (offs_n[None, :] + N) * stride_ggvn
-
-    tl.store(g_gate_ptrs, dgate.to(G_GV.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
-    tl.store(g_val_ptrs, dval.to(G_GV.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+    g_gate_ptr = tl.make_block_ptr(base=G_GV, shape=(M, 2 * N), strides=(stride_ggvm, stride_ggvn), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+    g_val_ptr = tl.make_block_ptr(base=G_GV, shape=(M, 2 * N), strides=(stride_ggvm, stride_ggvn), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N + N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+    tl.store(g_gate_ptr, dgate.to(G_GV.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(g_val_ptr, dval.to(G_GV.dtype.element_ty), boundary_check=(0, 1))
 
 
 class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
@@ -238,27 +252,27 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         w_gv_q = torch.round(torch.clamp(w_gv_f / gamma_gv, -1.0, 1.0)).to(w_gv_f.dtype)
         w_d_q = torch.round(torch.clamp(w_d_f / gamma_d, -1.0, 1.0)).to(w_d_f.dtype)
 
-        gamma_d_tensor = gamma_d.to(torch.float32) if isinstance(gamma_d, torch.Tensor) else torch.tensor(float(gamma_d), device=x.device, dtype=torch.float32)
-
-        # Step 1: Compute Gate & Val projections via Tensor Cores with quantized weights * gamma
-        gv = torch.matmul(x_flat, w_gv_q.t()) * gamma_gv  # [M, 2*N]
-
-        # Step 2 & 3: Fused in-SRAM SiLU(gate) * val + Down projection via Triton
+        gamma_d_scalar = float(gamma_d.to(torch.float32).item()) if isinstance(gamma_d, torch.Tensor) else float(gamma_d)
+        gv = torch.matmul(x_flat, w_gv_q.t()) * gamma_gv
         out = torch.empty((M, K), device=x_flat.device, dtype=x_flat.dtype)
         h_act = torch.empty((M, N), device=x_flat.device, dtype=torch.float32)
-
-        grid_fwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(K, META["BLOCK_K"]))
+        gate_pt, val_pt = gv.chunk(2, dim=-1)
+        sig_pt = torch.sigmoid(gate_pt.float())
+        h_act_pytorch = (gate_pt.float() * sig_pt * val_pt.float())
+        h_act.copy_(h_act_pytorch)
+        grid_fwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(K, META["BLOCK_K"]))  # noqa: E731
         _swiglu_down_fwd_kernel[grid_fwd](
             gv, w_d_q, out, h_act,
             gv.stride(0), gv.stride(1),
             w_d_q.stride(0), w_d_q.stride(1),
             out.stride(0), out.stride(1),
             h_act.stride(0), h_act.stride(1),
-            gamma_d_tensor,
+            gamma_d_scalar,
             M, N, K,
+            HAS_STORE=False,
         )
 
-        ctx.save_for_backward(x_flat, w_gv_q, w_d_q, gv, h_act, gamma_gv, gamma_d_tensor)
+        ctx.save_for_backward(x_flat, w_gv_q, w_d_q, gv, h_act, gamma_gv, torch.tensor(gamma_d_scalar, device=x_flat.device, dtype=torch.float32))
         ctx.orig_shape = orig_shape
         return out.reshape(*orig_shape)
 
@@ -276,14 +290,15 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
 
         # 2. Gradients through SwiGLU non-linearity directly fused in SRAM
         g_gv = torch.empty((M, 2 * N), dtype=x_flat.dtype, device=x_flat.device)
-        grid_bwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+        grid_bwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))  # noqa: E731
+        gamma_d_scalar = float(gamma_d.item())
         _swiglu_bwd_kernel[grid_bwd](
             go_flat, w_d_q, gv, g_gv,
             go_flat.stride(0), go_flat.stride(1),
             w_d_q.stride(0), w_d_q.stride(1),
             gv.stride(0), gv.stride(1),
             g_gv.stride(0), g_gv.stride(1),
-            gamma_d,
+            gamma_d_scalar,
             M, N, K,
         )
 

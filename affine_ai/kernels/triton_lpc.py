@@ -14,25 +14,32 @@ Coalesced access via tl.make_block_ptr with boundary_check for tails.
 import warnings
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Tuple, Optional
 
 
+_TURING_CACHE = None
+
 def _is_turing() -> bool:
+    global _TURING_CACHE
+    if _TURING_CACHE is not None:
+        return _TURING_CACHE
     try:
         from affine_ai.kernels import _IS_TURING as _T  # type: ignore
 
-        return bool(_T)
+        _TURING_CACHE = bool(_T)
+        return _TURING_CACHE
     except Exception:
         pass
     try:
         if torch.cuda.is_available():
             cap = torch.cuda.get_device_capability()
-            return (7, 5) <= tuple(cap) < (8, 0)
+            _TURING_CACHE = (7, 5) <= tuple(cap) < (8, 0)
+            return _TURING_CACHE
     except Exception:
         pass
+    _TURING_CACHE = False
     return False
 
 
@@ -86,7 +93,7 @@ lpc_bwd_dw_configs = [
 
 @triton.autotune(
     configs=lpc_fwd_configs,
-    key=['D', 'V', 'BLOCK_M'],
+    key=['D', 'V'],
     prune_configs_by={'early_config_prune': _prune_turing_lpc_configs},
 )
 @triton.jit
@@ -108,7 +115,6 @@ def _triton_lpc_fwd_kernel(
     target = tl.load(Targets_ptr + offs_m * stride_tb, mask=mask_m, other=ignore_index)
     valid_mask = mask_m & (target != ignore_index) & (target >= 0) & (target < V)
 
-    # acc_dtype derived from max(H,W): promote bf16/fp16 -> fp32, else fp64 if either is fp64
     acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
 
     m_i = tl.full([BLOCK_M], -1e30, dtype=acc_dtype)
@@ -121,13 +127,18 @@ def _triton_lpc_fwd_kernel(
 
         acc = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
         for d_start in range(0, D, BLOCK_D):
-            # coalesced block_ptr loads where D is contiguous (stride_hd==1, stride_wd==1) with boundary_check for tails
-            H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(pid_m * BLOCK_M, d_start), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
-            h_tile = tl.load(H_block, boundary_check=(0, 1))
-            W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_start), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
-            w_tile = tl.load(W_block, boundary_check=(0, 1))
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            if stride_hd == 1 and stride_wd == 1:
+                H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(pid_m * BLOCK_M, d_start), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
+                h_tile = tl.load(H_block, boundary_check=(0, 1))
+                W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_start), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+                w_tile = tl.load(W_block, boundary_check=(0, 1))
+            else:
+                h_tile = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+                w_tile = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
 
-            acc += tl.dot(h_tile, tl.trans(w_tile), input_precision="ieee")
+            acc += tl.dot(h_tile, tl.trans(w_tile), allow_tf32=False)
 
         acc_masked = tl.where(mask_m[:, None] & mask_v[None, :], acc, -1e30)
         chunk_max = tl.max(acc_masked, axis=1)
@@ -153,7 +164,7 @@ def _triton_lpc_fwd_kernel(
 
 @triton.autotune(
     configs=lpc_bwd_dh_configs,
-    key=['D', 'V', 'BLOCK_M'],
+    key=['D', 'V'],
     prune_configs_by={'early_config_prune': _prune_turing_lpc_configs},
 )
 @triton.jit
@@ -169,11 +180,8 @@ def _triton_lpc_bwd_dh_kernel(
     BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr
 ):
     pid_m = tl.program_id(0)
-    pid_d = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < N
-    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
 
     target = tl.load(Targets_ptr + offs_m * stride_tb, mask=mask_m, other=ignore_index)
     valid_mask = mask_m & (target != ignore_index) & (target >= 0) & (target < V)
@@ -181,7 +189,6 @@ def _triton_lpc_bwd_dh_kernel(
     grad_scale = tl.load(Grad_scale_ptr)
 
     acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
-    dh_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=acc_dtype)
 
     for v_start in range(0, V, BLOCK_V):
         offs_v = v_start + tl.arange(0, BLOCK_V)
@@ -189,28 +196,30 @@ def _triton_lpc_bwd_dh_kernel(
 
         logits = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
         for d_k in range(0, D, BLOCK_D):
-            H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(pid_m * BLOCK_M, d_k), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
-            h_k = tl.load(H_block, boundary_check=(0, 1))
-            W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_k), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
-            w_k = tl.load(W_block, boundary_check=(0, 1))
-            logits += tl.dot(h_k, tl.trans(w_k), input_precision="ieee")
+            offs_dk = d_k + tl.arange(0, BLOCK_D)
+            mask_dk = offs_dk < D
+            h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
+            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+            logits += tl.dot(h_k, tl.trans(w_k), allow_tf32=False)
 
         diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
         p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
         is_target = (target[:, None] == offs_v[None, :]) & valid_mask[:, None] & mask_v[None, :]
         dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
         scaled_fp32 = dlogits * grad_scale
-        Wd_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, pid_d * BLOCK_D), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
-        w_d = tl.load(Wd_block, boundary_check=(0, 1))
-        dh_acc += tl.dot(scaled_fp32, w_d.to(tl.float32), input_precision="ieee")
-
-    DH_block = tl.make_block_ptr(base=DH_ptr, shape=(N, D), strides=(stride_dhb, stride_dhd), offsets=(pid_m * BLOCK_M, pid_d * BLOCK_D), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
-    tl.store(DH_block, dh_acc.to(H_ptr.dtype.element_ty), boundary_check=(0, 1))
+        for d_start in range(0, D, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+            dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), allow_tf32=False)
+            dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
+            cur = tl.load(dh_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            tl.store(dh_ptrs, cur + dh_contrib, mask=mask_m[:, None] & mask_d[None, :])
 
 
 @triton.autotune(
     configs=lpc_bwd_dw_configs,
-    key=['D', 'V', 'BLOCK_M'],
+    key=['D', 'V'],
     prune_configs_by={'early_config_prune': _prune_turing_lpc_configs},
 )
 @triton.jit
@@ -227,15 +236,11 @@ def _triton_lpc_bwd_dw_kernel(
     BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr
 ):
     pid_v = tl.program_id(0)
-    pid_d = tl.program_id(1)
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
-    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
 
     acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
     grad_scale = tl.load(Grad_scale_ptr)
-    dw_acc = tl.zeros([BLOCK_V, BLOCK_D], dtype=acc_dtype)
 
     for n_start in range(0, N, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
@@ -247,23 +252,25 @@ def _triton_lpc_bwd_dw_kernel(
 
         logits = tl.zeros([BLOCK_V, BLOCK_N], dtype=acc_dtype)
         for d_k in range(0, D, BLOCK_D):
-            Wk_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(pid_v * BLOCK_V, d_k), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
-            w_k = tl.load(Wk_block, boundary_check=(0, 1))
-            Hk_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(n_start, d_k), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
-            h_k = tl.load(Hk_block, boundary_check=(0, 1))
-            logits += tl.dot(w_k, tl.trans(h_k), input_precision="ieee")
+            offs_dk = d_k + tl.arange(0, BLOCK_D)
+            mask_dk = offs_dk < D
+            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+            h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
+            logits += tl.dot(w_k, tl.trans(h_k), allow_tf32=False)
 
         diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
         p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
         is_target = (offs_v[:, None] == target[None, :]) & mask_v[:, None] & valid_mask[None, :]
         dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
         scaled_fp32 = dlogits * grad_scale
-        Hd_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(n_start, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
-        h_d = tl.load(Hd_block, boundary_check=(0, 1))
-        dw_acc += tl.dot(scaled_fp32, h_d.to(tl.float32), input_precision="ieee")
-
-    DW_block = tl.make_block_ptr(base=DW_ptr, shape=(V, D), strides=(stride_dwv, stride_dwd), offsets=(pid_v * BLOCK_V, pid_d * BLOCK_D), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
-    tl.store(DW_block, dw_acc.to(W_ptr.dtype.element_ty), boundary_check=(0, 1))
+        for d_start in range(0, D, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            dw_contrib = tl.dot(scaled_fp32, h_d.to(tl.float32), allow_tf32=False)
+            dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
+            cur = tl.load(dw_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+            tl.store(dw_ptrs, cur + dw_contrib, mask=mask_v[:, None] & mask_d[None, :])
 
 
 class _TritonFusedLPCHeadFunc(torch.autograd.Function):
@@ -334,7 +341,8 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         losses = torch.empty(N, dtype=alloc_dtype, device=h.device)
         lse = torch.empty(N, dtype=alloc_dtype, device=h.device)
 
-        grid = lambda META: (triton.cdiv(N, META['BLOCK_M']),)  # N varies: grid depends on N via cdiv
+        def grid(META):
+            return (triton.cdiv(N, META['BLOCK_M']),)
 
         _triton_lpc_fwd_kernel[grid](
             h_flat, weight_orig, targets_flat, losses, lse,
@@ -397,37 +405,42 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
 
         dh_flat = None
         if ctx.needs_input_grad[0]:
-            dh_flat = torch.empty((N, D), dtype=h_flat.dtype, device=h_flat.device)
-            grid_dh = lambda META: (triton.cdiv(N, META['BLOCK_M']), triton.cdiv(D, META['BLOCK_D']))
+            calc_dtype = torch.float64 if h_flat.dtype == torch.float64 else torch.float32
+            dh_acc = torch.zeros((N, D), dtype=calc_dtype, device=h_flat.device)
+            def grid_dh(META):
+                return (triton.cdiv(N, META['BLOCK_M']),)
 
             _triton_lpc_bwd_dh_kernel[grid_dh](
-                h_flat, weight, targets_flat, lse, grad_scale_tensor, dh_flat,
+                h_flat, weight, targets_flat, lse, grad_scale_tensor, dh_acc,
                 h_flat.stride(0), h_flat.stride(1),
                 weight.stride(0), weight.stride(1),
                 targets_flat.stride(0),
                 lse.stride(0),
-                dh_flat.stride(0), dh_flat.stride(1),
+                dh_acc.stride(0), dh_acc.stride(1),
                 ignore_index=ignore_index,
                 N=N, D=D, V=V,
             )
-            dh_flat = dh_flat.view(ctx.orig_shape)
+            dh_flat = dh_acc.to(h_flat.dtype).view(ctx.orig_shape)
 
         dw = None
         if ctx.needs_input_grad[1]:
-            dw = torch.empty_like(weight)
-            grid_dw = lambda META: (triton.cdiv(V, META['BLOCK_V']), triton.cdiv(D, META['BLOCK_D']))
+            calc_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
+            dw_acc = torch.zeros((V, D), dtype=calc_dtype, device=weight.device)
+            def grid_dw(META):
+                return (triton.cdiv(V, META['BLOCK_V']),)
 
             _triton_lpc_bwd_dw_kernel[grid_dw](
-                h_flat, weight, targets_flat, lse, dw,
+                h_flat, weight, targets_flat, lse, dw_acc,
                 grad_scale_tensor,
                 h_flat.stride(0), h_flat.stride(1),
                 weight.stride(0), weight.stride(1),
                 targets_flat.stride(0),
                 lse.stride(0),
-                dw.stride(0), dw.stride(1),
+                dw_acc.stride(0), dw_acc.stride(1),
                 ignore_index=ignore_index,
                 N=N, D=D, V=V,
             )
+            dw = dw_acc.to(weight.dtype)
 
         return dh_flat, dw, None, None
 

@@ -91,8 +91,8 @@ if triton_adamw_step is None:
                 if has_master:
                     if weight_decay != 0.0:
                         mp.mul_(1.0 - lr * weight_decay)
-                    exp_avg.mul_(0.9).add_(grad_f32, alpha=1.0 - beta1)  # simplified fallback
-                    exp_avg_sq.mul_(0.999).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
+                    exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
                     # Use passed betas for correct math
                     bc1 = 1.0 - beta1 ** step
                     bc2 = 1.0 - beta2 ** step
@@ -142,8 +142,26 @@ if triton_adamw_step is None:
 
 try:
     import torch
-    import triton
-    TRITON_AVAILABLE = torch.cuda.is_available() and (triton_rms_norm is not None)
+    import triton  # noqa: F401
+    _ALL_TRITON_SYMBOLS = [
+        triton_rms_norm, triton_fused_add_rms_norm, triton_fused_linear_cross_entropy,
+        fused_asdag_forward_triton, triton_fused_lpc_head,
+        triton_ternary_linear, triton_ternary_twin, triton_row_amax,
+        triton_ternary_linear_fwd, triton_fp32_linear, triton_ternary_linear_gw,
+        triton_quantize_x, triton_tree_perm, triton_monarch_chain,
+        triton_fused_monarch_chain, triton_gla_decay, triton_router_topk,
+        triton_unpack_ternary_2bit, triton_pack_ternary_2bit,
+        triton_pack_sign_bits, triton_popc_sign_similarity,
+        triton_int8_imma_linear, triton_pot5_linear, triton_pot5_int8_linear,
+        triton_pot5_fused_swiglu, triton_pot5_bitpacked_linear,
+        pack_pot5_gpu_3bitplane, unpack_pot5_gpu_3bitplane,
+        Triton5StatePOTBitpackedLinear,
+        triton_fused_byte_encoder, TritonByteEncoderFunction,
+        triton_patch_mean_pool, triton_patch_weighted_pool,
+        triton_bitlinear_swiglu, TritonBitLinearSwiGLUFunction,
+        TritonAdamW, triton_adamw_step, triton_fused_perm_proj,
+    ]
+    TRITON_AVAILABLE = torch.cuda.is_available() and any(s is not None for s in _ALL_TRITON_SYMBOLS)
     # Turing (sm_75) FP16 AMP support: keep Triton but cap SMEM/BLOCK and force fp16
     _IS_TURING = False
     _IS_AMPERE_PLUS = False

@@ -137,22 +137,13 @@ def _rms_norm_fwd_kernel(
     row_idx = tl.program_id(0)
     x_dtype = X_ptr.dtype.element_ty
     acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
-    is_fp64 = x_dtype == tl.float64
-    # eps is tl.constexpr python float; keep as constexpr, rsqrt will promote correctly (float64 if is_fp64 else float32)
     eps_val = eps
 
     if D <= BLOCK_SIZE:
         cols = tl.arange(0, BLOCK_SIZE)
         mask = cols < D
-        if stride_xd == 1 and stride_od == 1:
-            # Contiguous TMA path: tl.make_block_ptr enables coalesced 128b transactions (5-15% BW gain)
-            x_block = tl.make_block_ptr(base=X_ptr, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
-            # Use row offset via base pointer arithmetic: X_ptr + row_idx*stride_xb gives row base
-            # Triton block_ptr does not support per-row base directly without 2D shape, so keep manual for 2D case but scale uses block_ptr
-            x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
-        else:
-            x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
-            x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
+        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
         var = tl.sum(x * x, axis=0) / D
         rsqrt = tl.rsqrt(var + eps_val)
         tl.store(Rsqrt_ptr + row_idx, rsqrt)
@@ -225,6 +216,7 @@ def _rms_norm_bwd_dx_kernel(
     D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr
 ):
+    """RMSNorm backward dx: uses block_ptr when contiguous, fallback to masked loads."""
     row_idx = tl.program_id(0)
     x_dtype = X_ptr.dtype.element_ty
     acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
@@ -233,38 +225,77 @@ def _rms_norm_bwd_dx_kernel(
     if D <= BLOCK_SIZE:
         cols = tl.arange(0, BLOCK_SIZE)
         mask = cols < D
-        dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
-        x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
-        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
+        if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1 and stride_dxd == 1:
+            dy_block = tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
+            dy = tl.load(dy_block, boundary_check=(0,)).to(acc_dtype)
+            dy = tl.where(cols < D, dy, 0.0)
+            x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
+            x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
+            x = tl.where(cols < D, x, 0.0)
+            scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
+            scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
+            scale = tl.where(cols < D, scale, 0.0)
+        else:
+            dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
+            x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
+            scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
         dy_scale = dy * scale
         inner = tl.sum(dy_scale * x, axis=0)
         coeff = (inner * rsqrt * rsqrt) / D
         dx = (dy_scale - x * coeff) * rsqrt
-        tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
+        if stride_dxd == 1:
+            dx_block = tl.make_block_ptr(base=DX_ptr + row_idx * stride_dxb, shape=(D,), strides=(stride_dxd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
+            tl.store(dx_block, dx.to(x_dtype), boundary_check=(0,))
+        else:
+            tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
         return
 
-    # Pass 1: Accumulate inner product across chunks (D > BLOCK_SIZE fallback)
     inner = 0.0
     for d_start in range(0, D, BLOCK_SIZE):
         cols = d_start + tl.arange(0, BLOCK_SIZE)
         mask = cols < D
-        dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
-        x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
-        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
+        if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1:
+            dy_block = tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            dy = tl.load(dy_block, boundary_check=(0,)).to(acc_dtype)
+            dy = tl.where(cols < D, dy, 0.0)
+            x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
+            x = tl.where(cols < D, x, 0.0)
+            scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
+            scale = tl.where(cols < D, scale, 0.0)
+        else:
+            dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
+            x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
+            scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
         inner += tl.sum(dy * scale * x, axis=0)
 
     coeff = (inner * rsqrt * rsqrt) / D
 
-    # Pass 2: Compute dx and store across chunks
     for d_start in range(0, D, BLOCK_SIZE):
         cols = d_start + tl.arange(0, BLOCK_SIZE)
         mask = cols < D
-        dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
-        x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
-        scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
+        if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1 and stride_dxd == 1:
+            dy_block = tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            dy = tl.load(dy_block, boundary_check=(0,)).to(acc_dtype)
+            dy = tl.where(cols < D, dy, 0.0)
+            x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
+            x = tl.where(cols < D, x, 0.0)
+            scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
+            scale = tl.where(cols < D, scale, 0.0)
+        else:
+            dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
+            x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
+            scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
         dy_scale = dy * scale
         dx = (dy_scale - x * coeff) * rsqrt
-        tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
+        if stride_dxd == 1:
+            dx_block = tl.make_block_ptr(base=DX_ptr + row_idx * stride_dxb, shape=(D,), strides=(stride_dxd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            tl.store(dx_block, dx.to(x_dtype), boundary_check=(0,))
+        else:
+            tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
 
 
 @triton.autotune(
@@ -349,12 +380,14 @@ def _rms_norm_bwd_fused_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_ROW: tl.constexpr
 ):
+    """Fused backward: dx + dscale in one pass. FP64 not supported in fused path (Python guards D>4096 or fp64)."""
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     mask_m = offs_m < N
     x_dtype = X_ptr.dtype.element_ty
     acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
     is_fp64 = X_ptr.dtype.element_ty == tl.float64
+    tl.device_assert(not is_fp64, "FP64 not supported in fused bwd; use separate dx/dscale kernels")
     rsqrt = tl.load(Rsqrt_ptr + offs_m, mask=mask_m, other=0.0).to(acc_dtype)
     inner = tl.zeros([BLOCK_ROW], dtype=acc_dtype)
     for d_start in range(0, D, BLOCK_D):
@@ -362,12 +395,8 @@ def _rms_norm_bwd_fused_kernel(
         mask_d = offs_d < D
         mask_2d = mask_m[:, None] & mask_d[None, :]
         scale = tl.load(Scale_ptr + offs_d * stride_sb, mask=mask_d, other=0.0).to(acc_dtype)
-        if stride_dyd == 1 and stride_xd == 1:
-            dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
-            x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
-        else:
-            dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
-            x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
+        dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
+        x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
         inner += tl.sum(dy * scale[None, :] * x, axis=1)
     coeff = (inner * rsqrt * rsqrt) / D
     for d_start in range(0, D, BLOCK_D):
@@ -378,10 +407,7 @@ def _rms_norm_bwd_fused_kernel(
         dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
         x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
         dscale_part = tl.sum(dy * (x * rsqrt[:, None]), axis=0)
-        if is_fp64:
-            tl.store(DScale_ptr + offs_d, dscale_part, mask=mask_d)
-        else:
-            tl.atomic_add(DScale_ptr + offs_d, dscale_part, mask=mask_d)
+        tl.atomic_add(DScale_ptr + offs_d, dscale_part, mask=mask_d)
         dy_scale = dy * scale[None, :]
         dx = (dy_scale - x * coeff[:, None]) * rsqrt[:, None]
         tl.store(DX_ptr + offs_m[:, None] * stride_dxb + offs_d[None, :] * stride_dxd, dx.to(x_dtype), mask=mask_2d)
@@ -468,11 +494,11 @@ class TritonRMSNormFunc(torch.autograd.Function):
             dx = torch.empty_like(x_flat)
             calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-            assert (dscale_acc == 0).all()  # R-08
-            BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))  # R-05 heuristic
+            BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))
             if _is_turing():
                 BLOCK_D = min(BLOCK_D, 64)
-            grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
+            def grid(META):
+                return (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
                 dy_flat, x_flat, scale, rsqrt, dx, dscale_acc,
                 dy_flat.stride(0), dy_flat.stride(1),
@@ -499,14 +525,12 @@ class TritonRMSNormFunc(torch.autograd.Function):
             if need_dscale:
                 calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
                 dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-                assert dscale_acc.is_contiguous() and (dscale_acc == 0).all()  # R-08: DScale_ptr is zeroed; reset_to_zero only for autotune
-                # Python guard for FP64: grid=(cdiv(D,BLOCK),1) ensures single split
-                # Doc: atomic_add for float64 requires single split, else raise.
-                # fp64: avoid multi-split atomic_add; force single writer
                 if calc_dtype == torch.float64:
-                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), 1)
+                    def grid(META):
+                        return (triton.cdiv(D, META['BLOCK_D']), 1)
                 else:
-                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+                    def grid(META):
+                        return (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
                 _rms_norm_bwd_dscale_kernel[grid](
                     dy_flat, x_flat, rsqrt, dscale_acc,
                     dy_flat.stride(0), dy_flat.stride(1),
@@ -519,6 +543,7 @@ class TritonRMSNormFunc(torch.autograd.Function):
 
 
 def triton_rms_norm(x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """RMSNorm via Triton fused kernel (forward + backward)."""
     return TritonRMSNormFunc.apply(x, scale, eps)
 
 
@@ -731,11 +756,11 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
             dx = torch.empty_like(res_out)
             calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-            assert (dscale_acc == 0).all()  # R-08: assert DScale_ptr is zeroed; reset_to_zero only for autotune
-            BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))  # R-05 heuristic
+            BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))
             if _is_turing():
                 BLOCK_D = min(BLOCK_D, 64)
-            grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
+            def grid(META):
+                return (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
                 dy_flat, res_out, scale, rsqrt, dx, dscale_acc,
                 dy_flat.stride(0), dy_flat.stride(1),
@@ -797,9 +822,11 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
                 calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
                 dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
                 if calc_dtype == torch.float64:
-                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), 1)
+                    def grid(META):
+                        return (triton.cdiv(D, META['BLOCK_D']), 1)
                 else:
-                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+                    def grid(META):
+                        return (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
                 _rms_norm_bwd_dscale_kernel[grid](
                     dy_flat, res_out, rsqrt, dscale_acc,
                     dy_flat.stride(0), dy_flat.stride(1),

@@ -32,19 +32,18 @@ def _is_turing() -> bool:
     return False
 
 
-# Autotune configs for BLOCK_M / BLOCK_D reuse across varying D
+# Autotune configs capped BLOCK_M/D<=64 to avoid register/SMEM blow-up (16x128x128 would spill).
+# SMEM per block ~ BLOCK_M*BLOCK_D*4 bytes for acc + X/W tiles; 64x64=16KB within 99KB sm80, 64KB sm75.
 _ASDAG_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=8),
-    triton.Config({"BLOCK_M": 64, "BLOCK_D": 128}, num_warps=8),
-    triton.Config({"BLOCK_M": 128, "BLOCK_D": 32}, num_warps=8),
-    triton.Config({"BLOCK_M": 128, "BLOCK_D": 64}, num_warps=8),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=8, num_stages=3),
 ]
 
-# Turing sm_75: prune autotune configs to BLOCK 32/64 only, remove 128 variants, num_warps 2/4 max, BLOCK <=64 (64KB SMEM).
 if _is_turing():
     _ASDAG_AUTOTUNE_CONFIGS = [
         c for c in _ASDAG_AUTOTUNE_CONFIGS
@@ -55,14 +54,14 @@ if _is_turing():
 @triton.autotune(configs=_ASDAG_AUTOTUNE_CONFIGS, key=["B_SZ", "DIM"])
 @triton.jit
 def _fused_asdag_2d_grid_kernel(
-    X_ptr,              # (B, D)
-    W_stack_ptr,        # (K, D, D)
-    Bias_stack_ptr,     # (K, D)
-    Routing_ptr,        # (B, K)
-    Context_ptr,        # (K, M_max, D) or (K, D)
-    Peer_ptr,           # (K, M_max, B, D)
-    Norm_Factors_ptr,   # (K,)
-    Leaf_Outs_ptr,      # (B, K, D)
+    X_ptr,
+    W_stack_ptr,
+    Bias_stack_ptr,
+    Routing_ptr,
+    Context_ptr,
+    Peer_ptr,
+    Norm_Factors_ptr,
+    Leaf_Outs_ptr,
     stride_xb, stride_xd,
     stride_wk, stride_wd1, stride_wd2,
     stride_bk, stride_bd,
@@ -80,250 +79,84 @@ def _fused_asdag_2d_grid_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    """
+    2D grid-tiled ASDAG forward: Y[b,k,d]=norm[k]*(bias[k,d]+ sum_e x[b,e]*W[k,e,d] + peer_ctx).
+    Grid (cdiv(B,BLOCK_M), K). BLOCK_M/D <=64 enforced; SMEM ~BLOCK_M*BLOCK_D*4*2 <99KB.
+    """
     pid_m = tl.program_id(0)
-    pid_k = tl.program_id(1)  # Parallelized over leaves
-
+    pid_k = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < B_SZ
-
-    norm_factor = tl.load(Norm_Factors_ptr + pid_k * stride_norm).to(tl.float32)
-
-    # Transposed loops: X tile reused across d_out blocks.
-    # Outer loop over d_in, inner over d_out so X loaded once per d_in block
-    # and reused for all d_out tiles (vs original opposite order which reloaded X
-    # D/BLOCK_D times per output tile). Use block_ptr for contiguous X/W where
-    # stride indicates contiguous last dim (stride_xd==1, stride_wd1/2 patterns);
-    # fallback manual pointer arithmetic kept for non-contiguous/strided views.
-    # Number of D blocks (ceil) — DIM and BLOCK_D are constexpr so compile-time.
+    norm_factor = tl.load(Norm_Factors_ptr + pid_k * stride_norm, eviction_policy="evict_first").to(tl.float32)
     num_d_blocks = (DIM + BLOCK_D - 1) // BLOCK_D
-
-    # Initialize per-output-block accumulators. Since DIM/BLOCK_D <= 16 for
-    # typical D<=512, BLOCK_D>=32, unrolled list of accumulators is bounded.
-    # Triton requires each accumulator distinct; we use explicit variables via
-    # manual unroll up to 16 blocks then loop fallback for larger (rare).
-    # Simpler: allocate on-the-fly with tl.zeros per block index and keep in
-    # a small fixed-size array simulated by recompiling for each DIM.
-    # Here we use Python list comprehension over constexpr range — Triton will
-    # unroll it at compile time.
-    # NOTE: Triton tl.zeros with constexpr shape; list size bounded.
-    # For code simplicity and to avoid dynamic list of tensors limit, we
-    # maintain accumulation via staged approach: outer d_in loop with inner
-    # d_out updates persistent tiles.
-
-    # Pre-allocate accumulators as tuple of zeros — max 16 blocks supported
-    # without Python dynamic branching; excess blocks are handled via extra loop.
-    # We implement as explicit accumulators using a loop-carried stack:
-    # Instead of Python list, we keep acc_tiles as tl.zeros re-created per
-    # d_out block index after outer loop accumulation. For correctness we
-    # implement persistent accumulation by iterating d_out blocks outermost for
-    # store after accumulation — see accumulation section below.
-
-    # Persistent accumulators: one per d_out tile, kept in registers SRAM
-    # Allocate up to 16 tiles (covers D up to 1024 with BLOCK_D=64). Use
-    # staged accumulation: initialize all to zero then update in transposed loops.
-    # We implement via a small fixed set and loop over them.
-    # To stay within Triton constraints, we use a 2D flattened approach when
-    # num_d_blocks > 8: accumulate into a larger 2D buffer.
-    # For clarity, handle common case num_d_blocks <=8 with explicit unroll;
-    # for larger, fall back to original ordering (rare, correctness preserved).
-    # Here we directly use transposed logic with per-block acc array.
-
-    # Create accumulator list (constexpr unrolled)
-    # Triton allows Python list of constexpr-sized tl tensors.
-    # Initialize lazily; we will create on demand per block idx.
-    # Use tl.zeros for each block.
-    # We need to reference them after loops for bias/peer/activation.
-
-    # Use a simple strategy: 64-block_D covers worst D=2048 => 32 blocks, but
-    # typical D<=256 => <=4 blocks. We'll create list via Python range on
-    # num_d_blocks which is constexpr int.
-    acc_list = []
-    for _ in range(16):
-        # limit to 16 to cap compilation; if num_d_blocks <=16 we use subset
-        acc_list.append(tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32))
-    # Trim to actual num_d_blocks (Triton will DCE unused)
-    # We keep full list but only first num_d_blocks are used; extra are dummy.
-
-    # Transposed loops: for d_in outer, for d_out inner — X reused
-    for d_in_start in range(0, DIM, BLOCK_D):
-        offs_k = d_in_start + tl.arange(0, BLOCK_D)
-        mask_k = offs_k < DIM
-
-        # Load X tile once per d_in block — reuse across all d_out via inner loop
-        # Use make_block_ptr for contiguous X where stride_xd == 1 (row-major)
-        # Fallback manual pointer arithmetic for strided/transposed X (stride_xd !=1)
-        # Manual fallback: X_ptr + offs_m[:,None]*stride_xb + offs_k[None,:]*stride_xd
-        # Block_ptr path (coalesced):
-        # tl.make_block_ptr(base=X_ptr, shape=(B_SZ, DIM), strides=(stride_xb, stride_xd),
-        #                   offsets=(pid_m*BLOCK_M, d_in_start), block_shape=(BLOCK_M, BLOCK_D), order=(1,0))
-        # Keep both paths documented; runtime branch on stride contiguity is
-        # constexpr-like but Triton requires static block_ptr, so we attempt
-        # block_ptr and rely on Triton to handle generic strides; comment documents fallback.
-        # Contiguous X/W blocks use make_block_ptr for better coalescing; non-contiguous keeps manual.
-        x_block_ptr = tl.make_block_ptr(
-            base=X_ptr,
-            shape=(B_SZ, DIM),
-            strides=(stride_xb, stride_xd),
-            offsets=(pid_m * BLOCK_M, d_in_start),
-            block_shape=(BLOCK_M, BLOCK_D),
-            order=(1, 0),
-        )
-        # tl.load with boundary_check for non-divisible tiles (masking)
-        # Use block_ptr load when contiguous, else evict_last manual pattern
-        # Heuristic: if stride_xd ==1, block_ptr is optimal; Triton handles any stride but
-        # coalescing benefit is when last dim contiguous.
-        x = tl.load(x_block_ptr, boundary_check=(0, 1))
-        # Fallback manual (kept as comment for non-contiguous):
-        # x_ptrs = X_ptr + offs_m[:, None] * stride_xb + offs_k[None, :] * stride_xd
-        # x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0, eviction_policy="evict_last")
-
-        for d_out_idx in range(16):
+    for d_out_idx in range(16):
+        if d_out_idx < num_d_blocks:
             d_out_start = d_out_idx * BLOCK_D
-            # need constexpr guard: only execute if d_out_start < DIM
-            # Triton if with constexpr-like runtime check; we use tl.where pattern
-            # Break via continue when beyond DIM (handled by mask)
             offs_d = d_out_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < DIM
-            # Guard: skip dummy d_out blocks beyond num_d_blocks to avoid extra DRAM
-            # Equivalent to: if d_out_idx >= num_d_blocks: continue
-            if d_out_idx >= 16:
-                continue
-            # Early continue if d_out_start >= DIM (beyond valid blocks)
-            # We still compute but masked stores will be zero; skip load for efficiency
-            # Use runtime check: tl.arange is constexpr, so simple Python if would need compile-time.
-            # Instead we mask loads/stores and skip dot when block out of range.
-            # Check block validity
-            # Load W tile for this (d_in, d_out) pair — contiguous W uses block_ptr
-            # W_stack is (K, D, D) with strides (stride_wk, stride_wd2, stride_wd1) ?
-            # Original manual: W_ptr + pid_k*stride_wk + offs_k[:,None]*stride_wd2 + offs_d[None,:]*stride_wd1
-            # For block_ptr, shape is (DIM, DIM) per leaf? Use 2D view.
-            # Contiguous W blocks: use make_block_ptr for coalesced loads; random X gather stays manual (uncoalesced by design).
-            # We attempt block_ptr for W (contiguous D*D plane); fallback manual noted.
-
-            # Note: Triton block_ptr for 2D W tile per leaf: base = W_stack_ptr + pid_k*stride_wk
-            # shape (DIM, DIM), strides (stride_wd2, stride_wd1)
-            # This is more coalesced than manual when D is contiguous.
-            # If W is not contiguous in last dim, manual path fallback (comment).
-            # Use conditional load: if block is out of range skip
-            # To avoid loading invalid tiles, check mask_d and mask_k together
-            w_block_ptr = tl.make_block_ptr(
-                base=W_stack_ptr + pid_k * stride_wk,
-                shape=(DIM, DIM),
-                strides=(stride_wd2, stride_wd1),
-                offsets=(d_in_start, d_out_start),
-                block_shape=(BLOCK_D, BLOCK_D),
-                order=(1, 0),
-            )
-            w_k = tl.load(w_block_ptr, boundary_check=(0, 1))
-            w_k = w_k.to(x.dtype)
-            # Fallback manual:
-            # w_ptrs = W_stack_ptr + pid_k * stride_wk + offs_k[:, None] * stride_wd2 + offs_d[None, :] * stride_wd1
-            # w_k = tl.load(w_ptrs, mask=mask_k[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last")
-
-            # Dot accumulation per d_out block — reuse x across all d_out
-            # Mask handling: if d_out_start >= DIM, this block is phantom; dot will be masked out via store mask later
-            # Accumulate only when both masks valid; extra blocks are no-ops (masked)
-            # Use tl.where to zero contribution for out-of-range d_out
-            # Turing sm_75: tl.dot with fp16 uses m16n8k8 shape; BLOCK 32 aligns to 8, ok.
-            contrib = tl.dot(x, w_k, input_precision=INPUT_PRECISION)
-            # Only accumulate if this d_out_idx is within num_d_blocks
-            # Triton if cannot be dynamic per loop iteration easily, so we guard with where-like:
-            # Check if d_out_start < DIM
-            valid_block = d_out_start < DIM
-            if valid_block:
-                acc_list[d_out_idx] = acc_list[d_out_idx] + contrib
-            # For d_out_start >= DIM, contrib is discarded (remains zero)
-
-    # Post-accumulation: per d_out block apply bias, peer, norm, activation, store
-    for d_out_idx in range(16):
-        d_out_start = d_out_idx * BLOCK_D
-        if d_out_idx >= 16:
-            continue
-        valid_block = d_out_start < DIM
-        if not valid_block:
-            continue
-        offs_d = d_out_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < DIM
-        acc = acc_list[d_out_idx]
-
-        # Load bias via block_ptr (contiguous 1D) — coalesced
-        # Bias_stack is (K, D) contiguous in D dimension
-        b_block_ptr = tl.make_block_ptr(
-            base=Bias_stack_ptr,
-            shape=(DIM,),
-            strides=(stride_bd,),
-            offsets=(0,),
-            block_shape=(BLOCK_D,),
-            order=(0,),
-        )
-        # Need per-leaf bias: base + pid_k*stride_bk, offsets d_out_start
-        # Triton block_ptr for 1D with leaf offset: use base + pid_k*stride_bk
-        b_block_ptr = tl.make_block_ptr(
-            base=Bias_stack_ptr + pid_k * stride_bk,
-            shape=(DIM,),
-            strides=(stride_bd,),
-            offsets=(d_out_start,),
-            block_shape=(BLOCK_D,),
-            order=(0,),
-        )
-        b_k = tl.load(b_block_ptr, boundary_check=(0,))
-        # fallback manual: b_ptrs = Bias_stack_ptr + pid_k * stride_bk + offs_d * stride_bd
-        b_k = b_k.to(tl.float32)
-
-        y_prim = acc + b_k[None, :]
-
-        # Secondary parent context accumulation — early exit for sparse gating
-        # If context_gates indicates valid count, skip dummy gathers to save DRAM.
-        # At minimum add `if HAS_PEER: if tl.sum(c_s)==0: continue` to skip dummy gathers.
-        # num_valid_secondaries derived from Context_ptr shape or Peer validity mask.
-        if HAS_PEER:
-            h_ctx = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-            for s in range(MAX_SECONDARY):
-                # dummy_peer stride zeroing fragile — HAS_PEER gates loads
-                c_s = tl.load(
-                    Context_ptr + pid_k * stride_ck + s * stride_cm + offs_d * stride_cd,
-                    mask=mask_d, other=0.0, eviction_policy="evict_first",
-                ).to(tl.float32)
-                # Early exit / skip: if c_s all zero (no valid secondaries), skip peer gather
-                # This saves DRAM bandwidth when routing is sparse and M_max is over-provisioned.
-                # Also provides early exit when s >= num_valid_secondaries (Context valid mask)
-                if tl.sum(c_s) == 0:
-                    continue
-                # Additional guard: if s >= num_valid_secondaries derived from Context shape,
-                # continue — here approximated by c_s zero check which covers sparse gating.
-                p_s = tl.load(
-                    Peer_ptr + pid_k * stride_pok + s * stride_pos + offs_m[:, None] * stride_pob + offs_d[None, :] * stride_pod,
-                    mask=mask_m[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last",
-                ).to(tl.float32)
-                h_ctx += c_s[None, :] * p_s
-            y_prim = y_prim + h_ctx
-
-        y_v = y_prim * norm_factor
-
-        if ACTIVATION == 1:
-            y_v = tl.minimum(tl.maximum(y_v, 0.0), 6.0)
-        elif ACTIVATION == 2:
-            y_v = tl.where(y_v >= 0.0, 1.0, -1.0)
-            y_v = tl.where(mask_d[None, :], y_v, 0.0)
-
-        # Store leaf output tile via block_ptr (contiguous D contiguous)
-        # Leaf_Outs is (B, K, D) with strides (stride_lob, stride_lok, stride_lod)
-        # For block_ptr we view per-leaf 2D plane (B, D)
-        # Use make_block_ptr for coalesced store where D contiguous (stride_lod==1)
-        # Fallback manual for strided views.
-        # Contiguous case: stride_lod==1 gives coalesced store.
-        out_block_ptr = tl.make_block_ptr(
-            base=Leaf_Outs_ptr + pid_k * stride_lok,
-            shape=(B_SZ, DIM),
-            strides=(stride_lob, stride_lod),
-            offsets=(pid_m * BLOCK_M, d_out_start),
-            block_shape=(BLOCK_M, BLOCK_D),
-            order=(1, 0),
-        )
-        tl.store(out_block_ptr, y_v.to(Leaf_Outs_ptr.dtype.element_ty), boundary_check=(0, 1))
-        # Fallback manual:
-        # lo_ptrs = Leaf_Outs_ptr + offs_m[:, None] * stride_lob + pid_k * stride_lok + offs_d[None, :] * stride_lod
-        # tl.store(lo_ptrs, y_v.to(Leaf_Outs_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+            if d_out_start < DIM:
+                acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+                for d_in_start in range(0, DIM, BLOCK_D):
+                    x_block_ptr = tl.make_block_ptr(
+                        base=X_ptr,
+                        shape=(B_SZ, DIM),
+                        strides=(stride_xb, stride_xd),
+                        offsets=(pid_m * BLOCK_M, d_in_start),
+                        block_shape=(BLOCK_M, BLOCK_D),
+                        order=(1, 0),
+                    )
+                    x = tl.load(x_block_ptr, boundary_check=(0, 1), eviction_policy="evict_last")
+                    w_block_ptr = tl.make_block_ptr(
+                        base=W_stack_ptr + pid_k * stride_wk,
+                        shape=(DIM, DIM),
+                        strides=(stride_wd2, stride_wd1),
+                        offsets=(d_in_start, d_out_start),
+                        block_shape=(BLOCK_D, BLOCK_D),
+                        order=(1, 0),
+                    )
+                    w_k = tl.load(w_block_ptr, boundary_check=(0, 1), eviction_policy="evict_last")
+                    contrib = tl.dot(x, w_k, input_precision=INPUT_PRECISION)
+                    acc = acc + contrib
+                b_block_ptr = tl.make_block_ptr(
+                    base=Bias_stack_ptr + pid_k * stride_bk,
+                    shape=(DIM,),
+                    strides=(stride_bd,),
+                    offsets=(d_out_start,),
+                    block_shape=(BLOCK_D,),
+                    order=(0,),
+                )
+                b_k = tl.load(b_block_ptr, boundary_check=(0,), eviction_policy="evict_first")
+                b_k = b_k.to(tl.float32)
+                y_prim = acc + b_k[None, :]
+                if HAS_PEER:
+                    h_ctx = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+                    for s in range(MAX_SECONDARY):
+                        c_s = tl.load(
+                            Context_ptr + pid_k * stride_ck + s * stride_cm + offs_d * stride_cd,
+                            mask=mask_d, other=0.0, eviction_policy="evict_first",
+                        ).to(tl.float32)
+                        if tl.sum(c_s) != 0:
+                            p_s = tl.load(
+                            Peer_ptr + pid_k * stride_pok + s * stride_pos + offs_m[:, None] * stride_pob + offs_d[None, :] * stride_pod,
+                            mask=mask_m[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last",
+                        ).to(tl.float32)
+                            h_ctx += c_s[None, :] * p_s
+                    y_prim = y_prim + h_ctx
+                y_v = y_prim * norm_factor
+                if ACTIVATION == 1:
+                    y_v = tl.minimum(tl.maximum(y_v, 0.0), 6.0)
+                elif ACTIVATION == 2:
+                    y_v = tl.where(y_v >= 0.0, 1.0, -1.0)
+                    y_v = tl.where(mask_d[None, :], y_v, 0.0)
+                out_block_ptr = tl.make_block_ptr(
+                    base=Leaf_Outs_ptr + pid_k * stride_lok,
+                    shape=(B_SZ, DIM),
+                    strides=(stride_lob, stride_lod),
+                    offsets=(pid_m * BLOCK_M, d_out_start),
+                    block_shape=(BLOCK_M, BLOCK_D),
+                    order=(1, 0),
+                )
+                tl.store(out_block_ptr, y_v.to(Leaf_Outs_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 class FusedASDAG2DFunction(torch.autograd.Function):
@@ -359,28 +192,23 @@ class FusedASDAG2DFunction(torch.autograd.Function):
         ctx.activation = activation
         ctx.use_checkpoint = bool(use_checkpoint)
 
+        assert x.ndim == 2 and x.shape[1] == w_stack.shape[1], f"x {x.shape} vs w_stack {w_stack.shape}"
+        assert w_stack.ndim == 3 and w_stack.shape[2] == x.shape[1], f"w_stack must be [K,D,D] with D={x.shape[1]}"
+        assert bias_stack.shape == (w_stack.shape[0], x.shape[1])
+        assert routing_probs.shape == (x.shape[0], w_stack.shape[0])
+        if not w_stack.is_contiguous():
+            w_stack = w_stack.contiguous()
+        assert w_stack.is_contiguous(), "w_stack must be contiguous for block_ptr coalescing; transposed in Python above"
         B, D = x.shape
         K = w_stack.shape[0]
         M_max = context_gates.shape[1] if context_gates.ndim >= 3 else 1
-
+        if K > 65535:
+            raise ValueError(f"K={K} exceeds grid limit 65535")
         leaf_outs = torch.empty((B, K, D), device=x.device, dtype=x.dtype)
         act_code = 1 if activation == "relu6" else (2 if activation == "sign" else 0)
-
-        # BLOCK_D heuristic: D=32 not multiple of 16 falls back to SIMT; suggest BLOCK_D=32 for D<=32
-        # Autotune will refine BLOCK_M/D (32/64/128) but we still provide heuristic default for CPU fallback
-        # Turing sm_75: clamp BLOCK to <=64 (64KB SMEM), handle bf16 -> fp16 fallback.
         if _is_turing() and x.dtype == torch.bfloat16:
             warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in fused_asdag_2d_triton", stacklevel=3)
-        if D <= 32:
-            BLOCK_D = 32
-        else:
-            BLOCK_D = min(64, triton.next_power_of_2(D))
-        BLOCK_M = 64
-        if _is_turing():
-            BLOCK_D = min(BLOCK_D, 64)
-            BLOCK_M = min(BLOCK_M, 64)
-
-        grid = (triton.cdiv(B, BLOCK_M), K)
+        grid = lambda META: (triton.cdiv(B, META["BLOCK_M"]), K)
 
         has_peer = peer_outputs is not None
         # dummy_peer stride zeroing: when not has_peer strides passed as 0, kernel gates loads via HAS_PEER
@@ -420,8 +248,6 @@ class FusedASDAG2DFunction(torch.autograd.Function):
             ACTIVATION=act_code,
             HAS_PEER=has_peer,
             INPUT_PRECISION=prec,
-            BLOCK_M=BLOCK_M,
-            BLOCK_D=BLOCK_D,
         )
 
         return torch.einsum('bk, bkd -> bd', routing_probs, leaf_outs)

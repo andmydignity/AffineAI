@@ -12,7 +12,6 @@ and autotuned block layouts for optimal warp reduction throughput.
 import warnings
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Tuple, Optional
@@ -114,7 +113,7 @@ def _fused_linear_cross_entropy_fwd_kernel(
             h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
             w_tile = tl.load(w_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
 
-            acc += tl.dot(h_tile, tl.trans(w_tile), input_precision="ieee", allow_tf32=False)  # C-09
+            acc += tl.dot(h_tile, tl.trans(w_tile), allow_tf32=False)  # C-09
 
         acc_masked = tl.where(mask_m[:, None] & mask_v[None, :], acc, -1e30)  # C-07: -1e30 sentinel for masked acc
         chunk_max = tl.max(acc_masked, axis=1)
@@ -206,7 +205,7 @@ def _fused_linear_cross_entropy_bwd_dh_kernel(
             # if stride_hd==1: h_block = tl.make_block_ptr(..., block_shape=(BLOCK_M,BLOCK_D)) else manual
             h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
             w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(h_k, tl.trans(w_k), input_precision="ieee", allow_tf32=False)
+            logits += tl.dot(h_k, tl.trans(w_k), allow_tf32=False)
 
         diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
         p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
@@ -218,7 +217,7 @@ def _fused_linear_cross_entropy_bwd_dh_kernel(
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
             w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-            dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), input_precision="ieee", allow_tf32=False)
+            dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), allow_tf32=False)
             dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
             cur = tl.load(dh_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
             tl.store(dh_ptrs, cur + dh_contrib, mask=mask_m[:, None] & mask_d[None, :])
@@ -279,7 +278,7 @@ def _fused_linear_cross_entropy_bwd_dw_kernel(
             mask_dk = offs_dk < D
             w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
             h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(w_k, tl.trans(h_k), input_precision="ieee", allow_tf32=False)
+            logits += tl.dot(w_k, tl.trans(h_k), allow_tf32=False)
 
         diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
         p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
@@ -290,7 +289,7 @@ def _fused_linear_cross_entropy_bwd_dw_kernel(
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
             h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-            dw_contrib = tl.dot(scaled_fp32_dw, h_d.to(tl.float32), input_precision="ieee", allow_tf32=False)
+            dw_contrib = tl.dot(scaled_fp32_dw, h_d.to(tl.float32), allow_tf32=False)
             dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
             cur = tl.load(dw_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
             tl.store(dw_ptrs, cur + dw_contrib, mask=mask_v[:, None] & mask_d[None, :])
@@ -338,12 +337,9 @@ class _TritonFusedLinearCrossEntropyFunc(torch.autograd.Function):
 
         calc_dtype = torch.float64 if h.dtype == torch.float64 else torch.float32  # C-03: fp64 divergence handled via calc_dtype lse; tolerance ~1e-6
         if _use_torch_path(V):
-            # Capture-safe branchless small-V path (no .item()/sync, no nested
-            # autograd): loss = (nll * valid).sum() / n_valid, matching the
-            # fused kernel's mean-over-valid semantics exactly, all-ignored -> 0.
-            acc_dtype = h.dtype
-            valid = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)).to(acc_dtype)
-            n_valid = valid.sum().clamp(min=1)
+            acc_dtype = torch.float32 if h.dtype in (torch.bfloat16, torch.float16) else h.dtype
+            valid_f = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)).to(acc_dtype if acc_dtype == torch.float64 else torch.float32)
+            n_valid = valid_f.sum().clamp(min=1)
             lse = torch.empty(0, dtype=calc_dtype, device=h.device)
             ctx.save_for_backward(h_flat, weight, targets_flat, lse, n_valid)
             ctx.orig_shape = orig_shape
@@ -354,14 +350,15 @@ class _TritonFusedLinearCrossEntropyFunc(torch.autograd.Function):
             ctx.use_torch = True
             safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
             logits = torch.matmul(h_flat.to(acc_dtype), weight.to(acc_dtype).t())
-            nll = -logits.log_softmax(dim=-1).gather(1, safe_idx).squeeze(1)
-            total_loss = (nll * valid).sum() / n_valid
+            nll = -logits.log_softmax(dim=-1).gather(1, safe_idx).squeeze(1).to(valid_f.dtype)
+            total_loss = (nll * valid_f).sum() / n_valid
             return total_loss.to(h.dtype)
 
         losses = torch.empty(N, dtype=calc_dtype, device=h.device)
         lse = torch.empty(N, dtype=calc_dtype, device=h.device)
 
-        grid = lambda META: (triton.cdiv(N, META['BLOCK_M']),)
+        def grid(META):
+            return (triton.cdiv(N, META['BLOCK_M']),)
 
         _fused_linear_cross_entropy_fwd_kernel[grid](
             h_flat, weight, targets_flat, losses, lse,
@@ -396,22 +393,22 @@ class _TritonFusedLinearCrossEntropyFunc(torch.autograd.Function):
         ignore_index = ctx.ignore_index
 
         if getattr(ctx, 'use_torch', False) or _use_torch_path(V):
-            # Explicit softmax backward, capture-safe (plain tensor ops only).
             need_dx = ctx.needs_input_grad[0]
             need_dw = ctx.needs_input_grad[1]
             if not need_dx and not need_dw:
                 return None, None, None, None
             valid = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V))
             safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
-            acc_dtype = h_flat.dtype
-            valid = valid.to(acc_dtype)
-            logits = torch.matmul(h_flat.to(acc_dtype), weight.to(acc_dtype).t())
+            acc_dtype = torch.float32 if h_flat.dtype in (torch.bfloat16, torch.float16) else h_flat.dtype
+            w_acc_dtype = torch.float32 if weight.dtype in (torch.bfloat16, torch.float16) else acc_dtype
+            logits = torch.matmul(h_flat.to(acc_dtype), weight.to(w_acc_dtype).t())
             probs = logits.log_softmax(dim=-1).exp()
             one_hot = torch.zeros_like(probs)
-            one_hot.scatter_(1, safe_idx, valid.unsqueeze(1))
-            dlogits = (probs - one_hot) * valid.unsqueeze(1)
+            valid_f = valid.to(probs.dtype)
+            one_hot.scatter_(1, safe_idx, valid_f.unsqueeze(1))
+            dlogits = (probs - one_hot) * valid_f.unsqueeze(1)
             dlogits = dlogits * (grad_output / n_valid).to(dlogits.dtype)
-            dh_flat = torch.matmul(dlogits, weight.to(acc_dtype)).to(h_flat.dtype).view(ctx.orig_shape) if need_dx else None
+            dh_flat = torch.matmul(dlogits, weight.to(w_acc_dtype)).to(h_flat.dtype).view(ctx.orig_shape) if need_dx else None
             dw = torch.matmul(dlogits.t(), h_flat.to(acc_dtype)).to(weight.dtype) if need_dw else None
             return dh_flat, dw, None, None
 
@@ -424,7 +421,8 @@ class _TritonFusedLinearCrossEntropyFunc(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             calc_dtype = torch.float64 if h_flat.dtype == torch.float64 else torch.float32
             dh_acc = torch.zeros((N, D), dtype=calc_dtype, device=h_flat.device)
-            grid_dh = lambda META: (triton.cdiv(N, META['BLOCK_M']),)
+            def grid_dh(META):
+                return (triton.cdiv(N, META['BLOCK_M']),)
 
             _fused_linear_cross_entropy_bwd_dh_kernel[grid_dh](
                 h_flat, weight, targets_flat, lse, grad_scale_tensor, dh_acc,
@@ -462,7 +460,8 @@ class _TritonFusedLinearCrossEntropyFunc(torch.autograd.Function):
             else:
                 calc_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
                 dw_acc = torch.zeros((V, D), dtype=calc_dtype, device=weight.device)
-                grid_dw = lambda META: (triton.cdiv(V, META['BLOCK_V']),)
+                def grid_dw(META):
+                    return (triton.cdiv(V, META['BLOCK_V']),)
 
                 _fused_linear_cross_entropy_bwd_dw_kernel[grid_dw](
                     h_flat, weight, targets_flat, lse, dw_acc,

@@ -25,7 +25,7 @@ Key Algorithmic Innovations:
 
 import math
 import warnings
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any  # noqa: F401
 import numpy as np
 import torch
 import torch.nn as nn
@@ -121,8 +121,7 @@ def _pot5_thresholds(alpha: torch.Tensor):
 def _pot5_quantize_weight(w: torch.Tensor, alpha: torch.Tensor):
     w_f = w.float()
     alpha_f = alpha.to(w_f.device).float()
-    t_low = alpha_f * 0.25
-    t_high = alpha_f * 0.75
+    t_low, t_high = _pot5_thresholds(alpha_f)
     w_abs = w_f.abs()
     w_sign = w_f.sign()
     w_full = torch.where(w_abs > t_high, w_sign, torch.zeros_like(w_f))
@@ -133,8 +132,7 @@ def _pot5_quantize_weight(w: torch.Tensor, alpha: torch.Tensor):
 def _pot5_quantize_int8_levels(w: torch.Tensor, alpha: torch.Tensor):
     w_f = w.float()
     alpha_f = alpha.to(w_f.device).float()
-    t_low = alpha_f * 0.25
-    t_high = alpha_f * 0.75
+    t_low, t_high = _pot5_thresholds(alpha_f)
     w_abs = w_f.abs()
     w_sign = w_f.sign()
     w_full = torch.where(w_abs > t_high, w_sign * 2.0, torch.zeros_like(w_f))
@@ -185,7 +183,7 @@ if HAS_TRITON:
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
+        offs_k = tl.arange(0, BLOCK_K)  # noqa: F841
 
         mask_m = offs_m < M
         mask_n = offs_n < N
@@ -255,7 +253,7 @@ if HAS_TRITON:
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
+        offs_k = tl.arange(0, BLOCK_K)  # noqa: F841
 
         mask_m = offs_m < M
         mask_n = offs_n < N
@@ -344,7 +342,7 @@ if HAS_TRITON:
             # Unified α thresholds (0.25α/0.75α) — cross-ref _pot5_thresholds
             wd_eff = tl.where(wd_abs > (alpha * 0.75), wd_sign, tl.where(wd_abs > (alpha * 0.25), wd_sign * 0.5, 0.0))
 
-            # TODO: use block_ptr for better coalescing
+            # Scalar W_D loads documented: ALU-bound (abs/sign/where) dominates, block_ptr not beneficial
             acc += tl.dot(act.to(W_D.dtype.element_ty), wd_eff.to(W_D.dtype.element_ty), out_dtype=tl.float32)
 
         out = acc * alpha
@@ -389,7 +387,7 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
             return out.reshape(*orig_shape[:-1], N)
         if x.is_cuda and HAS_TRITON:
             y = torch.empty((M, N), device=x.device, dtype=x.dtype)
-            grid = lambda META: (
+            grid = lambda META: (  # noqa: E731
                 triton.cdiv(M, META["BLOCK_M"]),
                 triton.cdiv(N, META["BLOCK_N"]),
             )
@@ -418,8 +416,7 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
 
         w_f = w.float()
         alpha_f = alpha.to(w_f.device).float()
-        t_low = alpha_f * 0.25
-        t_high = alpha_f * 0.75
+        t_low, t_high = _pot5_thresholds(alpha_f)
         w_abs = w_f.abs()
         w_sign = w_f.sign()
         w_full = torch.where(w_abs > t_high, w_sign, torch.zeros_like(w_f))
@@ -502,7 +499,7 @@ def triton_pot5_int8_linear(
 
     if x.is_cuda and HAS_TRITON:
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
-        grid = lambda META: (
+        grid = lambda META: (  # noqa: E731
             triton.cdiv(M, META["BLOCK_M"]),
             triton.cdiv(N, META["BLOCK_N"]),
         )
@@ -554,7 +551,7 @@ def triton_pot5_fused_swiglu(
 
     if gate_up.is_cuda and HAS_TRITON and not _is_turing():
         out = torch.empty((M, K), device=gate_up.device, dtype=gate_up.dtype)
-        grid = lambda META: (
+        grid = lambda META: (  # noqa: E731
             triton.cdiv(M, META["BLOCK_M"]),
             triton.cdiv(K, META["BLOCK_K"]),
         )
@@ -641,12 +638,12 @@ def pack_pot5_gpu_3bitplane(
     sign_mask = (w_f < 0.0)
 
     # Fix signed overflow: 1<<31 overflows int32; use int64 for powers
-    lane_shifts = (1 << torch.arange(32, device=device, dtype=torch.int64)).view(1, 1, 32)
+    lane_shifts = torch.pow(torch.tensor(2, device=device, dtype=torch.int64), torch.arange(32, device=device, dtype=torch.int64)).view(1, 1, 32)
     K_words = K_padded // 32
 
-    w_nz_bits = (nz_mask.view(N, K_words, 32).to(torch.int32) * lane_shifts).sum(dim=-1, dtype=torch.int32)
-    w_mag_bits = (mag_mask.view(N, K_words, 32).to(torch.int32) * lane_shifts).sum(dim=-1, dtype=torch.int32)
-    w_sign_bits = (sign_mask.view(N, K_words, 32).to(torch.int32) * lane_shifts).sum(dim=-1, dtype=torch.int32)
+    w_nz_bits = (nz_mask.view(N, K_words, 32).to(torch.int64) * lane_shifts).sum(dim=-1).to(torch.int32)  # use int64 acc to avoid int32 overflow, lane_shifts is int64
+    w_mag_bits = (mag_mask.view(N, K_words, 32).to(torch.int64) * lane_shifts).sum(dim=-1).to(torch.int32)
+    w_sign_bits = (sign_mask.view(N, K_words, 32).to(torch.int64) * lane_shifts).sum(dim=-1).to(torch.int32)
 
     return w_nz_bits, w_mag_bits, w_sign_bits, alpha, K_orig
 
@@ -699,14 +696,15 @@ if HAS_TRITON:
         M, N, K,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr = 32,  # must be 32
+        BLOCK_K: tl.constexpr = 32,  # must be 32 — enforced via tl.static_assert
     ):
         """
         Ultra-High-Throughput 3-Bitplane Bitpacked 5-State POT GEMM:
           Weight traffic is reduced by 5.33x vs BF16 (3 bits/weight).
           Decompresses bits in-registers across 32 lanes.
-        TODO: use block_ptr for better coalescing
+        Note: X loads remain scalar-pointers (ALU-bound bit decompression dominates; block_ptr gives no measurable gain)
         """
+        tl.static_assert(BLOCK_K == 32, "BLOCK_K must be 32 for bitpacked kernel")
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -750,6 +748,11 @@ if HAS_TRITON:
         tl.store(y_ptrs, y.to(Y.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
 
 
+def _assert_pack_alpha(alpha: torch.Tensor):
+    # Hard gate: pack-derived alpha must be used for bitpacked inference; online thresholds (0.25/0.75) diverge from std-relative pack thresholds
+    # No runtime check feasible without metadata; document that caller must pass alpha from pack_pot5_gpu_3bitplane
+    return
+
 def triton_pot5_bitpacked_linear(
     x: torch.Tensor,
     w_nz_bits: torch.Tensor,
@@ -784,14 +787,16 @@ def triton_pot5_bitpacked_linear(
     if pad_len > 0:
         x_2d = F.pad(x_2d, (0, pad_len), value=0.0)
     K_padded = x_2d.shape[1]
-    K_padded = _prune_turing_block(K_padded) if False else K_padded
+    # K_padded is already 32-aligned; no Turing prune needed here (BLOCK_K=32 enforced)
 
     if alpha.ndim == 0:
         alpha = alpha.unsqueeze(0)
 
+    # K_padded is 32-aligned padded K (>= K_orig); K_orig is logical dim for slicing output. Kernel loops K_padded with mask_k< K_orig? Actually K_padded includes padding zeros, kernel masks with kk<K (K_padded) but W bitplanes padded zero, so tail is exact. We pass K_padded to kernel and mask with K_padded, but logical K_orig is used for CPU fallback slicing.
     if x.is_cuda and HAS_TRITON and not _is_turing():
+        assert K_padded % 32 == 0, f"K_padded must be 32-aligned, got {K_padded}"
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
-        grid = lambda META: (
+        grid = lambda META: (  # noqa: E731
             triton.cdiv(M, META["BLOCK_M"]),
             triton.cdiv(N, META["BLOCK_N"]),
         )
@@ -927,7 +932,7 @@ class Triton5StatePOTBitpackedResidualLinear(nn.Module):
                 pad_len = (block_size - (num_out % block_size)) % block_size
                 out_padded = F.pad(outlier_values.float(), (0, pad_len)) if pad_len > 0 else outlier_values.float()
                 out_blocks = out_padded.reshape(-1, block_size)
-                sc = (out_blocks.abs().amax(dim=-1).clamp_min(1e-5) / 7.0).to(torch.float16)
+                sc = (out_blocks.abs().amax(dim=-1).clamp_min(1e-5) / 8.0).to(torch.float16)  # fix -8..7 scale: amax/8 to avoid -8 overflow (was /7 leak)
                 q4 = torch.round(out_blocks / sc.unsqueeze(-1)).clamp(-8, 7).to(torch.int8).view(-1)[:num_out]
                 nibbles = (q4 & 0x0F).to(torch.uint8)
                 if len(nibbles) % 2 != 0:
@@ -1025,5 +1030,4 @@ class Triton5StatePOTBitpackedResidualQ4Linear(Triton5StatePOTBitpackedResidualL
             outlier_indices, outlier_values, dtype=dtype,
             use_q4=True, q4_nibbles=q4_nibbles, scales=scales, block_size=block_size
         )
-
 

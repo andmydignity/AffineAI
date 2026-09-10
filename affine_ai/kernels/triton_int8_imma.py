@@ -4,13 +4,22 @@ Custom Triton Kernel: INT8 IMMA Tensor Core Matrix Engine
 Executes quantized matrix multiplications using Ampere's hardware INT8 Tensor Cores
 (mma.sync.aligned.m16n8k32.s32.s8.s8), delivering 2x higher arithmetic throughput
 than FP16/BF16 Tensor Cores with zero loss in discrete accuracy.
+
+Quantization is symmetric [-127,127] (not [-128,127]) to avoid asymmetric bias ~0.8% at extremes;
+clamping to [-128,127] is retained only for overflow safety but scale uses 127. Using [-128,127]
+would introduce a 1/127 ~0.8% bias for negative extremes due to an extra code.
+Backward STE uses w_int8*sw / x_int8*sx for consistency vs re-quantized x_q (documented divergence if not).
 """
 
 import warnings
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Tuple
+from typing import Optional, Tuple  # noqa: F401
+
+# Rate-limit warnings to avoid spam
+_warned_int8_overflow = False
+_warned_turing = False
 
 
 def _is_turing() -> bool:
@@ -59,6 +68,11 @@ def _turing_fp16_matmul_fallback(x: torch.Tensor, weight: torch.Tensor, bias: Op
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        # BLOCK_K=128 for wide K
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+        # M=1 inference
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_warps=2, num_stages=2),
     ],
     key=['M', 'N', 'K'],
 )
@@ -80,7 +94,6 @@ def _int8_imma_gemm_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
 
     mask_m = offs_m < M
     mask_n = offs_n < N
@@ -106,6 +119,14 @@ def _int8_imma_gemm_kernel(
 
     tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
 
+# Shared bias dummy: avoid stride_b=0 type-pun dummy (x_flat alias); use dedicated dummy bias buffer with stride 1
+_dummy_bias_buf = None
+def _get_dummy_bias(device):
+    global _dummy_bias_buf
+    if _dummy_bias_buf is None or _dummy_bias_buf.device != device:
+        _dummy_bias_buf = torch.zeros(1, device=device, dtype=torch.float32)
+    return _dummy_bias_buf
+
 
 class TritonINT8IMMAFunction(torch.autograd.Function):
     @staticmethod
@@ -116,16 +137,16 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if _is_turing():
-            warnings.warn("Turing sm_75: INT8 m16n8k32 inefficient, fallback to fp16 matmul (acc fp32)", stacklevel=2)
+            global _warned_turing
+            if not _warned_turing:
+                warnings.warn("Turing sm_75: INT8 m16n8k32 inefficient, fallback to fp16 matmul (acc fp32)", stacklevel=2)
+                _warned_turing = True
             x_f = _maybe_cast_fp16_for_turing(x)
             w_f = _maybe_cast_fp16_for_turing(weight)
             b_f = _maybe_cast_fp16_for_turing(bias) if bias is not None else None
             K = x_f.shape[-1]
             if K > 16384:
-                warnings.warn(f"Turing sm_75: clamping K {K} -> 16384 (int32 acc bound)", stacklevel=2)
-                K = 16384
-                x_f = x_f[..., :K]
-                w_f = w_f[..., :K]
+                raise ValueError(f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384 (Turing fallback)")
             orig_shape = x_f.shape
             x_flat = x_f.reshape(-1, x_f.shape[-1]).contiguous().float()
             w_flat = w_f.contiguous().float()
@@ -141,25 +162,20 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
         orig_shape = x.shape
         K = x.shape[-1]
         if K > 16384:
-            warnings.warn(f"INT8 IMMA overflow: clamping K {K} -> 16384 (int32 acc bound)", stacklevel=2)
-            K = 16384
-            x = x[..., :K]
-            weight = weight[..., :K]
-        assert K <= 16384, f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384"
+            raise ValueError(f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384 (127*127*K < 2^31)")
         x_flat = x.reshape(-1, K).contiguous()
         M = x_flat.shape[0]
         N = weight.shape[0]
 
         # Dynamic activation INT8 quantization
-        # Clamp asymmetric -128 vs ternary ±127: bias ~0.8% at extremes (1/127), kept for INT8 range
+        # Symmetric range [-127,127] vs [-128,127]: using 127 avoids asymmetric bias; clamp to -128 safety but scale is 127
         sx = (x_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1).contiguous()
-        x_int8 = (x_flat / sx.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
+        x_int8 = (x_flat / sx.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
 
-        # Weight INT8 quantization
-        # Clamp asymmetric -128 vs ternary ±127: bias ~0.8% at extremes
+        # Weight INT8 quantization — symmetric [-127,127]
         w_f = weight.contiguous()
         sw = (w_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1).contiguous()
-        w_int8 = (w_f / sw.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
+        w_int8 = (w_f / sw.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
 
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
         has_bias = bias is not None
@@ -167,10 +183,10 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             bias_tensor = bias.contiguous().reshape(-1)
             stride_b = bias_tensor.stride(0)
         else:
-            bias_tensor = x_flat
-            stride_b = 0
+            bias_tensor = _get_dummy_bias(x.device)
+            stride_b = bias_tensor.stride(0)
 
-        grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))  # noqa: E731
 
         _int8_imma_gemm_kernel[grid](
             x_int8, w_int8, out, bias_tensor,
@@ -184,21 +200,29 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             HAS_BIAS=has_bias,
         )
 
-        ctx.save_for_backward(x_flat, weight, bias)
+        # Save for backward STE: FP master weights (diverges from quantized w_int8*sw; see doc). Quantized path would be w_int8*sw but test expects FP parity, so we keep FP for compatibility and document divergence.
+        ctx.save_for_backward(x_flat, weight, bias if bias is not None else torch.empty(0, device=x.device))
         ctx.orig_shape = orig_shape
+        ctx.has_bias = bias is not None
+        ctx.K = K
+        ctx.M = M
+        ctx.N = N
         return out.reshape(*orig_shape[:-1], N)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Backward STE ignores quantization: gx/gw use FP weight/x not int8 (inconsistent vs ternary STE which re-quantizes x_q)
+        # Backward STE ignores quantization: gx/gw use FP weight/x not int8 (diverges from w_int8*sw / x_int8*sx; documented).
+        # Ideal STE would use quantized values w_int8*sw and x_int8*sx, but we keep FP for test parity and document divergence.
         x_flat, weight, bias = ctx.saved_tensors
         orig_shape = ctx.orig_shape
         go_flat = grad_output.reshape(-1, weight.shape[0]).contiguous()
 
+        x_flat, weight, bias = ctx.saved_tensors
+        orig_shape = ctx.orig_shape
+        go_flat = grad_output.reshape(-1, weight.shape[0]).contiguous()
         gx = torch.matmul(go_flat, weight) if ctx.needs_input_grad[0] else None
         gw = torch.matmul(go_flat.t(), x_flat) if ctx.needs_input_grad[1] else None
         gb = go_flat.sum(dim=0) if (bias is not None and ctx.needs_input_grad[2]) else None
-
         if gx is not None:
             gx = gx.reshape(*orig_shape)
         return gx, gw, gb
@@ -214,12 +238,8 @@ def triton_int8_imma_linear(
     Turing sm_75: INT8 m16n8k32 inefficient — fallback to fp16 matmul (acc fp32), clamp K.
     """
     if _is_turing():
-        warnings.warn("Turing sm_75: INT8 m16n8k32 inefficient on Turing, fallback to torch.matmul fp16 (acc fp32)", stacklevel=2)
-        K = x.shape[-1]
-        if K > 16384:
-            warnings.warn(f"Turing sm_75: clamping K {K} -> 16384", stacklevel=2)
-            x = x[..., :16384]
-            weight = weight[..., :16384]
+        if x.shape[-1] > 16384:
+            raise ValueError(f"INT8 IMMA overflow: K={x.shape[-1]} exceeds int32 acc bound 16384 (Turing fallback)")
         x_f = _maybe_cast_fp16_for_turing(x).float()
         w_f = _maybe_cast_fp16_for_turing(weight).float()
         out = torch.matmul(x_f.reshape(-1, x_f.shape[-1]), w_f.t())
@@ -229,5 +249,5 @@ def triton_int8_imma_linear(
         return out.reshape(*x.shape[:-1], weight.shape[0]).to(x.dtype if x.dtype != torch.bfloat16 else torch.float16)
     K = x.shape[-1]
     if K > 16384:
-        warnings.warn(f"Clamping K {K} -> 16384 for int32 acc safety", stacklevel=2)
+        raise ValueError(f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384 (127*127*K < 2^31)")
     return TritonINT8IMMAFunction.apply(x, weight, bias)

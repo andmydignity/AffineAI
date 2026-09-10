@@ -10,11 +10,17 @@ TODO: use tl.make_block_ptr for coalesced access where Triton kernels are used.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # CPU-only: keep import-safe, kernels become no-ops via _optional_import
+    triton = None  # type: ignore
+    tl = None  # type: ignore
+
+
+_TURING_CACHE: Optional[bool] = None
 
 
 def _is_turing() -> bool:
@@ -22,20 +28,26 @@ def _is_turing() -> bool:
 
     Prefer canonical ``affine_ai.kernels._IS_TURING`` when available to avoid
     redundant ``get_device_capability`` calls; fall back to direct
-    capability probe ``(7,5) <= cap < (8,0)``.
+    capability probe ``(7,5) <= cap < (8,0)``. Result is cached after first probe.
     """
+    global _TURING_CACHE
+    if _TURING_CACHE is not None:
+        return _TURING_CACHE
     try:
         from affine_ai.kernels import _IS_TURING as _T  # type: ignore
 
-        return bool(_T)
+        _TURING_CACHE = bool(_T)
+        return _TURING_CACHE
     except Exception:
         pass
     try:
         if torch.cuda.is_available():
             cap = torch.cuda.get_device_capability()
-            return (7, 5) <= tuple(cap) < (8, 0)
+            _TURING_CACHE = (7, 5) <= tuple(cap) < (8, 0)
+            return _TURING_CACHE
     except Exception:
         pass
+    _TURING_CACHE = False
     return False
 
 
@@ -169,8 +181,9 @@ class TritonByteEncoderFunction(torch.autograd.Function):
 
             g_embed_w = torch.zeros_like(embed_w)
             vocab = embed_w.shape[0]
-            assert torch.all(byte_ids < vocab) and torch.all(byte_ids >= 0), "byte_ids OOB"
-            idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte).clamp(0, vocab - 1)
+            if torch.any(byte_ids >= vocab) or torch.any(byte_ids < 0):
+                raise ValueError(f"byte_ids OOB: vocab={vocab}, min={int(byte_ids.min())}, max={int(byte_ids.max())}")
+            idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte)
             g_embed_w.scatter_add_(0, idx, g_x.reshape(-1, d_byte))
         else:
             g_embed_w = None
@@ -189,9 +202,14 @@ def triton_fused_byte_encoder(
     bp_b: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    High-Throughput Byte Encoder (PyTorch).
-    PyTorch (embedding+conv1d+mm) with manual scatter_add backward; not Triton fused.
-    Fuses Embedding, Causal Conv1D, Residual RMSNorm, Projection, SiLU, and Boundary Logits via PyTorch ops.
+    High-Throughput Byte Encoder (PyTorch fallback, NOT a Triton kernel).
+
+    Despite the ``triton_`` prefix (kept for API compatibility with
+    ``triton_patch_mean_pool`` / ``triton_patch_weighted_pool`` which ARE true
+    Triton kernels), this path is pure PyTorch (embedding+conv1d+mm) with a
+    manual scatter_add backward to avoid EmbeddingBackward dense overhead.
+    Fuses Embedding, Causal Conv1D, Residual RMSNorm, Projection, SiLU, and
+    Boundary Logits via PyTorch ops.
     """
     return TritonByteEncoderFunction.apply(
         byte_ids, embed_w, conv_w, conv_b, norm_scale, proj_w, bp_w, bp_b
@@ -200,66 +218,83 @@ def triton_fused_byte_encoder(
 
 # ==============================================================================
 # Triton Fused Patch Mean Pooling
+# Contract: T % P == 0 enforced; EntropyPatcher pads tail before call. Non-pow2 D wastes lanes (next_pow2 capped 64/128).
 # ==============================================================================
-@triton.jit
-def _patch_mean_pool_fwd_kernel(
-    X_ptr, Out_ptr,
-    stride_xb, stride_xt, stride_xd,
-    stride_ob, stride_om, stride_od,
-    B, M, T, P: tl.constexpr, D_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)
+if triton is not None:
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_M": 8, "BLOCK_D": 32}, num_warps=2),
+            triton.Config({"BLOCK_M": 8, "BLOCK_D": 64}, num_warps=2),
+            triton.Config({"BLOCK_M": 16, "BLOCK_D": 32}, num_warps=4),
+            triton.Config({"BLOCK_M": 16, "BLOCK_D": 64}, num_warps=4),
+            triton.Config({"BLOCK_M": 16, "BLOCK_D": 128}, num_warps=4),
+            triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
+            triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=8),
+        ],
+        key=["M", "D_DIM"],
+    )
+    @triton.jit
+    def _patch_mean_pool_fwd_kernel(
+        X_ptr, Out_ptr,
+        stride_xb, stride_xt, stride_xd,
+        stride_ob, stride_om, stride_od,
+        B, M, T, P: tl.constexpr, D_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
 
-    inv_p = 1.0 / P
-    for d_start in range(0, D_DIM, BLOCK_D):
-        offs_d = d_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D_DIM
+        inv_p = 1.0 / P
+        for d_start in range(0, D_DIM, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D_DIM
 
-        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
-        for p in range(P):
-            t = offs_m * P + p
-            mask_t = mask_m & (t < T)
-            x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
-            val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
-            acc += val
+            acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+            for p in range(P):
+                t = offs_m * P + p
+                mask_t = mask_m & (t < T)
+                x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
+                val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+                acc += val
 
-        out = acc * inv_p
-        out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-        tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+            out = acc * inv_p
+            out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
-@triton.jit
-def _patch_mean_pool_bwd_kernel(
-    dOut_ptr, dX_ptr,
-    stride_ob, stride_om, stride_od,
-    stride_xb, stride_xt, stride_xd,
-    B, M, T, P: tl.constexpr, D_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    @triton.jit
+    def _patch_mean_pool_bwd_kernel(
+        dOut_ptr, dX_ptr,
+        stride_ob, stride_om, stride_od,
+        stride_xb, stride_xt, stride_xd,
+        B, M, T, P: tl.constexpr, D_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
 
-    for d_start in range(0, D_DIM, BLOCK_D):
-        offs_d = d_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D_DIM
+        for d_start in range(0, D_DIM, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D_DIM
 
-        out_ptrs = dOut_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-        dout = tl.load(out_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-        scaled_dout = (dout * (1.0 / P)).to(dX_ptr.dtype.element_ty)
+            out_ptrs = dOut_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+            dout = tl.load(out_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            scaled_dout = (dout * (1.0 / P)).to(dX_ptr.dtype.element_ty)
 
-        for p in range(P):
-            t = offs_m * P + p
-            mask_t = mask_m & (t < T)
-            x_ptrs = dX_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
-            tl.store(x_ptrs, scaled_dout, mask=mask_t[:, None] & mask_d[None, :])
+            for p in range(P):
+                t = offs_m * P + p
+                mask_t = mask_m & (t < T)
+                x_ptrs = dX_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
+                tl.store(x_ptrs, scaled_dout, mask=mask_t[:, None] & mask_d[None, :])
+else:
+    _patch_mean_pool_fwd_kernel = None  # type: ignore
+    _patch_mean_pool_bwd_kernel = None  # type: ignore
 
 
 class _TritonPatchMeanPoolFunc(torch.autograd.Function):
@@ -269,32 +304,37 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         B, T, D = x.shape
         if T % P != 0:
             raise ValueError(
-                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped"
+                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped. Pad to next multiple of P before calling (EntropyPatcher contract)."
             )
         M = T // P
+        if triton is None or not x.is_cuda or _patch_mean_pool_fwd_kernel is None:
+            out = x.view(B, M, P, D).mean(dim=2)
+            ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
+            ctx.dtype = x.dtype
+            ctx._used_triton = False
+            return out
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
-        BLOCK_M = 16
-        # Turing sm_75: 64KB SMEM => clamp BLOCK_D <=64 (Ampere 128)
-        BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
-        grid = (triton.cdiv(M, BLOCK_M), B)
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), B)  # noqa: E731
         _patch_mean_pool_fwd_kernel[grid](
             x, out,
             x.stride(0), x.stride(1), x.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
             B, M, T, P=P, D_DIM=D,
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
         ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
         ctx.dtype = x.dtype
+        ctx._used_triton = True
         return out
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         dout = dout.contiguous()
         B, T, D, M, P = ctx.B, ctx.T, ctx.D, ctx.M, ctx.P
+        if not getattr(ctx, "_used_triton", True) or triton is None or _patch_mean_pool_bwd_kernel is None:
+            dx = torch.repeat_interleave(dout / P, P, dim=1)
+            return dx, None
         dx = torch.empty((B, T, D), device=dout.device, dtype=ctx.dtype)
-        BLOCK_M = 16
-        # Turing sm_75: clamp BLOCK_D <=64
+        BLOCK_M = 8 if M <= 8 else 16
         BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_bwd_kernel[grid](
@@ -315,57 +355,56 @@ def triton_patch_mean_pool(h_byte: torch.Tensor, patch_size: int) -> torch.Tenso
     return _TritonPatchMeanPoolFunc.apply(h_byte, patch_size)
 
 
-@triton.jit
-def _patch_weighted_pool_fwd_kernel(
-    X_ptr, Logits_ptr, Out_ptr, Weights_ptr,
-    stride_xb, stride_xt, stride_xd,
-    stride_lb, stride_lt,
-    stride_ob, stride_om, stride_od,
-    stride_wb, stride_wm, stride_wp,
-    B, M, T, P: tl.constexpr, P_POW2: tl.constexpr, D_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)
+if triton is not None:
+    @triton.jit
+    def _patch_weighted_pool_fwd_kernel(
+        X_ptr, Logits_ptr, Out_ptr, Weights_ptr,
+        stride_xb, stride_xt, stride_xd,
+        stride_lb, stride_lt,
+        stride_ob, stride_om, stride_od,
+        stride_wb, stride_wm, stride_wp,
+        B, M, T, P: tl.constexpr, P_POW2: tl.constexpr, D_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
 
-    offs_p = tl.arange(0, P_POW2)
-    mask_p = offs_p < P
+        offs_p = tl.arange(0, P_POW2)
+        mask_p = offs_p < P
 
-    # Load logits for the patch [BLOCK_M, P_POW2]
-    l_ptrs = Logits_ptr + pid_b * stride_lb + (offs_m[:, None] * P + offs_p[None, :]) * stride_lt
-    logits = tl.load(l_ptrs, mask=mask_m[:, None] & mask_p[None, :], other=-1e9).to(tl.float32)
-    logits = tl.clamp(logits, -30.0, 30.0)
+        l_ptrs = Logits_ptr + pid_b * stride_lb + (offs_m[:, None] * P + offs_p[None, :]) * stride_lt
+        logits = tl.load(l_ptrs, mask=mask_m[:, None] & mask_p[None, :], other=-1e9).to(tl.float32)
+        logits = tl.clamp(logits, -30.0, 30.0)
 
-    # Softmax over P
-    m_l = tl.max(logits, axis=1)
-    exp_l = tl.exp(logits - m_l[:, None])
-    exp_l = tl.where(mask_p[None, :], exp_l, 0.0)
-    sum_exp = tl.sum(exp_l, axis=1)
-    w = exp_l / sum_exp[:, None]  # [BLOCK_M, P_POW2]
+        m_l = tl.max(logits, axis=1)
+        exp_l = tl.exp(logits - m_l[:, None])
+        exp_l = tl.where(mask_p[None, :], exp_l, 0.0)
+        sum_exp = tl.sum(exp_l, axis=1)
+        w = exp_l / sum_exp[:, None]
 
-    # Store computed softmax weights for backward pass (float32 for stability)
-    w_ptrs = Weights_ptr + pid_b * stride_wb + offs_m[:, None] * stride_wm + offs_p[None, :] * stride_wp
-    tl.store(w_ptrs, w.to(Weights_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_p[None, :])
+        w_ptrs = Weights_ptr + pid_b * stride_wb + offs_m[:, None] * stride_wm + offs_p[None, :] * stride_wp
+        tl.store(w_ptrs, w.to(Weights_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_p[None, :])
 
-    for d_start in range(0, D_DIM, BLOCK_D):
-        offs_d = d_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D_DIM
+        for d_start in range(0, D_DIM, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D_DIM
 
-        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
-        for p in range(P):
-            # O(P) direct indexing: w_p = w[:,p] avoids O(P^2) reduction per p
-            w_p = w[:, p]
-            t = offs_m * P + p
-            mask_t = mask_m & (t < T)
-            x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
-            val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
-            acc += val.to(tl.float32) * w_p[:, None]
+            acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+            for p in range(P):
+                w_p = tl.load(Weights_ptr + pid_b * stride_wb + offs_m * stride_wm + p * stride_wp, mask=mask_m)
+                t = offs_m * P + p
+                mask_t = mask_m & (t < T)
+                x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
+                val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+                acc += val.to(tl.float32) * w_p[:, None]
 
-        out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-        tl.store(out_ptrs, acc.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+            out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+else:
+    _patch_weighted_pool_fwd_kernel = None  # type: ignore
 
 
 class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
@@ -376,14 +415,21 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         B, T, D = x.shape
         if T % P != 0:
             raise ValueError(
-                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped"
+                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped. Pad to next multiple of P before calling (EntropyPatcher contract)."
             )
         M = T // P
+        if triton is None or not x.is_cuda or _patch_weighted_pool_fwd_kernel is None:
+            w = torch.softmax(logits.view(B, M, P).float().clamp(-30, 30), dim=-1)
+            ctx.save_for_backward(x, w.to(torch.float32))
+            ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
+            ctx._used_triton = False
+            out = (x.view(B, M, P, D).float() * w.unsqueeze(-1)).sum(dim=2).to(x.dtype)
+            return out
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         P_POW2 = triton.next_power_of_2(P)
         weights = torch.empty((B, M, P_POW2), device=x.device, dtype=torch.float32)
 
-        BLOCK_M = 16
+        BLOCK_M = 8 if M <= 8 else 16
         BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
 
@@ -399,23 +445,24 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
 
         ctx.save_for_backward(x, weights)
         ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
+        ctx._used_triton = True
         return out
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         x, weights = ctx.saved_tensors
         B, T, D, M, P = ctx.B, ctx.T, ctx.D, ctx.M, ctx.P
-        w = weights[:, :, :P].to(dout.dtype)  # [B, M, P]
+        if getattr(ctx, "_used_triton", True):
+            w_fp32 = weights[:, :, :P].float()
+        else:
+            w_fp32 = weights.float()
+        w = w_fp32.to(dout.dtype)
         h_reshaped = x.view(B, M, P, D)
         dout_u = dout.unsqueeze(2)
-
-        # Gradient w.r.t input x: dh = dout * w
         gx = (dout_u * w.unsqueeze(-1)).reshape(B, T, D)
-
-        # Gradient w.r.t logits via softmax derivative:
-        gw = (dout_u * h_reshaped).sum(dim=-1)  # [B, M, P]
-        glogits = (w * (gw - (w * gw).sum(dim=-1, keepdim=True))).reshape(B, T)
-
+        gw_fp32 = (dout_u.float() * h_reshaped.float()).sum(dim=-1)
+        glogits_fp32 = w_fp32 * (gw_fp32 - (w_fp32 * gw_fp32).sum(dim=-1, keepdim=True))
+        glogits = glogits_fp32.to(dout.dtype).reshape(B, T)
         return gx, glogits, None
 
 

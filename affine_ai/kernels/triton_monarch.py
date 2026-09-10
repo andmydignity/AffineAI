@@ -7,6 +7,7 @@ Eliminates intermediate VRAM writes across all Monarch projection stages.
 """
 
 import math
+import os
 import warnings
 from typing import Tuple, Optional
 import torch
@@ -71,12 +72,15 @@ def precompute_monarch_composed_fused(diagonals: torch.Tensor, perms: torch.Tens
 
 
 _MONARCH_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=8),
-    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=4),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=8, num_stages=3),
 ]
 
 # Turing sm_75: prune to BLOCK 32/64 only, remove 128 variants, num_warps 2/4 max, BLOCK <=64.
@@ -85,6 +89,13 @@ if _is_turing():
         c for c in _MONARCH_AUTOTUNE_CONFIGS
         if c.kwargs.get("BLOCK_M", 32) <= 64 and c.kwargs.get("BLOCK_D", 32) <= 64 and c.num_warps <= 4
     ]
+
+try:
+    _cap_monarch = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
+    if _cap_monarch >= (9, 0):
+        _MONARCH_AUTOTUNE_CONFIGS.append(triton.Config({"BLOCK_M": 128, "BLOCK_D": 64}, num_warps=8, num_stages=3))
+except Exception:
+    pass
 
 
 @triton.autotune(configs=_MONARCH_AUTOTUNE_CONFIGS, key=["N", "D"])
@@ -96,8 +107,14 @@ def _monarch_chain_fwd_kernel(
     N, D,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
+    """
+    Fused Monarch chain: Y[m,d]=Bias[d]+W[d]*X[m,P[d]]. BLOCK_M/D tiles cover (N,D).
+    Early-exit when pid_d*BLOCK_D >= D (fully masked D tail) avoids useless loads.
+    """
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
+    if pid_d * BLOCK_D >= D:
+        return
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
@@ -179,10 +196,15 @@ def _fused_monarch_chain_fwd_kernel(
     N, D,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
+    """
+    Fused multi-branch Monarch chain: Y[m,n,d]=Bias[m,d]+W[m,d]*X[n,P[d]].
+    Grid (cdiv(N,BLOCK_M), cdiv(D,BLOCK_D), M). Early-exit on fully masked D tail.
+    """
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
-    br = tl.program_id(2)  # native 3D grid: branch index directly!
-
+    br = tl.program_id(2)
+    if pid_d * BLOCK_D >= D:
+        return
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
@@ -244,7 +266,16 @@ def _fused_monarch_chain_fwd_kernel(
 
 
 def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Monarch chain forward: composes diagonals/perms into monomial W,P then fused kernel.
+    Tail-mask subtlety: blocked loads use boundary_check + early-exit on fully masked D tail;
+    masked lanes contribute 0 (other=0) not NaN, so D not divisible by BLOCK_D is safe.
+    """
+    assert x.ndim == 2, f"x must be [N,D], got {x.shape}"
     N, D = x.shape
+    assert diagonals.ndim == 2 and diagonals.shape[1] == D, f"diagonals must be [S,D] with D={D}"
+    assert bias.shape == (D,), f"bias must be [D], got {bias.shape}"
+    assert perms.shape[1] == D, f"perms must be [S,D] with D={D}"
     # Turing sm_75: bf16 fallback to fp16 (acc fp32) with warning.
     _maybe_warn_bf16_turing(x.dtype, "triton_monarch_chain_fwd")
     _maybe_warn_bf16_turing(diagonals.dtype, "triton_monarch_chain_fwd")
@@ -269,8 +300,17 @@ def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: to
 
 
 def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused multi-branch Monarch chain forward. Tail-mask subtlety same as single-branch:
+    masked D lanes are other=0 with boundary_check, fully masked tail block early-exits.
+    """
+    assert x.ndim == 2, f"x must be [N,D], got {x.shape}"
     N, D = x.shape
     M = diagonals.shape[0]
+    assert diagonals.ndim == 3 and diagonals.shape[2] == D, f"diagonals must be [M,S,D] with D={D}"
+    assert bias.shape == (M, D), f"bias must be [M,D], got {bias.shape}"
+    if M > 65535:
+        raise ValueError(f"M={M} exceeds grid z limit 65535")
     _maybe_warn_bf16_turing(x.dtype, "triton_fused_monarch_chain_fwd")
     _maybe_warn_bf16_turing(diagonals.dtype, "triton_fused_monarch_chain_fwd")
     if not x.is_cuda or not torch.cuda.is_available():
@@ -304,6 +344,7 @@ class TritonMonarchChainFunction(torch.autograd.Function):
         inv_perms: torch.Tensor,
         bias: torch.Tensor
     ) -> torch.Tensor:
+        assert x.ndim >= 2 and x.shape[-1] == diagonals.shape[-1], f"x last dim {x.shape[-1]} != D {diagonals.shape[-1]}"
         orig_shape = x.shape
         # Ensure perms/inv_perms contiguous for stride assumptions in gathering
         perms = perms.long().contiguous()
@@ -312,7 +353,7 @@ class TritonMonarchChainFunction(torch.autograd.Function):
         num_stages = diagonals.shape[0]
         # Debug parity check: perms/inv_perms must be bijective (recompute vs composed forward)
         # Memory peak note: backward recomputes h_list vs composed forward; CPU path recomputes per-stage vs Triton fused
-        if __debug__:
+        if __debug__ and os.environ.get("AFFINE_DEBUG_MONARCH", "0") == "1":
             D = x.shape[-1]
             arange = torch.arange(D, device=perms.device)
             for s in range(num_stages - 1):
@@ -366,13 +407,14 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
         inv_perms: torch.Tensor,
         bias: torch.Tensor
     ) -> Tuple[torch.Tensor, ...]:
+        assert x.ndim >= 2 and x.shape[-1] == diagonals.shape[2], f"x last dim {x.shape[-1]} != D {diagonals.shape[2]}"
         orig_shape = x.shape
         perms = perms.long().contiguous()
         inv_perms = inv_perms.long().contiguous()
         x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
         num_branches = diagonals.shape[0]
         num_stages = diagonals.shape[1]
-        if __debug__:
+        if __debug__ and os.environ.get("AFFINE_DEBUG_MONARCH", "0") == "1":
             D = x.shape[-1]
             arange = torch.arange(D, device=perms.device)
             for s in range(num_stages - 1):

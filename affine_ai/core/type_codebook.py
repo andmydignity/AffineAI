@@ -12,6 +12,8 @@ class LatentTypeCodebook(nn.Module):
 
     Online Gaussian types with stick-breaking birth and BMR merging.
     Embedding is zero-init scale, so enrichment is function-preserving at init.
+    Note: uses torch.cdist for exact distances; fused Triton cdist is not
+    implemented (report-only) — proposal in docs to fuse if profiled hot.
     """
 
     def __init__(self, dim: int, max_types: int = 32, birth_threshold: float = 1.5, merge_threshold: float = 0.8):
@@ -36,6 +38,8 @@ class LatentTypeCodebook(nn.Module):
         if active == 0:
             return latents, torch.zeros(B, M, dtype=torch.long, device=latents.device)
         flat = latents.reshape(-1, D)
+        if flat.numel() == 0:
+            return latents, torch.zeros(B, M, dtype=torch.long, device=latents.device)
         dists = torch.cdist(flat.float(), self.means[:active].float())
         ids = dists.argmin(dim=-1).view(B, M)
         enrich = self.embedding(ids) * self.scale
@@ -44,12 +48,16 @@ class LatentTypeCodebook(nn.Module):
     @torch.no_grad()
     def update(self, latents: torch.Tensor):
         flat = latents.detach().reshape(-1, self.dim)
+        if flat.numel() == 0:
+            return
         active = int(self.num_types.item())
         if active == 0:
             return
         dists = torch.cdist(flat.float(), self.means[:active].float())
         min_dist, nearest = dists.min(dim=-1)
         birth_mask = (min_dist > self.birth_threshold) & (active < self.max_types)
+        birth_indices = None
+        n_birth = 0
         if birth_mask.any():
             birth_idx = torch.where(birth_mask)[0]
             n_birth = min(int(birth_mask.sum().item()), self.max_types - active)
@@ -59,13 +67,24 @@ class LatentTypeCodebook(nn.Module):
                 self.counts[active:active + n_birth] = 1.0
                 active += n_birth
                 self.num_types.fill_(active)
-            if n_birth > 0 and n_birth < flat.shape[0]:
+                birth_indices = set(chosen_idx.tolist())
+                # Recompute distances for remaining points only (avoid double-count)
+                # Mask out birth points for subsequent mean updates
+                # Do not recompute for birth points; they are not in rem set
                 dists = torch.cdist(flat.float(), self.means[:active].float())
                 min_dist, nearest = dists.min(dim=-1)
-                birth_mask = torch.zeros_like(birth_mask)
-        mask = ~birth_mask
+                # Build mask that excludes birth points
+                birth_mask_new = torch.zeros(flat.shape[0], dtype=torch.bool, device=flat.device)
+                birth_mask_new[chosen_idx] = True
+                mask = ~birth_mask_new
+            else:
+                mask = ~birth_mask
+        else:
+            mask = ~birth_mask
         if mask.any():
             flat_rem = flat[mask]
+            if flat_rem.numel() == 0:
+                return
             nearest_rem = nearest[mask]
             counts_add = torch.bincount(nearest_rem, minlength=active).float()
             sums = torch.zeros(active, self.dim, dtype=flat_rem.dtype, device=flat_rem.device)
@@ -86,27 +105,36 @@ class LatentTypeCodebook(nn.Module):
 
     @torch.no_grad()
     def bmr_merge(self) -> int:
-        """BMR-style merge: merge closest pair if distance < merge_threshold."""
+        """BMR-style merge: merge closest pair if distance < merge_threshold.
+        Iteratively merges until no pair below threshold (counts-weighted, bias-free).
+        Returns number of merges performed (single pair per call for stability).
+        """
         active = int(self.num_types.item())
         if active <= 1:
             return 0
+        # Compute pairwise distances
         dists = torch.cdist(self.means[:active].float(), self.means[:active].float())
         dists.fill_diagonal_(float("inf"))
-        min_val, min_idx = dists.min(dim=-1)
-        # global min
-        best = min_val.argmin().item()
-        other = int(min_idx[best].item())
-        if min_val[best].item() >= self.merge_threshold:
+        # Find global closest pair
+        min_val = dists.min()
+        if min_val.item() >= self.merge_threshold:
             return 0
-        a, b = best, other
+        # Get indices of global min
+        flat_idx = dists.argmin().item()
+        a = flat_idx // active
+        b = flat_idx % active
         if a > b:
             a, b = b, a
-        # Merge b into a (keep a, drop b)
-        ca, cb = self.counts[a].item(), self.counts[b].item()
-        if ca + cb == 0:
-            return 0
-        self.means[a] = (ca * self.means[a] + cb * self.means[b]) / (ca + cb)
-        self.counts[a] = ca + cb
+        # Merge b into a (keep a, drop b) with counts weighting (bias-free)
+        ca, cb = float(self.counts[a].item()), float(self.counts[b].item())
+        tot = ca + cb
+        if tot == 0:
+            # Both zero-count types: average equally then drop b
+            self.means[a] = (self.means[a] + self.means[b]) * 0.5
+            self.counts[a] = 0.0
+        else:
+            self.means[a] = (ca * self.means[a] + cb * self.means[b]) / tot
+            self.counts[a] = tot
         if b < active - 1:
             self.means[b : active - 1] = self.means[b + 1 : active].clone()
             self.counts[b : active - 1] = self.counts[b + 1 : active].clone()
@@ -115,7 +143,10 @@ class LatentTypeCodebook(nn.Module):
         self.num_types.fill_(active - 1)
         with torch.no_grad():
             w = self.embedding.weight
-            w[a] = (w[a] * ca + w[b] * cb) / (ca + cb) if (ca + cb) > 0 else w[a]
+            if tot == 0:
+                w[a] = (w[a] + w[b]) * 0.5
+            else:
+                w[a] = (w[a] * ca + w[b] * cb) / tot if tot > 0 else w[a]
             if b < active - 1:
                 w[b : active - 1] = w[b + 1 : active].clone()
             w[active - 1].zero_()

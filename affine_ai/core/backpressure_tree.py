@@ -408,7 +408,21 @@ class FusedSparseBackpressureTreeV3(nn.Module):
         if self.rank is None:
             leaf_w_eff = self._effective_leaf_weights()
             leaf_w_packed = leaf_w_eff.permute(1, 0, 2).reshape(self.in_features, self.num_leaves * self.out_features)
-            x_proj = torch.matmul(x_flat, leaf_w_packed).view(B, self.num_leaves, self.out_features)
+            # leaf_w_packed = (I, K*O) contiguous copy of size I*K*O; peak O(I*K*O) allocate from permute+reshape.
+            # Chunking proposal: materialize per-chunk K tiles if I*K*O > 1M elements.
+            # Triton wiring: triton_ternary_linear not drop-in for packed K*O layout; fallback to torch matmul.
+            if leaf_w_packed.is_cuda:
+                try:
+                    from affine_ai.kernels import triton_fp32_linear as _tfl
+                    if _tfl is not None and B * self.num_leaves * self.out_features < (1 << 26):
+                        x_proj_try = _tfl(x_flat, leaf_w_packed.t().contiguous())
+                        x_proj = x_proj_try.view(B, self.num_leaves, self.out_features)
+                    else:
+                        raise RuntimeError("fallback")
+                except Exception:
+                    x_proj = torch.matmul(x_flat, leaf_w_packed).view(B, self.num_leaves, self.out_features)
+            else:
+                x_proj = torch.matmul(x_flat, leaf_w_packed).view(B, self.num_leaves, self.out_features)
             leaf_outputs = x_proj + self.leaf_biases.unsqueeze(0)
             out = torch.bmm(sparse_probs.unsqueeze(1), leaf_outputs).squeeze(1)
             h = m = sib = p_sib = h_sel = a_sel = a = None
@@ -426,13 +440,34 @@ class FusedSparseBackpressureTreeV3(nn.Module):
             h = a = None
             leaf_outputs = None
         else:
-            # Low-rank dense-over-K path: mix before projecting.
             u_eff, v_eff = self._effective_factors()
             u_packed = u_eff.permute(1, 0, 2).reshape(self.in_features, self.num_leaves * self.rank)
-            h = torch.matmul(x_flat, u_packed).view(B, self.num_leaves, self.rank)
+            if u_packed.is_cuda:
+                try:
+                    from affine_ai.kernels import triton_fp32_linear as _tfl2
+                    if _tfl2 is not None:
+                        h_try = _tfl2(x_flat, u_packed.t().contiguous())
+                        h = h_try.view(B, self.num_leaves, self.rank)
+                    else:
+                        raise RuntimeError("fallback")
+                except Exception:
+                    h = torch.matmul(x_flat, u_packed).view(B, self.num_leaves, self.rank)
+            else:
+                h = torch.matmul(x_flat, u_packed).view(B, self.num_leaves, self.rank)
             a = self._phi(h)
             m = torch.einsum('bk,bkr->br', sparse_probs, a)
-            out = m @ v_eff + sparse_probs @ self.leaf_biases
+            if m.is_cuda:
+                try:
+                    from affine_ai.kernels import triton_fp32_linear as _tfl3
+                    if _tfl3 is not None and v_eff.is_cuda:
+                        out_try = _tfl3(m, v_eff.t().contiguous())
+                        out = out_try + sparse_probs @ self.leaf_biases
+                    else:
+                        raise RuntimeError("fallback")
+                except Exception:
+                    out = m @ v_eff + sparse_probs @ self.leaf_biases
+            else:
+                out = m @ v_eff + sparse_probs @ self.leaf_biases
             sib = p_sib = h_sel = a_sel = None
             leaf_outputs = None
 
@@ -892,7 +927,9 @@ class FusedSparseBackpressureTreeV3(nn.Module):
             # regrow instantly and the mask never moves (observed: zero
             # change across hundreds of steps). Only genuinely-long-inactive
             # positions may be grown.
-            grow_cand = inactive_idx[~torch.isin(inactive_idx, dropped)]
+            dropped_mask = torch.zeros(flat_mask.numel(), dtype=torch.bool, device=flat_mask.device)
+            dropped_mask[dropped] = True
+            grow_cand = inactive_idx[~dropped_mask[inactive_idx]]
             if grow_cand.numel() == 0:
                 grow_cand = inactive_idx
             if grow_by_gradient and grad_scores is not None and grow_cand.numel() > 0:

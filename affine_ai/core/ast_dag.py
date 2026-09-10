@@ -507,7 +507,8 @@ class ASTDAGNode(nn.Module):
             x_4d = x_in.unsqueeze(1).expand(-1, self.num_permutations, -1)
             perms_4d = self.perms.long().unsqueeze(0).expand(x_in.shape[0], -1, -1)
             x_p = torch.gather(x_4d, -1, perms_4d)
-            h_primary = (x_p * w_perm.unsqueeze(0)).sum(dim=1) + self.bias
+            # 1/sqrt(P) scaling: permutation sum is P independent paths; preserve variance
+            h_primary = (x_p * w_perm.unsqueeze(0)).sum(dim=1) * (1.0 / math.sqrt(self.num_permutations)) + self.bias
         elif self.rank is None:
             W_bin = ternarize(
                 self.latent_W_primary,
@@ -665,7 +666,10 @@ class ASTDAGNode(nn.Module):
             if idx >= self.max_secondary:
                 break
             c_k_flat = c_k.reshape(-1, self.dim)
-            if self.use_power_of_two_gates or self.bounded_gating:
+            if self.use_power_of_two_gates:
+                ste_mask = (self.W_context[idx].abs() <= 1.5).to(g_v_flat.dtype)
+                grad_W_context[idx] = (g_v_flat * c_k_flat * ste_mask).mean(dim=0)
+            elif self.bounded_gating:
                 tanh_w = torch.tanh(self.W_context[idx])
                 dtanh = 1.0 - tanh_w * tanh_w
                 grad_W_context[idx] = (g_v_flat * c_k_flat * dtanh).mean(dim=0)
@@ -717,13 +721,9 @@ class HierarchicalSignRouter(nn.Module):
         self.biases = nn.Parameter(torch.zeros(self.num_internal_nodes))
 
     def route_tokens(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns routing probabilities out-of-place without in-place slice mutation.
-        Evaluates O(log2 K * d) integer sign tests per token.
-        """
         B = x_flat.shape[0]
         W_route = ternarize(self.hyperplanes)
-        node_logits = F.linear(x_flat, W_route, self.biases)  # (B, num_internal_nodes)
+        node_logits = F.linear(x_flat, W_route, self.biases)
 
         logit_root = node_logits[:, 0:1]
         p_right = torch.sigmoid(logit_root * 2.0)
@@ -739,23 +739,31 @@ class HierarchicalSignRouter(nn.Module):
             current_level_probs = torch.stack([current_level_probs * pl, current_level_probs * pr], dim=-1).view(B, -1)
 
         leaf_probs = current_level_probs
-        routing_probs = leaf_probs[:, :self.num_leaves]
-        routing_probs = routing_probs / routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        if self.num_leaves < (1 << self.tree_depth):
+            routing_probs = leaf_probs[:, :self.num_leaves]
+            denom = routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            routing_probs = routing_probs / denom
+            uniform = torch.full_like(routing_probs, 1.0 / self.num_leaves)
+            routing_probs = torch.where(denom < 1e-8, uniform, routing_probs)
+        else:
+            routing_probs = leaf_probs
         return routing_probs, node_logits
 
     def route_tokens_popc(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Fast 1-Bit POPC hardware ALU routing using native popc.b32 instructions.
-        Replaces 32 FP32 FMAs with 1 XOR + 1 POPC per 32 dimensions on the INT32 ALU datapath.
-        """
         if not x_flat.is_cuda:
             return self.route_tokens(x_flat)
         try:
             from affine_ai.kernels.triton_popc import triton_pack_sign_bits, triton_popc_sign_similarity
-            x_bits = triton_pack_sign_bits(x_flat)
-            w_bits = triton_pack_sign_bits(self.hyperplanes)
-            sim = triton_popc_sign_similarity(x_bits, w_bits, scale=1.0 / math.sqrt(self.dim))
-            node_logits = sim + self.biases.unsqueeze(0)
+            W_route = ternarize(self.hyperplanes)
+            if (W_route == 0).any():
+                node_logits = F.linear(x_flat, W_route, self.biases)
+            else:
+                active = W_route[W_route != 0]
+                alpha = active.abs().mean().item() if active.numel() else 1.0 / math.sqrt(self.dim)
+                x_bits = triton_pack_sign_bits(x_flat)
+                w_bits = triton_pack_sign_bits(self.hyperplanes)
+                sim = triton_popc_sign_similarity(x_bits, w_bits, scale=alpha)
+                node_logits = sim + self.biases.unsqueeze(0)
         except Exception:
             return self.route_tokens(x_flat)
 
@@ -774,8 +782,14 @@ class HierarchicalSignRouter(nn.Module):
             current_level_probs = torch.stack([current_level_probs * pl, current_level_probs * pr], dim=-1).view(B, -1)
 
         leaf_probs = current_level_probs
-        routing_probs = leaf_probs[:, :self.num_leaves]
-        routing_probs = routing_probs / routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        if self.num_leaves < (1 << self.tree_depth):
+            routing_probs = leaf_probs[:, :self.num_leaves]
+            denom = routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            routing_probs = routing_probs / denom
+            uniform = torch.full_like(routing_probs, 1.0 / self.num_leaves)
+            routing_probs = torch.where(denom < 1e-8, uniform, routing_probs)
+        else:
+            routing_probs = leaf_probs
         return routing_probs, node_logits
 
 
@@ -885,8 +899,13 @@ class ASTDAGLayer(nn.Module):
         self.step_counter = 0
         self._last_routing_probs: Optional[torch.Tensor] = None
         self._last_x_flat: Optional[torch.Tensor] = None
+        self._last_r_in: Optional[torch.Tensor] = None
         self._last_stacked_leaf_outs: Optional[torch.Tensor] = None
         self._last_out: Optional[torch.Tensor] = None
+        self._leaves_cache: Optional[List[ASTDAGNode]] = None
+        self._leaves_cache_valid: bool = False
+        self.register_buffer('_cached_perms_stack', torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer('_cached_inv_perms_stack', torch.empty(0, dtype=torch.long), persistent=False)
 
     def _create_node(self, depth: int = 0, topo_order: int = 0) -> ASTDAGNode:
         node_id = self._next_node_id
@@ -912,11 +931,20 @@ class ASTDAGLayer(nn.Module):
             use_power_of_two_gates=self.use_power_of_two_gates,
         )
         self.nodes[str(node_id)] = node
+        self._invalidate_leaves_cache()
         return node
 
     @property
     def leaves(self) -> List[ASTDAGNode]:
-        return [node for node in self.nodes.values() if node.is_leaf]
+        if getattr(self, "_leaves_cache", None) is not None and getattr(self, "_leaves_cache_valid", False):
+            return self._leaves_cache
+        leaves = [node for node in self.nodes.values() if node.is_leaf]
+        self._leaves_cache = leaves
+        self._leaves_cache_valid = True
+        return leaves
+
+    def _invalidate_leaves_cache(self) -> None:
+        self._leaves_cache_valid = False
 
     def resparsify(self) -> None:
         for node in self.nodes.values():
@@ -930,22 +958,69 @@ class ASTDAGLayer(nn.Module):
         for node in self.nodes.values():
             node.redistribute_sparsity(drop_fraction=drop_fraction, seed=seed)
 
-    def _sync_router(self) -> None:
+    def _migrate_param_state(self, old_param: nn.Parameter, new_param: nn.Parameter, optimizer: Any) -> None:
+        if optimizer is None or old_param is None or new_param is None:
+            return
+        sub_opts = getattr(optimizer, "optimizers", [optimizer])
+        for opt in sub_opts:
+            if not hasattr(opt, "state") or not hasattr(opt, "param_groups"):
+                continue
+            if old_param in opt.state:
+                state = opt.state.pop(old_param)
+                new_state = {}
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        try:
+                            new_state[k] = v.clone()
+                        except Exception:
+                            new_state[k] = v
+                    else:
+                        new_state[k] = v
+                opt.state[new_param] = new_state
+            for pg in opt.param_groups:
+                for i, p in enumerate(pg["params"]):
+                    if p is old_param:
+                        pg["params"][i] = new_param
+
+    def _sync_router(self, optimizer: Optional[Any] = None) -> None:
         num_leaves = len(self.leaves)
         if self.use_hierarchical_routing:
             if self.router.num_leaves != num_leaves:
-                self.router = HierarchicalSignRouter(self.dim, num_leaves)
+                old_router = self.router
+                old_h = old_router.hyperplanes
+                old_b = old_router.biases
+                new_router = HierarchicalSignRouter(self.dim, num_leaves).to(old_h.device)
+                with torch.no_grad():
+                    n_old = old_h.shape[0]
+                    n_new = new_router.hyperplanes.shape[0]
+                    min_n = min(n_old, n_new)
+                    if min_n > 0:
+                        new_router.hyperplanes.data[:min_n].copy_(old_h.data[:min_n])
+                        new_router.biases.data[:min_n].copy_(old_b.data[:min_n])
+                if optimizer is not None:
+                    self._migrate_param_state(old_h, new_router.hyperplanes, optimizer)
+                    self._migrate_param_state(old_b, new_router.biases, optimizer)
+                self._modules['router'] = new_router
+                self._invalidate_leaves_cache()
         else:
             cur_leaves = self.router_weights.shape[0] if self.router_weights is not None else 0
             if cur_leaves != num_leaves:
-                new_w = torch.randn(num_leaves, self.dim, device=self.router_weights.device if self.router_weights is not None else 'cpu') * (1.0 / math.sqrt(self.dim))
-                new_b = torch.zeros(num_leaves, device=self.router_biases.device if self.router_biases is not None else 'cpu')
+                old_w = self.router_weights
+                old_b = self.router_biases
+                new_w = torch.randn(num_leaves, self.dim, device=old_w.device if old_w is not None else 'cpu') * (1.0 / math.sqrt(self.dim))
+                new_b = torch.zeros(num_leaves, device=old_b.device if old_b is not None else 'cpu')
                 min_k = min(cur_leaves, num_leaves)
                 if min_k > 0:
-                    new_w[:min_k] = self.router_weights.data[:min_k]
-                    new_b[:min_k] = self.router_biases.data[:min_k]
-                self.router_weights = nn.Parameter(new_w)
-                self.router_biases = nn.Parameter(new_b)
+                    new_w[:min_k] = old_w.data[:min_k]
+                    new_b[:min_k] = old_b.data[:min_k]
+                new_w_param = nn.Parameter(new_w)
+                new_b_param = nn.Parameter(new_b)
+                self._parameters['router_weights'] = new_w_param
+                self._parameters['router_biases'] = new_b_param
+                if optimizer is not None:
+                    self._migrate_param_state(old_w, new_w_param, optimizer)
+                    self._migrate_param_state(old_b, new_b_param, optimizer)
+                self._invalidate_leaves_cache()
 
     def forward(
         self,
@@ -1020,36 +1095,69 @@ class ASTDAGLayer(nn.Module):
                 alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
             w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
-            if getattr(self, '_cached_perms_stack', None) is None or self._cached_perms_stack.shape[0] != len(leaves) or self._cached_perms_stack.device != b_stack.device:
-                self._cached_perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
-                self._cached_inv_perms_stack = torch.stack([leaf.inv_perms for leaf in leaves], dim=0)
+            need_rebuild = False
+            if not hasattr(self, '_cached_perms_stack') or self._cached_perms_stack.numel() == 0:
+                need_rebuild = True
+            elif self._cached_perms_stack.shape[0] != len(leaves):
+                need_rebuild = True
+            elif self._cached_perms_stack.device != b_stack.device:
+                need_rebuild = True
+            elif self._cached_perms_stack.shape[1] != leaves[0].perms.shape[0]:
+                need_rebuild = True
+            if need_rebuild:
+                perms_cpu = torch.stack([leaf.perms for leaf in leaves], dim=0).to(b_stack.device)
+                inv_cpu = torch.stack([leaf.inv_perms for leaf in leaves], dim=0).to(b_stack.device)
+                self.register_buffer('_cached_perms_stack', perms_cpu, persistent=False)
+                self.register_buffer('_cached_inv_perms_stack', inv_cpu, persistent=False)
             perms_stack = self._cached_perms_stack
             inv_perms_stack = self._cached_inv_perms_stack
 
             has_secondary = any(len(leaf.secondary_parents) > 0 for leaf in leaves)
+            scale_perm = 1.0 / math.sqrt(perms_stack.shape[1]) if perms_stack.numel() else 1.0
             if not r_in.is_cuda and not has_secondary and first_leaf.activation == "relu6":
-                from affine_ai.core.cpp_ops import asdag_cpu_sparse_tree_perm
-                composite_out = asdag_cpu_sparse_tree_perm(
-                    r_in, w_perm_stack, perms_stack, inv_perms_stack, b_stack, top_indices, top_weights
-                )
-                return composite_out.reshape(*orig_shape)
-
-            if r_in.is_cuda and not has_secondary and first_leaf.activation == "relu6":
                 try:
-                    from affine_ai.kernels.triton_tree import triton_tree_perm
-                    composite_out = triton_tree_perm(
-                        r_in, w_perm_stack, b_stack, perms_stack, top_indices, top_weights
+                    from affine_ai.core.cpp_ops import asdag_cpu_sparse_tree_perm
+                    w_scaled = w_perm_stack * scale_perm
+                    composite_out = asdag_cpu_sparse_tree_perm(
+                        r_in, w_scaled, perms_stack, inv_perms_stack, b_stack, top_indices, top_weights
                     )
                     if record_cache is None:
                         record_cache = self.training
                     if record_cache:
                         self._last_routing_probs = routing_probs.detach()
                         self._last_x_flat = x_flat.detach()
+                        self._last_r_in = r_in.detach()
                         self._last_stacked_leaf_outs = None
                         self._last_out = composite_out.detach()
                     else:
                         self._last_routing_probs = None
                         self._last_x_flat = None
+                        self._last_r_in = None
+                        self._last_stacked_leaf_outs = None
+                        self._last_out = None
+                    return composite_out.reshape(*orig_shape)
+                except Exception:
+                    pass
+
+            if r_in.is_cuda and not has_secondary and first_leaf.activation == "relu6":
+                try:
+                    from affine_ai.kernels.triton_tree import triton_tree_perm
+                    w_scaled2 = w_perm_stack * scale_perm
+                    composite_out = triton_tree_perm(
+                        r_in, w_scaled2, b_stack, perms_stack, top_indices, top_weights
+                    )
+                    if record_cache is None:
+                        record_cache = self.training
+                    if record_cache:
+                        self._last_routing_probs = routing_probs.detach()
+                        self._last_x_flat = x_flat.detach()
+                        self._last_r_in = r_in.detach()
+                        self._last_stacked_leaf_outs = None
+                        self._last_out = composite_out.detach()
+                    else:
+                        self._last_routing_probs = None
+                        self._last_x_flat = None
+                        self._last_r_in = None
                         self._last_stacked_leaf_outs = None
                         self._last_out = None
                     return composite_out.reshape(*orig_shape)
@@ -1058,40 +1166,111 @@ class ASTDAGLayer(nn.Module):
 
             K_num = len(leaves)
             P_num = perms_stack.shape[1]
-            r_4d = r_in.view(B, 1, 1, self.dim).expand(B, K_num, P_num, self.dim)
-            perms_4d = perms_stack.long().unsqueeze(0).expand(B, K_num, P_num, self.dim)
-            x_p = torch.gather(r_4d, -1, perms_4d)
-            leaf_prim = (x_p * w_perm_stack.unsqueeze(0)).sum(dim=2) + b_stack.unsqueeze(0)
+            scale_perm = 1.0 / math.sqrt(P_num)
+            if not has_secondary:
+                r_4d = r_in.view(B, 1, 1, self.dim).expand(B, K_num, P_num, self.dim)
+                perms_4d = perms_stack.long().unsqueeze(0).expand(B, K_num, P_num, self.dim)
+                x_p = torch.gather(r_4d, -1, perms_4d)
+                leaf_prim = (x_p * w_perm_stack.unsqueeze(0)).sum(dim=2) * scale_perm + b_stack.unsqueeze(0)
+            else:
+                chunk_k = 4
+                leaf_prim = torch.empty(B, K_num, self.dim, device=r_in.device, dtype=r_in.dtype)
+                for k_start in range(0, K_num, chunk_k):
+                    k_end = min(k_start + chunk_k, K_num)
+                    ck = k_end - k_start
+                    perms_c = perms_stack[k_start:k_end]
+                    w_c = w_perm_stack[k_start:k_end]
+                    b_c = b_stack[k_start:k_end]
+                    r_4d = r_in.view(B, 1, 1, self.dim).expand(B, ck, P_num, self.dim)
+                    perms_4d = perms_c.long().unsqueeze(0).expand(B, ck, P_num, self.dim)
+                    x_p = torch.gather(r_4d, -1, perms_4d)
+                    leaf_prim[:, k_start:k_end] = (x_p * w_c.unsqueeze(0)).sum(dim=2) * scale_perm + b_c.unsqueeze(0)
         elif self.rank is None:
-            w_stack = torch.stack([
-                ternarize(
-                    leaf.latent_W_primary,
-                    self.threshold_frac,
-                    mask=leaf.sparsity_mask if leaf.leaf_sparsity > 0.0 else None,
-                    scale=leaf.scale_w if self.learnable_scale else None
-                )
-                for leaf in leaves
-            ], dim=0)
+            latent_stack = torch.stack([leaf.latent_W_primary for leaf in leaves], dim=0)
+            if leaves[0].leaf_sparsity > 0.0:
+                mask_stack = torch.stack([leaf.sparsity_mask for leaf in leaves], dim=0)
+            else:
+                mask_stack = None
+            if self.learnable_scale and leaves[0].scale_w is not None:
+                scale_stack = torch.stack([leaf.scale_w for leaf in leaves], dim=0).view(-1, 1, 1)
+            else:
+                scale_stack = None
+            w_eff = latent_stack * mask_stack if mask_stack is not None else latent_stack
+            abs_eff = w_eff.detach().abs()
+            if mask_stack is not None:
+                flat_w = w_eff.reshape(latent_stack.shape[0], -1)
+                flat_abs = abs_eff.reshape(latent_stack.shape[0], -1)
+                survivor_mask = (flat_w != 0).float()
+                survivor_sum = (flat_abs * survivor_mask).sum(dim=1)
+                survivor_cnt = survivor_mask.sum(dim=1)
+                mean_surv = survivor_sum / survivor_cnt.clamp(min=1)
+                mean_all = flat_abs.mean(dim=1)
+                mean_abs_vec = torch.where(survivor_cnt > 0, mean_surv, mean_all)
+                mean_abs = mean_abs_vec.view(-1, 1, 1).to(latent_stack.dtype)
+            else:
+                mean_abs = abs_eff.mean(dim=(1,2), keepdim=True)
+            delta = mean_abs * self.threshold_frac
+            w_sign = torch.where(w_eff > delta, torch.ones_like(w_eff), torch.where(w_eff < -delta, -torch.ones_like(w_eff), torch.zeros_like(w_eff)))
+            if scale_stack is not None:
+                alpha = scale_stack
+            else:
+                active = (w_sign != 0).to(w_eff.dtype)
+                denom = active.sum(dim=(1,2), keepdim=True).clamp(min=1.0)
+                alpha = (abs_eff * active).sum(dim=(1,2), keepdim=True) / denom
+                alpha = alpha.detach()
+            w_stack = w_sign.detach() * alpha + (w_eff - w_eff.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             leaf_prim = torch.einsum('bi, kdi -> bkd', r_in, w_stack) + b_stack.unsqueeze(0)
         else:
-            u_stack = torch.stack([
-                ternarize(
-                    leaf.latent_U,
-                    self.threshold_frac,
-                    mask=leaf.sparsity_mask if leaf.leaf_sparsity > 0.0 else None,
-                    scale=leaf.scale_u if self.learnable_scale else None
-                )
-                for leaf in leaves
-            ], dim=0)
-            v_stack = torch.stack([
-                ternarize(
-                    leaf.latent_V,
-                    self.threshold_frac,
-                    scale=leaf.scale_v if self.learnable_scale else None
-                )
-                for leaf in leaves
-            ], dim=0)
+            latent_u_stack = torch.stack([leaf.latent_U for leaf in leaves], dim=0)
+            if leaves[0].leaf_sparsity > 0.0:
+                mask_u_stack = torch.stack([leaf.sparsity_mask for leaf in leaves], dim=0)
+            else:
+                mask_u_stack = None
+            if self.learnable_scale and leaves[0].scale_u is not None:
+                scale_u_stack = torch.stack([leaf.scale_u for leaf in leaves], dim=0).view(-1, 1, 1)
+                scale_v_stack = torch.stack([leaf.scale_v for leaf in leaves], dim=0).view(-1, 1, 1)
+            else:
+                scale_u_stack = None
+                scale_v_stack = None
+            w_eff_u = latent_u_stack * mask_u_stack if mask_u_stack is not None else latent_u_stack
+            abs_eff_u = w_eff_u.detach().abs()
+            if mask_u_stack is not None:
+                flat_w_u = w_eff_u.reshape(latent_u_stack.shape[0], -1)
+                flat_abs_u = abs_eff_u.reshape(latent_u_stack.shape[0], -1)
+                survivor_mask_u = (flat_w_u != 0).float()
+                survivor_sum_u = (flat_abs_u * survivor_mask_u).sum(dim=1)
+                survivor_cnt_u = survivor_mask_u.sum(dim=1)
+                mean_surv_u = survivor_sum_u / survivor_cnt_u.clamp(min=1)
+                mean_all_u = flat_abs_u.mean(dim=1)
+                mean_abs_vec_u = torch.where(survivor_cnt_u > 0, mean_surv_u, mean_all_u)
+                mean_abs_u = mean_abs_vec_u.view(-1, 1, 1).to(latent_u_stack.dtype)
+            else:
+                mean_abs_u = abs_eff_u.mean(dim=(1,2), keepdim=True)
+            delta_u = mean_abs_u * self.threshold_frac
+            w_sign_u = torch.where(w_eff_u > delta_u, torch.ones_like(w_eff_u), torch.where(w_eff_u < -delta_u, -torch.ones_like(w_eff_u), torch.zeros_like(w_eff_u)))
+            if scale_u_stack is not None:
+                alpha_u = scale_u_stack
+            else:
+                active_u = (w_sign_u != 0).to(w_eff_u.dtype)
+                denom_u = active_u.sum(dim=(1,2), keepdim=True).clamp(min=1.0)
+                alpha_u = (abs_eff_u * active_u).sum(dim=(1,2), keepdim=True) / denom_u
+                alpha_u = alpha_u.detach()
+            u_stack = w_sign_u.detach() * alpha_u + (w_eff_u - w_eff_u.detach())
+            v_latent_stack = torch.stack([leaf.latent_V for leaf in leaves], dim=0)
+            v_eff = v_latent_stack
+            v_abs = v_eff.detach().abs()
+            v_mean = v_abs.mean(dim=(1,2), keepdim=True)
+            v_delta = v_mean * self.threshold_frac
+            v_sign = torch.where(v_eff > v_delta, torch.ones_like(v_eff), torch.where(v_eff < -v_delta, -torch.ones_like(v_eff), torch.zeros_like(v_eff)))
+            if scale_v_stack is not None:
+                v_alpha = scale_v_stack
+            else:
+                v_active = (v_sign != 0).to(v_eff.dtype)
+                v_denom = v_active.sum(dim=(1,2), keepdim=True).clamp(min=1.0)
+                v_alpha = (v_abs * v_active).sum(dim=(1,2), keepdim=True) / v_denom
+                v_alpha = v_alpha.detach()
+            v_stack = v_sign.detach() * v_alpha + (v_eff - v_eff.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             h_mid = torch.einsum('bi, kir -> bkr', r_in, u_stack)
             leaf_prim = torch.einsum('bkr, krd -> bkd', h_mid, v_stack) + b_stack.unsqueeze(0)
@@ -1112,31 +1291,34 @@ class ASTDAGLayer(nn.Module):
                 leaf.cached_output = stacked_leaf_outs[:, idx]
             composite_out = torch.einsum('bk, bkd -> bd', routing_probs.to(stacked_leaf_outs.dtype), stacked_leaf_outs)
         else:
-            leaf_outs = []
+            K = len(leaves)
+            W_ctx_stack = torch.stack([leaf.W_context for leaf in leaves], dim=0)
+            m_actives = torch.tensor([min(len(leaf.secondary_parents), self.max_secondary) for leaf in leaves], device=leaf_prim.device, dtype=leaf_prim.dtype)
+            norm_factors = torch.where(m_actives > 0, 1.0 / torch.sqrt(1.0 + m_actives), torch.ones_like(m_actives)).view(1, K, 1)
+            B_dim = leaf_prim.shape[0]
+            sec_stack = torch.zeros(B_dim, K, self.max_secondary, self.dim, device=leaf_prim.device, dtype=leaf_prim.dtype)
+            for k, leaf in enumerate(leaves):
+                for s, p_sec in enumerate(leaf.secondary_parents[:self.max_secondary]):
+                    if p_sec.cached_output is not None:
+                        sec_stack[:, k, s] = p_sec.cached_output.detach()
+            if use_quantized_gates or first_leaf.use_power_of_two_gates:
+                gates = quantize_power_of_two_gate(W_ctx_stack)
+            elif first_leaf.bounded_gating:
+                gates = torch.tanh(W_ctx_stack)
+            else:
+                gates = W_ctx_stack
+            h_context = (gates.unsqueeze(0) * sec_stack).sum(dim=2)
+            y = (leaf_prim + h_context) * norm_factors
+            if first_leaf.activation == "relu6":
+                stacked_leaf_outs = F.relu6(y)
+            elif first_leaf.activation == "sign":
+                stacked_leaf_outs = _SignSTE.apply(y)
+            else:
+                stacked_leaf_outs = y
             for idx, leaf in enumerate(leaves):
-                prim_k = leaf_prim[:, idx]
                 leaf.cached_primary_input = r_in
-                leaf.cached_pre_act = prim_k
-                m_active = min(len(leaf.secondary_parents), self.max_secondary)
-                norm_factor = 1.0 / math.sqrt(1.0 + float(m_active)) if (self.normalize_context and m_active > 0) else 1.0
-
-                h_context = torch.zeros_like(prim_k)
-                for s_idx, p_sec in enumerate(leaf.secondary_parents):
-                    if s_idx >= self.max_secondary:
-                        break
-                    c_k = p_sec.cached_output.detach() if p_sec.cached_output is not None else torch.zeros_like(prim_k)
-                    if use_quantized_gates or leaf.use_power_of_two_gates:
-                        gate_k = quantize_power_of_two_gate(leaf.W_context[s_idx])
-                    elif leaf.bounded_gating:
-                        gate_k = torch.tanh(leaf.W_context[s_idx])
-                    else:
-                        gate_k = leaf.W_context[s_idx]
-                    h_context = h_context + gate_k * c_k
-
-                y_k = (prim_k + h_context) * norm_factor
-                leaf.cached_output = leaf._apply_activation(y_k)
-                leaf_outs.append(leaf.cached_output)
-            stacked_leaf_outs = torch.stack(leaf_outs, dim=1)
+                leaf.cached_pre_act = leaf_prim[:, idx]
+                leaf.cached_output = stacked_leaf_outs[:, idx]
             composite_out = torch.einsum('bk, bkd -> bd', routing_probs.to(stacked_leaf_outs.dtype), stacked_leaf_outs)
 
         if record_cache is None:
@@ -1145,12 +1327,14 @@ class ASTDAGLayer(nn.Module):
         if record_cache:
             self._last_routing_probs = routing_probs.detach()
             self._last_x_flat = x_flat.detach()
+            self._last_r_in = r_in.detach()
             self._last_stacked_leaf_outs = stacked_leaf_outs.detach() if stacked_leaf_outs is not None else None
             self._last_out = composite_out.detach()
             self._last_w_stack = w_stack.detach() if (self.rank is None and first_leaf.leaf_mode not in ("permutation", "perm")) else None
         else:
             self._last_routing_probs = None
             self._last_x_flat = None
+            self._last_r_in = None
             self._last_stacked_leaf_outs = None
             self._last_out = None
             self._last_w_stack = None
@@ -1200,73 +1384,159 @@ class ASTDAGLayer(nn.Module):
                 alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
             w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
-            if getattr(self, '_cached_perms_stack', None) is None or self._cached_perms_stack.shape[0] != len(leaves) or self._cached_perms_stack.device != b_stack.device:
-                self._cached_perms_stack = torch.stack([leaf.perms for leaf in leaves], dim=0)
+            need_rebuild = False
+            if not hasattr(self, '_cached_perms_stack') or self._cached_perms_stack.numel() == 0:
+                need_rebuild = True
+            elif self._cached_perms_stack.shape[0] != len(leaves):
+                need_rebuild = True
+            elif self._cached_perms_stack.device != b_stack.device:
+                need_rebuild = True
+            elif self._cached_perms_stack.shape[1] != leaves[0].perms.shape[0]:
+                need_rebuild = True
+            if need_rebuild:
+                perms_cpu = torch.stack([leaf.perms for leaf in leaves], dim=0).to(b_stack.device)
+                inv_cpu = torch.stack([leaf.inv_perms for leaf in leaves], dim=0).to(b_stack.device)
+                self.register_buffer('_cached_perms_stack', perms_cpu, persistent=False)
+                self.register_buffer('_cached_inv_perms_stack', inv_cpu, persistent=False)
             perms_stack = self._cached_perms_stack
             K_num = len(leaves)
             P_num = perms_stack.shape[1]
-            r_4d = r_in.view(B, 1, 1, self.dim).expand(B, K_num, P_num, self.dim)
-            perms_4d = perms_stack.long().unsqueeze(0).expand(B, K_num, P_num, self.dim)
-            x_p = torch.gather(r_4d, -1, perms_4d)
-            leaf_prim = (x_p * w_perm_stack.unsqueeze(0)).sum(dim=2) + b_stack.unsqueeze(0)
+            scale_perm = 1.0 / math.sqrt(P_num)
+            has_secondary = any(len(leaf.secondary_parents) > 0 for leaf in leaves)
+            if not has_secondary:
+                r_4d = r_in.view(B, 1, 1, self.dim).expand(B, K_num, P_num, self.dim)
+                perms_4d = perms_stack.long().unsqueeze(0).expand(B, K_num, P_num, self.dim)
+                x_p = torch.gather(r_4d, -1, perms_4d)
+                leaf_prim = (x_p * w_perm_stack.unsqueeze(0)).sum(dim=2) * scale_perm + b_stack.unsqueeze(0)
+            else:
+                chunk_k = 4
+                leaf_prim = torch.empty(B, K_num, self.dim, device=r_in.device, dtype=r_in.dtype)
+                for k_start in range(0, K_num, chunk_k):
+                    k_end = min(k_start + chunk_k, K_num)
+                    ck = k_end - k_start
+                    perms_c = perms_stack[k_start:k_end]
+                    w_c = w_perm_stack[k_start:k_end]
+                    b_c = b_stack[k_start:k_end]
+                    r_4d = r_in.view(B, 1, 1, self.dim).expand(B, ck, P_num, self.dim)
+                    perms_4d = perms_c.long().unsqueeze(0).expand(B, ck, P_num, self.dim)
+                    x_p = torch.gather(r_4d, -1, perms_4d)
+                    leaf_prim[:, k_start:k_end] = (x_p * w_c.unsqueeze(0)).sum(dim=2) * scale_perm + b_c.unsqueeze(0)
         elif self.rank is None:
-            w_stack = torch.stack([
-                ternarize(
-                    leaf.latent_W_primary,
-                    self.threshold_frac,
-                    mask=leaf.sparsity_mask if leaf.leaf_sparsity > 0.0 else None,
-                    scale=leaf.scale_w if self.learnable_scale else None
-                )
-                for leaf in leaves
-            ], dim=0)
+            latent_stack = torch.stack([leaf.latent_W_primary for leaf in leaves], dim=0)
+            if leaves[0].leaf_sparsity > 0.0:
+                mask_stack = torch.stack([leaf.sparsity_mask for leaf in leaves], dim=0)
+            else:
+                mask_stack = None
+            if self.learnable_scale and leaves[0].scale_w is not None:
+                scale_stack = torch.stack([leaf.scale_w for leaf in leaves], dim=0).view(-1, 1, 1)
+            else:
+                scale_stack = None
+            w_eff = latent_stack * mask_stack if mask_stack is not None else latent_stack
+            abs_eff = w_eff.detach().abs()
+            if mask_stack is not None:
+                flat_w = w_eff.reshape(latent_stack.shape[0], -1)
+                flat_abs = abs_eff.reshape(latent_stack.shape[0], -1)
+                survivor_mask = (flat_w != 0).float()
+                survivor_sum = (flat_abs * survivor_mask).sum(dim=1)
+                survivor_cnt = survivor_mask.sum(dim=1)
+                mean_surv = survivor_sum / survivor_cnt.clamp(min=1)
+                mean_all = flat_abs.mean(dim=1)
+                mean_abs_vec = torch.where(survivor_cnt > 0, mean_surv, mean_all)
+                mean_abs = mean_abs_vec.view(-1, 1, 1).to(latent_stack.dtype)
+            else:
+                mean_abs = abs_eff.mean(dim=(1,2), keepdim=True)
+            delta = mean_abs * self.threshold_frac
+            w_sign = torch.where(w_eff > delta, torch.ones_like(w_eff), torch.where(w_eff < -delta, -torch.ones_like(w_eff), torch.zeros_like(w_eff)))
+            if scale_stack is not None:
+                alpha = scale_stack
+            else:
+                active = (w_sign != 0).to(w_eff.dtype)
+                denom = active.sum(dim=(1,2), keepdim=True).clamp(min=1.0)
+                alpha = (abs_eff * active).sum(dim=(1,2), keepdim=True) / denom
+                alpha = alpha.detach()
+            w_stack = w_sign.detach() * alpha + (w_eff - w_eff.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             leaf_prim = torch.einsum('bi, kdi -> bkd', r_in, w_stack) + b_stack.unsqueeze(0)
         else:
-            u_stack = torch.stack([
-                ternarize(
-                    leaf.latent_U,
-                    self.threshold_frac,
-                    mask=leaf.sparsity_mask if leaf.leaf_sparsity > 0.0 else None,
-                    scale=leaf.scale_u if self.learnable_scale else None
-                )
-                for leaf in leaves
-            ], dim=0)
-            v_stack = torch.stack([
-                ternarize(
-                    leaf.latent_V,
-                    self.threshold_frac,
-                    scale=leaf.scale_v if self.learnable_scale else None
-                )
-                for leaf in leaves
-            ], dim=0)
+            latent_u_stack = torch.stack([leaf.latent_U for leaf in leaves], dim=0)
+            if leaves[0].leaf_sparsity > 0.0:
+                mask_u_stack = torch.stack([leaf.sparsity_mask for leaf in leaves], dim=0)
+            else:
+                mask_u_stack = None
+            if self.learnable_scale and leaves[0].scale_u is not None:
+                scale_u_stack = torch.stack([leaf.scale_u for leaf in leaves], dim=0).view(-1, 1, 1)
+                scale_v_stack = torch.stack([leaf.scale_v for leaf in leaves], dim=0).view(-1, 1, 1)
+            else:
+                scale_u_stack = None
+                scale_v_stack = None
+            w_eff_u = latent_u_stack * mask_u_stack if mask_u_stack is not None else latent_u_stack
+            abs_eff_u = w_eff_u.detach().abs()
+            if mask_u_stack is not None:
+                flat_w_u = w_eff_u.reshape(latent_u_stack.shape[0], -1)
+                flat_abs_u = abs_eff_u.reshape(latent_u_stack.shape[0], -1)
+                survivor_mask_u = (flat_w_u != 0).float()
+                survivor_sum_u = (flat_abs_u * survivor_mask_u).sum(dim=1)
+                survivor_cnt_u = survivor_mask_u.sum(dim=1)
+                mean_surv_u = survivor_sum_u / survivor_cnt_u.clamp(min=1)
+                mean_all_u = flat_abs_u.mean(dim=1)
+                mean_abs_vec_u = torch.where(survivor_cnt_u > 0, mean_surv_u, mean_all_u)
+                mean_abs_u = mean_abs_vec_u.view(-1, 1, 1).to(latent_u_stack.dtype)
+            else:
+                mean_abs_u = abs_eff_u.mean(dim=(1,2), keepdim=True)
+            delta_u = mean_abs_u * self.threshold_frac
+            w_sign_u = torch.where(w_eff_u > delta_u, torch.ones_like(w_eff_u), torch.where(w_eff_u < -delta_u, -torch.ones_like(w_eff_u), torch.zeros_like(w_eff_u)))
+            if scale_u_stack is not None:
+                alpha_u = scale_u_stack
+            else:
+                active_u = (w_sign_u != 0).to(w_eff_u.dtype)
+                denom_u = active_u.sum(dim=(1,2), keepdim=True).clamp(min=1.0)
+                alpha_u = (abs_eff_u * active_u).sum(dim=(1,2), keepdim=True) / denom_u
+                alpha_u = alpha_u.detach()
+            u_stack = w_sign_u.detach() * alpha_u + (w_eff_u - w_eff_u.detach())
+            v_latent_stack = torch.stack([leaf.latent_V for leaf in leaves], dim=0)
+            v_eff = v_latent_stack
+            v_abs = v_eff.detach().abs()
+            v_mean = v_abs.mean(dim=(1,2), keepdim=True)
+            v_delta = v_mean * self.threshold_frac
+            v_sign = torch.where(v_eff > v_delta, torch.ones_like(v_eff), torch.where(v_eff < -v_delta, -torch.ones_like(v_eff), torch.zeros_like(v_eff)))
+            if scale_v_stack is not None:
+                v_alpha = scale_v_stack
+            else:
+                v_active = (v_sign != 0).to(v_eff.dtype)
+                v_denom = v_active.sum(dim=(1,2), keepdim=True).clamp(min=1.0)
+                v_alpha = (v_abs * v_active).sum(dim=(1,2), keepdim=True) / v_denom
+                v_alpha = v_alpha.detach()
+            v_stack = v_sign.detach() * v_alpha + (v_eff - v_eff.detach())
             b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             h_mid = torch.einsum('bi, kir -> bkr', r_in, u_stack)
             leaf_prim = torch.einsum('bkr, krd -> bkd', h_mid, v_stack) + b_stack.unsqueeze(0)
 
-        leaf_outs = []
+        K = len(leaves)
+        W_ctx_stack = torch.stack([leaf.W_context for leaf in leaves], dim=0)
+        m_actives = torch.tensor([min(len(leaf.secondary_parents), self.max_secondary) for leaf in leaves], device=leaf_prim.device, dtype=leaf_prim.dtype)
+        norm_factors = torch.where(m_actives > 0, 1.0 / torch.sqrt(1.0 + m_actives), torch.ones_like(m_actives)).view(1, K, 1)
+        B_dim = leaf_prim.shape[0]
+        sec_stack = torch.zeros(B_dim, K, self.max_secondary, self.dim, device=leaf_prim.device, dtype=leaf_prim.dtype)
+        for k, leaf in enumerate(leaves):
+            for s, p_sec in enumerate(leaf.secondary_parents[:self.max_secondary]):
+                if p_sec.cached_output is not None:
+                    sec_stack[:, k, s] = p_sec.cached_output.detach()
+        if first_leaf.use_power_of_two_gates:
+            gates = quantize_power_of_two_gate(W_ctx_stack)
+        elif first_leaf.bounded_gating:
+            gates = torch.tanh(W_ctx_stack)
+        else:
+            gates = W_ctx_stack
+        h_context = (gates.unsqueeze(0) * sec_stack).sum(dim=2)
+        y = (leaf_prim + h_context) * norm_factors
+        if first_leaf.activation == "relu6":
+            stacked_leaf_outs = F.relu6(y)
+        elif first_leaf.activation == "sign":
+            stacked_leaf_outs = _SignSTE.apply(y)
+        else:
+            stacked_leaf_outs = y
         for idx, leaf in enumerate(leaves):
-            prim_k = leaf_prim[:, idx]
-            m_active = min(len(leaf.secondary_parents), self.max_secondary)
-            norm_factor = 1.0 / math.sqrt(1.0 + float(m_active)) if (self.normalize_context and m_active > 0) else 1.0
-
-            h_context = torch.zeros_like(prim_k)
-            for s_idx, p_sec in enumerate(leaf.secondary_parents):
-                if s_idx >= self.max_secondary:
-                    break
-                c_k = p_sec.cached_output.detach() if p_sec.cached_output is not None else torch.zeros_like(prim_k)
-                if leaf.use_power_of_two_gates:
-                    gate_k = quantize_power_of_two_gate(leaf.W_context[s_idx])
-                elif leaf.bounded_gating:
-                    gate_k = torch.tanh(leaf.W_context[s_idx])
-                else:
-                    gate_k = leaf.W_context[s_idx]
-                h_context = h_context + gate_k * c_k
-
-            y_k = (prim_k + h_context) * norm_factor
-            leaf.cached_output = leaf._apply_activation(y_k)
-            leaf_outs.append(leaf.cached_output)
-
-        stacked_leaf_outs = torch.stack(leaf_outs, dim=1)
+            leaf.cached_output = stacked_leaf_outs[:, idx]
         composite_out = torch.einsum('bk, bkd -> bd', routing_probs.to(stacked_leaf_outs.dtype), stacked_leaf_outs)
         return composite_out.reshape(*orig_shape)
 
@@ -1319,7 +1589,7 @@ class ASTDAGLayer(nn.Module):
                 act_grad = torch.ones_like(stacked_leaf_outs)
 
             g_v = error.unsqueeze(1) * routing_probs.unsqueeze(2) * act_grad
-            x_prim = self._last_x_flat
+            x_prim = self._last_r_in if getattr(self, '_last_r_in', None) is not None else self._last_x_flat
 
             if use_sign_backpressure:
                 g_update = g_v.sign()
@@ -1564,42 +1834,49 @@ class ASTDAGLayer(nn.Module):
                             leaf.W_context.data[idx].zero_()
                         peek_count += 1
 
-        # 3. Homomorphic Sibling Leaf Merging
         if len(self.leaves) > 2 and tau_merge < 1.0:
             leaves_to_check = list(self.leaves)
-            for i in range(len(leaves_to_check)):
-                for j in range(i + 1, len(leaves_to_check)):
-                    u = leaves_to_check[i]
-                    v = leaves_to_check[j]
-                    if u.primary_parent == v.primary_parent and u.rank == v.rank:
-                        with torch.no_grad():
-                            if getattr(u, "latent_w_perm", None) is not None and getattr(v, "latent_w_perm", None) is not None:
-                                cos_sim = F.cosine_similarity(
-                                    u.latent_w_perm.flatten(), v.latent_w_perm.flatten(), dim=0
-                                ).item()
-                            elif u.rank is None and u.latent_W_primary is not None and v.latent_W_primary is not None:
-                                cos_sim = F.cosine_similarity(
-                                    u.latent_W_primary.flatten(), v.latent_W_primary.flatten(), dim=0
-                                ).item()
-                            elif u.rank is not None and u.latent_U is not None and v.latent_U is not None:
-                                cos_sim = F.cosine_similarity(
-                                    u.latent_U.flatten(), v.latent_U.flatten(), dim=0
-                                ).item()
-                            else:
-                                cos_sim = 0.0
-
-                            if cos_sim > tau_merge:
-                                # Merge weights into u and prune v
-                                if getattr(u, "latent_w_perm", None) is not None:
-                                    u.latent_w_perm.data.copy_((u.latent_w_perm.data + v.latent_w_perm.data) * 0.5)
-                                elif u.rank is None:
-                                    u.latent_W_primary.data.copy_((u.latent_W_primary.data + v.latent_W_primary.data) * 0.5)
-                                else:
-                                    u.latent_U.data.copy_((u.latent_U.data + v.latent_U.data) * 0.5)
-                                u.bias.data.copy_((u.bias.data + v.bias.data) * 0.5)
-                                self._prune_leaf(v)
-                                merge_count += 1
-                                break
+            from collections import defaultdict
+            groups = defaultdict(list)
+            for leaf in leaves_to_check:
+                groups[(id(leaf.primary_parent) if leaf.primary_parent is not None else None, leaf.rank)].append(leaf)
+            for group in groups.values():
+                G = len(group)
+                if G < 2:
+                    continue
+                with torch.no_grad():
+                    if getattr(group[0], "latent_w_perm", None) is not None:
+                        flats = torch.stack([l.latent_w_perm.flatten() for l in group], dim=0)
+                    elif group[0].rank is None:
+                        flats = torch.stack([l.latent_W_primary.flatten() for l in group if l.latent_W_primary is not None], dim=0)
+                        if flats.shape[0] != G:
+                            continue
+                    else:
+                        flats = torch.stack([l.latent_U.flatten() for l in group if l.latent_U is not None], dim=0)
+                        if flats.shape[0] != G:
+                            continue
+                    norms = flats.norm(dim=1).clamp(min=1e-8)
+                    normed = flats / norms.unsqueeze(1)
+                    cos_mat = normed @ normed.T
+                    cos_mat.fill_diagonal_(-2.0)
+                    max_val, max_idx = cos_mat.view(-1).max(dim=0)
+                    if max_val.item() > tau_merge:
+                        i = max_idx.item() // G
+                        j = max_idx.item() % G
+                        if i == j:
+                            continue
+                        u = group[i]
+                        v = group[j]
+                        if getattr(u, "latent_w_perm", None) is not None:
+                            u.latent_w_perm.data.copy_((u.latent_w_perm.data + v.latent_w_perm.data) * 0.5)
+                        elif u.rank is None:
+                            u.latent_W_primary.data.copy_((u.latent_W_primary.data + v.latent_W_primary.data) * 0.5)
+                        else:
+                            u.latent_U.data.copy_((u.latent_U.data + v.latent_U.data) * 0.5)
+                        u.bias.data.copy_((u.bias.data + v.bias.data) * 0.5)
+                        self._prune_leaf(v)
+                        merge_count += 1
+                        break
 
         # 4. Utility Pruning
         if self.step_counter % self.k_prune == 0:
@@ -1612,7 +1889,7 @@ class ASTDAGLayer(nn.Module):
                 node.utility_counter = 0.0
 
         if split_count > 0 or prune_count > 0 or merge_count > 0:
-            self._sync_router()
+            self._sync_router(optimizer=optimizer)
 
         return {
             "splits": split_count,
@@ -1640,6 +1917,9 @@ class ASTDAGLayer(nn.Module):
                 if leaf in node.secondary_parents:
                     node.secondary_parents.remove(leaf)
             del self.nodes[str(leaf.node_id)]
+            self._invalidate_leaves_cache()
+            self._cached_perms_stack = torch.empty(0, dtype=torch.long, device=self._cached_perms_stack.device if hasattr(self, '_cached_perms_stack') else 'cpu')
+            self._cached_inv_perms_stack = torch.empty(0, dtype=torch.long, device=self._cached_inv_perms_stack.device if hasattr(self, '_cached_inv_perms_stack') else 'cpu')
 
 
 # Aliases

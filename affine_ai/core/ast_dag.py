@@ -1200,12 +1200,13 @@ class ASTDAGLayer(nn.Module):
             if mask_stack is not None:
                 flat_w = w_eff.reshape(latent_stack.shape[0], -1)
                 flat_abs = abs_eff.reshape(latent_stack.shape[0], -1)
-                mean_abs = []
-                for k in range(latent_stack.shape[0]):
-                    survivors = flat_abs[k][flat_w[k] != 0]
-                    m = survivors.mean() if survivors.numel() else flat_abs[k].mean()
-                    mean_abs.append(m)
-                mean_abs = torch.stack(mean_abs).view(-1, 1, 1).to(latent_stack.dtype)
+                survivor_mask = (flat_w != 0).float()
+                survivor_sum = (flat_abs * survivor_mask).sum(dim=1)
+                survivor_cnt = survivor_mask.sum(dim=1)
+                mean_surv = survivor_sum / survivor_cnt.clamp(min=1)
+                mean_all = flat_abs.mean(dim=1)
+                mean_abs_vec = torch.where(survivor_cnt > 0, mean_surv, mean_all)
+                mean_abs = mean_abs_vec.view(-1, 1, 1).to(latent_stack.dtype)
             else:
                 mean_abs = abs_eff.mean(dim=(1,2), keepdim=True)
             delta = mean_abs * self.threshold_frac
@@ -1237,12 +1238,13 @@ class ASTDAGLayer(nn.Module):
             if mask_u_stack is not None:
                 flat_w_u = w_eff_u.reshape(latent_u_stack.shape[0], -1)
                 flat_abs_u = abs_eff_u.reshape(latent_u_stack.shape[0], -1)
-                mean_abs_u = []
-                for k in range(latent_u_stack.shape[0]):
-                    survivors = flat_abs_u[k][flat_w_u[k] != 0]
-                    m = survivors.mean() if survivors.numel() else flat_abs_u[k].mean()
-                    mean_abs_u.append(m)
-                mean_abs_u = torch.stack(mean_abs_u).view(-1, 1, 1).to(latent_u_stack.dtype)
+                survivor_mask_u = (flat_w_u != 0).float()
+                survivor_sum_u = (flat_abs_u * survivor_mask_u).sum(dim=1)
+                survivor_cnt_u = survivor_mask_u.sum(dim=1)
+                mean_surv_u = survivor_sum_u / survivor_cnt_u.clamp(min=1)
+                mean_all_u = flat_abs_u.mean(dim=1)
+                mean_abs_vec_u = torch.where(survivor_cnt_u > 0, mean_surv_u, mean_all_u)
+                mean_abs_u = mean_abs_vec_u.view(-1, 1, 1).to(latent_u_stack.dtype)
             else:
                 mean_abs_u = abs_eff_u.mean(dim=(1,2), keepdim=True)
             delta_u = mean_abs_u * self.threshold_frac
@@ -1289,31 +1291,34 @@ class ASTDAGLayer(nn.Module):
                 leaf.cached_output = stacked_leaf_outs[:, idx]
             composite_out = torch.einsum('bk, bkd -> bd', routing_probs.to(stacked_leaf_outs.dtype), stacked_leaf_outs)
         else:
-            leaf_outs = []
+            K = len(leaves)
+            W_ctx_stack = torch.stack([leaf.W_context for leaf in leaves], dim=0)
+            m_actives = torch.tensor([min(len(leaf.secondary_parents), self.max_secondary) for leaf in leaves], device=leaf_prim.device, dtype=leaf_prim.dtype)
+            norm_factors = torch.where(m_actives > 0, 1.0 / torch.sqrt(1.0 + m_actives), torch.ones_like(m_actives)).view(1, K, 1)
+            B_dim = leaf_prim.shape[0]
+            sec_stack = torch.zeros(B_dim, K, self.max_secondary, self.dim, device=leaf_prim.device, dtype=leaf_prim.dtype)
+            for k, leaf in enumerate(leaves):
+                for s, p_sec in enumerate(leaf.secondary_parents[:self.max_secondary]):
+                    if p_sec.cached_output is not None:
+                        sec_stack[:, k, s] = p_sec.cached_output.detach()
+            if use_quantized_gates or first_leaf.use_power_of_two_gates:
+                gates = quantize_power_of_two_gate(W_ctx_stack)
+            elif first_leaf.bounded_gating:
+                gates = torch.tanh(W_ctx_stack)
+            else:
+                gates = W_ctx_stack
+            h_context = (gates.unsqueeze(0) * sec_stack).sum(dim=2)
+            y = (leaf_prim + h_context) * norm_factors
+            if first_leaf.activation == "relu6":
+                stacked_leaf_outs = F.relu6(y)
+            elif first_leaf.activation == "sign":
+                stacked_leaf_outs = _SignSTE.apply(y)
+            else:
+                stacked_leaf_outs = y
             for idx, leaf in enumerate(leaves):
-                prim_k = leaf_prim[:, idx]
                 leaf.cached_primary_input = r_in
-                leaf.cached_pre_act = prim_k
-                m_active = min(len(leaf.secondary_parents), self.max_secondary)
-                norm_factor = 1.0 / math.sqrt(1.0 + float(m_active)) if (self.normalize_context and m_active > 0) else 1.0
-
-                h_context = torch.zeros_like(prim_k)
-                for s_idx, p_sec in enumerate(leaf.secondary_parents):
-                    if s_idx >= self.max_secondary:
-                        break
-                    c_k = p_sec.cached_output.detach() if p_sec.cached_output is not None else torch.zeros_like(prim_k)
-                    if use_quantized_gates or leaf.use_power_of_two_gates:
-                        gate_k = quantize_power_of_two_gate(leaf.W_context[s_idx])
-                    elif leaf.bounded_gating:
-                        gate_k = torch.tanh(leaf.W_context[s_idx])
-                    else:
-                        gate_k = leaf.W_context[s_idx]
-                    h_context = h_context + gate_k * c_k
-
-                y_k = (prim_k + h_context) * norm_factor
-                leaf.cached_output = leaf._apply_activation(y_k)
-                leaf_outs.append(leaf.cached_output)
-            stacked_leaf_outs = torch.stack(leaf_outs, dim=1)
+                leaf.cached_pre_act = leaf_prim[:, idx]
+                leaf.cached_output = stacked_leaf_outs[:, idx]
             composite_out = torch.einsum('bk, bkd -> bd', routing_probs.to(stacked_leaf_outs.dtype), stacked_leaf_outs)
 
         if record_cache is None:
@@ -1431,12 +1436,13 @@ class ASTDAGLayer(nn.Module):
             if mask_stack is not None:
                 flat_w = w_eff.reshape(latent_stack.shape[0], -1)
                 flat_abs = abs_eff.reshape(latent_stack.shape[0], -1)
-                mean_abs = []
-                for k in range(latent_stack.shape[0]):
-                    survivors = flat_abs[k][flat_w[k] != 0]
-                    m = survivors.mean() if survivors.numel() else flat_abs[k].mean()
-                    mean_abs.append(m)
-                mean_abs = torch.stack(mean_abs).view(-1, 1, 1).to(latent_stack.dtype)
+                survivor_mask = (flat_w != 0).float()
+                survivor_sum = (flat_abs * survivor_mask).sum(dim=1)
+                survivor_cnt = survivor_mask.sum(dim=1)
+                mean_surv = survivor_sum / survivor_cnt.clamp(min=1)
+                mean_all = flat_abs.mean(dim=1)
+                mean_abs_vec = torch.where(survivor_cnt > 0, mean_surv, mean_all)
+                mean_abs = mean_abs_vec.view(-1, 1, 1).to(latent_stack.dtype)
             else:
                 mean_abs = abs_eff.mean(dim=(1,2), keepdim=True)
             delta = mean_abs * self.threshold_frac
@@ -1468,12 +1474,13 @@ class ASTDAGLayer(nn.Module):
             if mask_u_stack is not None:
                 flat_w_u = w_eff_u.reshape(latent_u_stack.shape[0], -1)
                 flat_abs_u = abs_eff_u.reshape(latent_u_stack.shape[0], -1)
-                mean_abs_u = []
-                for k in range(latent_u_stack.shape[0]):
-                    survivors = flat_abs_u[k][flat_w_u[k] != 0]
-                    m = survivors.mean() if survivors.numel() else flat_abs_u[k].mean()
-                    mean_abs_u.append(m)
-                mean_abs_u = torch.stack(mean_abs_u).view(-1, 1, 1).to(latent_u_stack.dtype)
+                survivor_mask_u = (flat_w_u != 0).float()
+                survivor_sum_u = (flat_abs_u * survivor_mask_u).sum(dim=1)
+                survivor_cnt_u = survivor_mask_u.sum(dim=1)
+                mean_surv_u = survivor_sum_u / survivor_cnt_u.clamp(min=1)
+                mean_all_u = flat_abs_u.mean(dim=1)
+                mean_abs_vec_u = torch.where(survivor_cnt_u > 0, mean_surv_u, mean_all_u)
+                mean_abs_u = mean_abs_vec_u.view(-1, 1, 1).to(latent_u_stack.dtype)
             else:
                 mean_abs_u = abs_eff_u.mean(dim=(1,2), keepdim=True)
             delta_u = mean_abs_u * self.threshold_frac
@@ -1504,30 +1511,32 @@ class ASTDAGLayer(nn.Module):
             h_mid = torch.einsum('bi, kir -> bkr', r_in, u_stack)
             leaf_prim = torch.einsum('bkr, krd -> bkd', h_mid, v_stack) + b_stack.unsqueeze(0)
 
-        leaf_outs = []
+        K = len(leaves)
+        W_ctx_stack = torch.stack([leaf.W_context for leaf in leaves], dim=0)
+        m_actives = torch.tensor([min(len(leaf.secondary_parents), self.max_secondary) for leaf in leaves], device=leaf_prim.device, dtype=leaf_prim.dtype)
+        norm_factors = torch.where(m_actives > 0, 1.0 / torch.sqrt(1.0 + m_actives), torch.ones_like(m_actives)).view(1, K, 1)
+        B_dim = leaf_prim.shape[0]
+        sec_stack = torch.zeros(B_dim, K, self.max_secondary, self.dim, device=leaf_prim.device, dtype=leaf_prim.dtype)
+        for k, leaf in enumerate(leaves):
+            for s, p_sec in enumerate(leaf.secondary_parents[:self.max_secondary]):
+                if p_sec.cached_output is not None:
+                    sec_stack[:, k, s] = p_sec.cached_output.detach()
+        if first_leaf.use_power_of_two_gates:
+            gates = quantize_power_of_two_gate(W_ctx_stack)
+        elif first_leaf.bounded_gating:
+            gates = torch.tanh(W_ctx_stack)
+        else:
+            gates = W_ctx_stack
+        h_context = (gates.unsqueeze(0) * sec_stack).sum(dim=2)
+        y = (leaf_prim + h_context) * norm_factors
+        if first_leaf.activation == "relu6":
+            stacked_leaf_outs = F.relu6(y)
+        elif first_leaf.activation == "sign":
+            stacked_leaf_outs = _SignSTE.apply(y)
+        else:
+            stacked_leaf_outs = y
         for idx, leaf in enumerate(leaves):
-            prim_k = leaf_prim[:, idx]
-            m_active = min(len(leaf.secondary_parents), self.max_secondary)
-            norm_factor = 1.0 / math.sqrt(1.0 + float(m_active)) if (self.normalize_context and m_active > 0) else 1.0
-
-            h_context = torch.zeros_like(prim_k)
-            for s_idx, p_sec in enumerate(leaf.secondary_parents):
-                if s_idx >= self.max_secondary:
-                    break
-                c_k = p_sec.cached_output.detach() if p_sec.cached_output is not None else torch.zeros_like(prim_k)
-                if leaf.use_power_of_two_gates:
-                    gate_k = quantize_power_of_two_gate(leaf.W_context[s_idx])
-                elif leaf.bounded_gating:
-                    gate_k = torch.tanh(leaf.W_context[s_idx])
-                else:
-                    gate_k = leaf.W_context[s_idx]
-                h_context = h_context + gate_k * c_k
-
-            y_k = (prim_k + h_context) * norm_factor
-            leaf.cached_output = leaf._apply_activation(y_k)
-            leaf_outs.append(leaf.cached_output)
-
-        stacked_leaf_outs = torch.stack(leaf_outs, dim=1)
+            leaf.cached_output = stacked_leaf_outs[:, idx]
         composite_out = torch.einsum('bk, bkd -> bd', routing_probs.to(stacked_leaf_outs.dtype), stacked_leaf_outs)
         return composite_out.reshape(*orig_shape)
 
@@ -1825,42 +1834,49 @@ class ASTDAGLayer(nn.Module):
                             leaf.W_context.data[idx].zero_()
                         peek_count += 1
 
-        # 3. Homomorphic Sibling Leaf Merging
         if len(self.leaves) > 2 and tau_merge < 1.0:
             leaves_to_check = list(self.leaves)
-            for i in range(len(leaves_to_check)):
-                for j in range(i + 1, len(leaves_to_check)):
-                    u = leaves_to_check[i]
-                    v = leaves_to_check[j]
-                    if u.primary_parent == v.primary_parent and u.rank == v.rank:
-                        with torch.no_grad():
-                            if getattr(u, "latent_w_perm", None) is not None and getattr(v, "latent_w_perm", None) is not None:
-                                cos_sim = F.cosine_similarity(
-                                    u.latent_w_perm.flatten(), v.latent_w_perm.flatten(), dim=0
-                                ).item()
-                            elif u.rank is None and u.latent_W_primary is not None and v.latent_W_primary is not None:
-                                cos_sim = F.cosine_similarity(
-                                    u.latent_W_primary.flatten(), v.latent_W_primary.flatten(), dim=0
-                                ).item()
-                            elif u.rank is not None and u.latent_U is not None and v.latent_U is not None:
-                                cos_sim = F.cosine_similarity(
-                                    u.latent_U.flatten(), v.latent_U.flatten(), dim=0
-                                ).item()
-                            else:
-                                cos_sim = 0.0
-
-                            if cos_sim > tau_merge:
-                                # Merge weights into u and prune v
-                                if getattr(u, "latent_w_perm", None) is not None:
-                                    u.latent_w_perm.data.copy_((u.latent_w_perm.data + v.latent_w_perm.data) * 0.5)
-                                elif u.rank is None:
-                                    u.latent_W_primary.data.copy_((u.latent_W_primary.data + v.latent_W_primary.data) * 0.5)
-                                else:
-                                    u.latent_U.data.copy_((u.latent_U.data + v.latent_U.data) * 0.5)
-                                u.bias.data.copy_((u.bias.data + v.bias.data) * 0.5)
-                                self._prune_leaf(v)
-                                merge_count += 1
-                                break
+            from collections import defaultdict
+            groups = defaultdict(list)
+            for leaf in leaves_to_check:
+                groups[(id(leaf.primary_parent) if leaf.primary_parent is not None else None, leaf.rank)].append(leaf)
+            for group in groups.values():
+                G = len(group)
+                if G < 2:
+                    continue
+                with torch.no_grad():
+                    if getattr(group[0], "latent_w_perm", None) is not None:
+                        flats = torch.stack([l.latent_w_perm.flatten() for l in group], dim=0)
+                    elif group[0].rank is None:
+                        flats = torch.stack([l.latent_W_primary.flatten() for l in group if l.latent_W_primary is not None], dim=0)
+                        if flats.shape[0] != G:
+                            continue
+                    else:
+                        flats = torch.stack([l.latent_U.flatten() for l in group if l.latent_U is not None], dim=0)
+                        if flats.shape[0] != G:
+                            continue
+                    norms = flats.norm(dim=1).clamp(min=1e-8)
+                    normed = flats / norms.unsqueeze(1)
+                    cos_mat = normed @ normed.T
+                    cos_mat.fill_diagonal_(-2.0)
+                    max_val, max_idx = cos_mat.view(-1).max(dim=0)
+                    if max_val.item() > tau_merge:
+                        i = max_idx.item() // G
+                        j = max_idx.item() % G
+                        if i == j:
+                            continue
+                        u = group[i]
+                        v = group[j]
+                        if getattr(u, "latent_w_perm", None) is not None:
+                            u.latent_w_perm.data.copy_((u.latent_w_perm.data + v.latent_w_perm.data) * 0.5)
+                        elif u.rank is None:
+                            u.latent_W_primary.data.copy_((u.latent_W_primary.data + v.latent_W_primary.data) * 0.5)
+                        else:
+                            u.latent_U.data.copy_((u.latent_U.data + v.latent_U.data) * 0.5)
+                        u.bias.data.copy_((u.bias.data + v.bias.data) * 0.5)
+                        self._prune_leaf(v)
+                        merge_count += 1
+                        break
 
         # 4. Utility Pruning
         if self.step_counter % self.k_prune == 0:

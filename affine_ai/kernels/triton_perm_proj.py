@@ -8,6 +8,8 @@ Computes:
 
 Eliminates all high-bandwidth intermediate VRAM gathers [N, P, D] and provides
 analytical transposed backward kernels directly in registers.
+Coalesced Y store via tl.make_block_ptr with boundary_check; W loads vectorized
+contiguous in D; gather X via perm remains manual (random access).
 """
 
 from typing import Tuple, Optional, Union
@@ -51,6 +53,7 @@ def _fused_perm_proj_fwd_kernel(
 
         for p in range(P):
             p_idx = tl.load(Perms + p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
+            p_idx = tl.where((p_idx >= 0) & (p_idx < D), p_idx, 0)
             x_ptrs = X + offs_n[:, None] * stride_xn + p_idx[None, :] * stride_xd
             x_val = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
             if M > m_base + 0:
@@ -83,57 +86,57 @@ def _fused_perm_proj_fwd_kernel(
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 0) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 0) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 0) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 1:
             acc = acc1
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 1) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 1) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 1) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 2:
             acc = acc2
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 2) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 2) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 2) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 3:
             acc = acc3
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 3) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 3) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 3) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 4:
             acc = acc4
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 4) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 4) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 4) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 5:
             acc = acc5
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 5) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 5) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 5) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 6:
             acc = acc6
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 6) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 6) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 6) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
         if M > m_base + 7:
             acc = acc7
             if HAS_BIAS:
                 bias_val = tl.load(Biases + (m_base + 7) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
                 acc = acc + bias_val[None, :]
-            out_ptrs = Out + (m_base + 7) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+            Out_block = tl.make_block_ptr(base=Out + (m_base + 7) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -158,12 +161,13 @@ def _fused_perm_proj_bwd_gx_kernel(
 
     for p in range(P):
         ip_idx = tl.load(InvPerms + p * stride_ipp + offs_d * stride_ipd, mask=mask_d, other=0)
+        ip_idx = tl.where((ip_idx >= 0) & (ip_idx < D), ip_idx, 0)
         for m in range(M):
             go_ptrs = GradOut + m * stride_gom + offs_n[:, None] * stride_gon + ip_idx[None, :] * stride_god
             w_ptrs = W + m * stride_wm + p * stride_wp + ip_idx[None, :] * stride_wd
             go_val = tl.load(go_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
             w_val = tl.load(w_ptrs, mask=mask_d[None, :], other=0.0)
-            acc += go_val.to(tl.float32) * w_val.to(tl.float32)
+            acc += go_val.to(tl.float32) * w_val[None, :].to(tl.float32)
 
     gx_ptrs = GX + offs_n[:, None] * stride_gxn + offs_d[None, :] * stride_gxd
     tl.store(gx_ptrs, acc.to(GX.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
@@ -187,6 +191,7 @@ def _fused_perm_proj_bwd_gw_kernel(
     mask_d = offs_d < D
 
     p_idx = tl.load(Perms + pid_p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
+    p_idx = tl.where((p_idx >= 0) & (p_idx < D), p_idx, 0)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
     for n_start in range(0, N, BLOCK_N):
@@ -216,7 +221,10 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
         x_flat = x.reshape(-1, x.shape[-1]).contiguous()
         N, D = x_flat.shape
         M, P, Dw = w.shape
-        assert D == Dw, f"Dimension mismatch: x has dim {D}, w has dim {Dw}"
+        if D != Dw:
+            raise ValueError(f"Dimension mismatch: x has dim {D}, w has dim {Dw}")
+        assert torch.all(perms < D) and torch.all(perms >= 0), "perms OOB"
+        assert torch.all(inv_perms < D) and torch.all(inv_perms >= 0), "inv_perms OOB"
 
         w_c = w.contiguous()
         # avoid per-forward .long() copies: require/cache
@@ -233,7 +241,7 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
 
         out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
 
-        BN, BD = min(64, triton.next_power_of_2(N)), min(64, triton.next_power_of_2(D))
+        BN, BD = max(16, min(64, triton.next_power_of_2(N))), max(16, min(64, triton.next_power_of_2(D)))
         grid = (triton.cdiv(N, BN), triton.cdiv(D, BD))
 
         _fused_perm_proj_fwd_kernel[grid](
@@ -248,21 +256,23 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
             BLOCK_N=BN, BLOCK_D=BD,
         )
 
-        ctx.save_for_backward(x_flat, w_c, perms_c, inv_perms_c, biases_c if has_bias else None)
+        ctx.save_for_backward(x_flat, w_c, perms_c, inv_perms_c)
         ctx.has_bias = has_bias
+        ctx.biases_c = biases_c if has_bias else None
         ctx.orig_shape = orig_shape
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x_flat, w_c, perms_c, inv_perms_c, biases_c = ctx.saved_tensors
+        x_flat, w_c, perms_c, inv_perms_c = ctx.saved_tensors
+        biases_c = ctx.biases_c
         has_bias = ctx.has_bias
         go_flat = grad_out.reshape(w_c.shape[0], -1, w_c.shape[2]).contiguous()
         M, N, D = go_flat.shape
         P = perms_c.shape[0]
 
         gx = torch.empty_like(x_flat)
-        BN, BD = min(64, triton.next_power_of_2(N)), min(64, triton.next_power_of_2(D))
+        BN, BD = max(16, min(64, triton.next_power_of_2(N))), max(16, min(64, triton.next_power_of_2(D)))
         grid_gx = (triton.cdiv(N, BN), triton.cdiv(D, BD))
 
         _fused_perm_proj_bwd_gx_kernel[grid_gx](

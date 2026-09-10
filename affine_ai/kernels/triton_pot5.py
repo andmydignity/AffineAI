@@ -4,6 +4,12 @@ Triton 5-State Power-of-Two (POT) Acceleration Kernels
 Custom GPU kernels for 5-State POT arithmetic:
   W in {-1.0, -0.5, 0.0, +0.5, +1.0} * alpha
 
+WARNING: pack path (pack_pot5_gpu_3bitplane, 0.35σ/0.9σ std-relative) and
+online path (0.25α/0.75α alpha-relative via _pot5_thresholds) are NOT
+numerics-equivalent; caller must use pack-derived α for parity; helper
+_pot5_alpha_levels_for_comparison exposes gap. See unified α thresholds
+comment below and pack docstring.
+
 Key Algorithmic Innovations:
 1. Two-Accumulator Vector Factorization (S_full and S_half) directly in GPU SRAM registers:
    - S_full accumulates x for weights with magnitude 1.0 (identity conditional add/sub).
@@ -57,6 +63,7 @@ except ImportError:
 # the same alpha-relative rule is used everywhere else.
 
 def _pot5_thresholds(alpha: torch.Tensor):
+    # Unified α thresholds — see docstring warning; pack path uses different STD rule
     t_low = alpha * 0.25
     t_high = alpha * 0.75
     return t_low, t_high
@@ -138,18 +145,13 @@ if HAS_TRITON:
         alpha = tl.load(Alpha)
 
         for k in range(0, K, BLOCK_K):
-            kk = k + offs_k
-            mask_k = kk < K
-
-            # Load X tile [BLOCK_M, BLOCK_K]
-            x_ptrs = X + offs_m[:, None] * stride_xm + kk[None, :] * stride_xk
-            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-
-            # Load W tile [BLOCK_N, BLOCK_K]
-            w_ptrs = W + offs_n[:, None] * stride_wn + kk[None, :] * stride_wk
-            w = tl.load(w_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+            x_ptr = tl.make_block_ptr(base=X, shape=(M, K), strides=(stride_xm, stride_xk), offsets=(pid_m * BLOCK_M, k), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
+            x = tl.load(x_ptr, boundary_check=(0, 1))
+            w_ptr = tl.make_block_ptr(base=W, shape=(N, K), strides=(stride_wn, stride_wk), offsets=(pid_n * BLOCK_N, k), block_shape=(BLOCK_N, BLOCK_K), order=(1, 0))
+            w = tl.load(w_ptr, boundary_check=(0, 1))
 
             # Route A: In-register signed 5-state weight synthesis {-1.0, -0.5, 0.0, +0.5, +1.0}
+            # Unified α thresholds (0.25α/0.75α) — cross-ref _pot5_thresholds; online path
             w_abs = tl.abs(w)
             w_sign = tl.where(w > 0, 1.0, tl.where(w < 0, -1.0, 0.0))
             w_eff = tl.where(w_abs > (alpha * 0.75), w_sign, tl.where(w_abs > (alpha * 0.25), w_sign * 0.5, 0.0))
@@ -212,11 +214,10 @@ if HAS_TRITON:
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
 
         for k in range(0, K, BLOCK_K):
-            kk = k + offs_k
-            mask_k = kk < K
-
-            x = tl.load(X_int8 + offs_m[:, None] * stride_xm + kk[None, :] * stride_xk, mask=mask_m[:, None] & mask_k[None, :], other=0)
-            w = tl.load(W_int8 + offs_n[:, None] * stride_wn + kk[None, :] * stride_wk, mask=mask_n[:, None] & mask_k[None, :], other=0)
+            x_ptr = tl.make_block_ptr(base=X_int8, shape=(M, K), strides=(stride_xm, stride_xk), offsets=(pid_m * BLOCK_M, k), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
+            x = tl.load(x_ptr, boundary_check=(0, 1))
+            w_ptr = tl.make_block_ptr(base=W_int8, shape=(N, K), strides=(stride_wn, stride_wk), offsets=(pid_n * BLOCK_N, k), block_shape=(BLOCK_N, BLOCK_K), order=(1, 0))
+            w = tl.load(w_ptr, boundary_check=(0, 1))
 
             # Native INT8 Tensor Core instruction: mma.sync.s8.s8
             acc += tl.dot(x, tl.trans(w), out_dtype=tl.int32)
@@ -224,7 +225,7 @@ if HAS_TRITON:
         sx = tl.load(Scale_x + offs_m * stride_sx, mask=mask_m, other=1.0)
         alpha = tl.load(Alpha)
 
-        # Scale by (alpha * 0.5) because integer weights are {-2, -1, 0, +1, +2}
+        # Scale by (alpha * 0.5) because integer weights are {-2, -1, 0, +1, +2} — INT8 POT scaling α*0.5 correct, keep
         scale_eff = sx[:, None] * (alpha * 0.5)
         y = acc.to(tl.float32) * scale_eff
 
@@ -291,8 +292,10 @@ if HAS_TRITON:
 
             wd_abs = tl.abs(wd)
             wd_sign = tl.where(wd > 0, 1.0, tl.where(wd < 0, -1.0, 0.0))
+            # Unified α thresholds (0.25α/0.75α) — cross-ref _pot5_thresholds
             wd_eff = tl.where(wd_abs > (alpha * 0.75), wd_sign, tl.where(wd_abs > (alpha * 0.25), wd_sign * 0.5, 0.0))
 
+            # TODO: use block_ptr for better coalescing
             acc += tl.dot(act.to(W_D.dtype.element_ty), wd_eff.to(W_D.dtype.element_ty), out_dtype=tl.float32)
 
         out = acc * alpha
@@ -527,15 +530,17 @@ def pack_pot5_gpu_3bitplane(
     sign = w_f.sign()
 
     q = torch.zeros_like(w_f)
-    q = torch.where(abs_w >= t0, sign * val_low, q)
-    q = torch.where(abs_w >= t1, sign * val_high, q)
+    # Align to online `>` edge (was `>=`); keep inclusive documented if reverted
+    q = torch.where(abs_w > t0, sign * val_low, q)
+    q = torch.where(abs_w > t1, sign * val_high, q)
     alpha = ((w_f * q).sum() / (q * q).sum().clamp_min(1e-8)).to(w.dtype)
 
-    nz_mask = (abs_w >= t0)
-    mag_mask = (abs_w >= t1)
+    nz_mask = (abs_w > t0)
+    mag_mask = (abs_w > t1)
     sign_mask = (w_f < 0.0)
 
-    lane_shifts = (1 << torch.arange(32, device=device, dtype=torch.int32)).view(1, 1, 32)
+    # Fix signed overflow: 1<<31 overflows int32; use int64 for powers
+    lane_shifts = (1 << torch.arange(32, device=device, dtype=torch.int64)).view(1, 1, 32)
     K_words = K_padded // 32
 
     w_nz_bits = (nz_mask.view(N, K_words, 32).to(torch.int32) * lane_shifts).sum(dim=-1, dtype=torch.int32)
@@ -558,11 +563,15 @@ def unpack_pot5_gpu_3bitplane(
     """
     N, K_words = w_nz_bits.shape
     device = w_nz_bits.device
-    lane_shifts = torch.arange(32, device=device, dtype=torch.int32).view(1, 1, 32)
+    lane_shifts = torch.arange(32, device=device, dtype=torch.int64).view(1, 1, 32)
 
-    nz = ((w_nz_bits.unsqueeze(-1) >> lane_shifts) & 1).float()
-    mag = ((w_mag_bits.unsqueeze(-1) >> lane_shifts) & 1).float()
-    sign = ((w_sign_bits.unsqueeze(-1) >> lane_shifts) & 1).float()
+    # Logical shift via unsigned: cast to int64 & 0xFFFFFFFF to avoid arithmetic sign-extend
+    w_nz_u = w_nz_bits.to(torch.int64) & 0xFFFFFFFF
+    w_mag_u = w_mag_bits.to(torch.int64) & 0xFFFFFFFF
+    w_sign_u = w_sign_bits.to(torch.int64) & 0xFFFFFFFF
+    nz = ((w_nz_u.unsqueeze(-1) >> lane_shifts) & 1).float()
+    mag = ((w_mag_u.unsqueeze(-1) >> lane_shifts) & 1).float()
+    sign = ((w_sign_u.unsqueeze(-1) >> lane_shifts) & 1).float()
 
     w_val = nz * (0.5 + 0.5 * mag) * (1.0 - 2.0 * sign) * alpha.float()
     return w_val.reshape(N, -1)[:, :K_orig].to(alpha.dtype)
@@ -595,6 +604,7 @@ if HAS_TRITON:
         Ultra-High-Throughput 3-Bitplane Bitpacked 5-State POT GEMM:
           Weight traffic is reduced by 5.33x vs BF16 (3 bits/weight).
           Decompresses bits in-registers across 32 lanes.
+        TODO: use block_ptr for better coalescing
         """
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -624,9 +634,10 @@ if HAS_TRITON:
             w_sign_word = tl.load(W_sign + offs_n * stride_wn + k_word * stride_wkw, mask=mask_n, other=0)
 
             # In-register bit decompression across 32 lanes: [BLOCK_N, 32]
-            nz = ((w_nz_word[:, None] >> lane[None, :]) & 1).to(tl.float32)
-            mag = ((w_mag_word[:, None] >> lane[None, :]) & 1).to(tl.float32)
-            sign = ((w_sign_word[:, None] >> lane[None, :]) & 1).to(tl.float32)
+            # Fix: use logical shift via uint32 (arithmetic >> would sign-extend bit31)
+            nz = ((w_nz_word[:, None].to(tl.uint32) >> lane[None, :].to(tl.uint32)) & 1).to(tl.float32)
+            mag = ((w_mag_word[:, None].to(tl.uint32) >> lane[None, :].to(tl.uint32)) & 1).to(tl.float32)
+            sign = ((w_sign_word[:, None].to(tl.uint32) >> lane[None, :].to(tl.uint32)) & 1).to(tl.float32)
 
             # Synthesize 5-state weights {-1.0, -0.5, 0.0, +0.5, +1.0}
             w_eff = nz * (0.5 + 0.5 * mag) * (1.0 - 2.0 * sign)

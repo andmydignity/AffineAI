@@ -1,9 +1,12 @@
 """
-Custom CUDA/Triton Kernel: Fused Byte Local Encoder
-===================================================
+Byte Local Encoder (PyTorch)
+============================
+PyTorch (embedding+conv1d+mm) with manual scatter_add backward; not Triton fused.
 Fuses Embedding Lookup, Causal Depthwise Conv1D, Residual RMSNorm,
-Linear Projection, SiLU non-linearity, and Boundary Logits on GPU.
+Linear Projection, SiLU non-linearity, and Boundary Logits on GPU via PyTorch ops.
 Eliminates PyTorch EmbeddingBackward0 dense gradient overhead with in-place scatter.
+
+TODO: use tl.make_block_ptr for coalesced access where Triton kernels are used.
 """
 
 import torch
@@ -30,6 +33,7 @@ class TritonByteEncoderFunction(torch.autograd.Function):
         B, T = byte_ids.shape
         d_byte = embed_w.shape[1]
         K = conv_w.shape[-1]
+        assert conv_w.shape[0] == d_byte and conv_w.shape[1] == 1, f"conv_w must be depthwise [d_byte,1,K] got {tuple(conv_w.shape)}"
 
         # 1. Embedding lookup
         x = F.embedding(byte_ids, embed_w)  # [B, T, d_byte]
@@ -118,14 +122,16 @@ class TritonByteEncoderFunction(torch.autograd.Function):
         if not needs_pre_norm:
             return None, None, None, None, g_norm_s, g_proj_w, g_bp_w, g_bp_b
 
-        g_h_scaled = (g_h * norm_scale).to(conv_w.dtype)
-        sum_gh = (g_h_scaled * x_normed).sum(dim=-1, keepdim=True)
-        g_res = (rms * (g_h_scaled - x_normed * (sum_gh / float(d_byte)))).to(conv_w.dtype)
+        g_h_scaled = (g_h * norm_scale).to(torch.float32)
+        sum_gh = (g_h_scaled * x_normed.to(torch.float32)).sum(dim=-1, keepdim=True)
+        g_res = (rms.to(torch.float32) * (g_h_scaled - x_normed.to(torch.float32) * (sum_gh / float(d_byte)))).to(conv_w.dtype)
         g_conv_b = g_res.sum(dim=(0, 1)).to(conv_w.dtype) if needs_conv_b else None
 
-        # Conv1D backward
+        # Conv1D backward: causal depthwise; flip + pad (0,K-1) is correct for input grad
+        # TODO: add gradcheck test for K>1 to verify flip+pad symmetry
         g_conv_trans = g_res.transpose(1, 2)  # [B, d_byte, T]
         if needs_conv_w:
+            assert conv_w.shape[0] == d_byte and conv_w.shape[1] == 1
             g_conv_w = torch.empty_like(conv_w)
             for k in range(K):
                 g_conv_w[:, 0, k] = (g_conv_trans * x_pad[:, :, k:k+T]).sum(dim=(0, 2))
@@ -140,7 +146,9 @@ class TritonByteEncoderFunction(torch.autograd.Function):
             g_x = (g_res + g_x_conv).to(embed_w.dtype)
 
             g_embed_w = torch.zeros_like(embed_w)
-            idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte)
+            vocab = embed_w.shape[0]
+            assert torch.all(byte_ids < vocab) and torch.all(byte_ids >= 0), "byte_ids OOB"
+            idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte).clamp_(0, vocab - 1)
             g_embed_w.scatter_add_(0, idx, g_x.reshape(-1, d_byte))
         else:
             g_embed_w = None
@@ -159,8 +167,9 @@ def triton_fused_byte_encoder(
     bp_b: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    High-Throughput Fused Local Byte Encoder.
-    Fuses Embedding, Causal Conv1D, Residual RMSNorm, Projection, SiLU, and Boundary Logits.
+    High-Throughput Byte Encoder (PyTorch).
+    PyTorch (embedding+conv1d+mm) with manual scatter_add backward; not Triton fused.
+    Fuses Embedding, Causal Conv1D, Residual RMSNorm, Projection, SiLU, and Boundary Logits via PyTorch ops.
     """
     return TritonByteEncoderFunction.apply(
         byte_ids, embed_w, conv_w, conv_b, norm_scale, proj_w, bp_w, bp_b
@@ -243,7 +252,7 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         M = T // P
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         BLOCK_M = 16
-        BLOCK_D = min(triton.next_power_of_2(D), 1024)
+        BLOCK_D = min(triton.next_power_of_2(D), 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_fwd_kernel[grid](
             x, out,
@@ -262,7 +271,7 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         B, T, D, M, P = ctx.B, ctx.T, ctx.D, ctx.M, ctx.P
         dx = torch.empty((B, T, D), device=dout.device, dtype=ctx.dtype)
         BLOCK_M = 16
-        BLOCK_D = min(triton.next_power_of_2(D), 1024)
+        BLOCK_D = min(triton.next_power_of_2(D), 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_bwd_kernel[grid](
             dout, dx,
@@ -304,6 +313,7 @@ def _patch_weighted_pool_fwd_kernel(
     # Load logits for the patch [BLOCK_M, P_POW2]
     l_ptrs = Logits_ptr + pid_b * stride_lb + (offs_m[:, None] * P + offs_p[None, :]) * stride_lt
     logits = tl.load(l_ptrs, mask=mask_m[:, None] & mask_p[None, :], other=-1e9).to(tl.float32)
+    logits = tl.clamp(logits, -30.0, 30.0)
 
     # Softmax over P
     m_l = tl.max(logits, axis=1)
@@ -312,7 +322,7 @@ def _patch_weighted_pool_fwd_kernel(
     sum_exp = tl.sum(exp_l, axis=1)
     w = exp_l / sum_exp[:, None]  # [BLOCK_M, P_POW2]
 
-    # Store computed softmax weights for backward pass
+    # Store computed softmax weights for backward pass (float32 for stability)
     w_ptrs = Weights_ptr + pid_b * stride_wb + offs_m[:, None] * stride_wm + offs_p[None, :] * stride_wp
     tl.store(w_ptrs, w.to(Weights_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_p[None, :])
 
@@ -322,8 +332,8 @@ def _patch_weighted_pool_fwd_kernel(
 
         acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
         for p in range(P):
-            mask_p_single = offs_p == p
-            w_p = tl.sum(tl.where(mask_p_single[None, :], w, 0.0), axis=1)
+            # O(P) direct indexing: w_p = w[:,p] avoids O(P^2) reduction per p
+            w_p = w[:, p]
             t = offs_m * P + p
             mask_t = mask_m & (t < T)
             x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
@@ -347,10 +357,10 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         M = T // P
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         P_POW2 = triton.next_power_of_2(P)
-        weights = torch.empty((B, M, P_POW2), device=x.device, dtype=x.dtype)
+        weights = torch.empty((B, M, P_POW2), device=x.device, dtype=torch.float32)
 
         BLOCK_M = 16
-        BLOCK_D = min(triton.next_power_of_2(D), 1024)
+        BLOCK_D = min(triton.next_power_of_2(D), 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
 
         _patch_weighted_pool_fwd_kernel[grid](

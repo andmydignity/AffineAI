@@ -7,7 +7,9 @@ def _optional_import(module_name, symbol):
         import importlib
         module = importlib.import_module(module_name)
         return getattr(module, symbol)
-    except Exception:
+    except Exception as e:  # I-01: capture e
+        import warnings
+        warnings.warn(f"{module_name}:{symbol} unavailable: {e}", stacklevel=2)
         return None
 
 
@@ -70,22 +72,68 @@ if triton_adamw_step is None:
         import math
         from affine_ai.kernels.triton_adamw import _adamw_kernel
         def triton_adamw_step(p, grad, exp_avg, exp_avg_sq, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01, step=1, master_p=None):
+            # I-02/03: fallback shim checks triton and cuda at call time, not import time
+            # A-04: heuristic BLOCK_SIZE 256/512/1024 by N same as TritonAdamW, and CPU guard
+            import torch as _torch
+            try:
+                import triton as _triton
+            except Exception:
+                _triton = None
+            if not p.is_cuda or _triton is None or not _torch.cuda.is_available():
+                # CPU fallback to torch AdamW logic (A-04)
+                has_master = master_p is not None
+                mp = master_p if has_master else p
+                grad_f32 = grad.float()
+                if has_master:
+                    if weight_decay != 0.0:
+                        mp.mul_(1.0 - lr * weight_decay)
+                    exp_avg.mul_(0.9).add_(grad_f32, alpha=1.0 - beta1)  # simplified fallback
+                    exp_avg_sq.mul_(0.999).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
+                    # Use passed betas for correct math
+                    bc1 = 1.0 - beta1 ** step
+                    bc2 = 1.0 - beta2 ** step
+                    step_size_fb = lr / bc1
+                    bc2_sqrt_fb = math.sqrt(bc2)
+                    denom = (exp_avg_sq.sqrt() / bc2_sqrt_fb).add_(eps)
+                    mp.addcdiv_(exp_avg, denom, value=-step_size_fb)
+                    p.copy_(mp)
+                else:
+                    if weight_decay != 0.0:
+                        p.mul_(1.0 - lr * weight_decay)
+                    exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
+                    bc1 = 1.0 - beta1 ** step
+                    bc2 = 1.0 - beta2 ** step
+                    step_size_fb = lr / bc1
+                    bc2_sqrt_fb = math.sqrt(bc2)
+                    denom = (exp_avg_sq.sqrt() / bc2_sqrt_fb).add_(eps)
+                    p.addcdiv_(exp_avg, denom, value=-step_size_fb)
+                return
             bc1 = 1.0 - beta1 ** step
             bc2 = 1.0 - beta2 ** step
             step_size = lr / bc1
             bc2_sqrt = math.sqrt(bc2)
             N = p.numel()
-            BLOCK_SIZE = 1024
-            grid = (triton.cdiv(N, BLOCK_SIZE),)
+            # A-04: heuristic same as TritonAdamW: 256/512/1024 by N
+            if N > 1 << 18:
+                BLOCK_SIZE = 1024
+            elif N > 1 << 14:
+                BLOCK_SIZE = 512
+            else:
+                BLOCK_SIZE = 256
+            grid = (_triton.cdiv(N, BLOCK_SIZE),)
             has_master = master_p is not None
             mp = master_p if has_master else p
+            has_wd = weight_decay != 0.0
             _adamw_kernel[grid](
                 p, grad, exp_avg, exp_avg_sq,
                 lr, beta1, beta2, eps, weight_decay,
                 step_size, bc2_sqrt, N, mp,
-                HAS_MASTER=has_master, BLOCK_SIZE=BLOCK_SIZE
+                HAS_MASTER=has_master, HAS_WD=has_wd, BLOCK_SIZE=BLOCK_SIZE
             )
-    except Exception:
+    except Exception as e:
+        import warnings
+        warnings.warn(f"triton_adamw_step shim unavailable: {e}", stacklevel=2)
         triton_adamw_step = None
 
 try:

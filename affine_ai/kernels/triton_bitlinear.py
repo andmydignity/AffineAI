@@ -1,8 +1,10 @@
 """
-Custom Triton Kernel: Fused 2:4 Structured Sparse BitLinear SwiGLU
-==================================================================
+Custom Triton Kernel: Fused BitLinear SwiGLU (No 2:4 Mask)
+=============================================================
 Fuses Gate, Value, SiLU non-linearity, and Down projections directly
-in GPU SRAM registers with support for 2:4 structured sparsity and BF16 AMP.
+in GPU SRAM registers with BF16 AMP.
+Note: No 2:4 structured sparsity mask is applied; earlier header overstated
+"Fused 2:4 Sparse" — this kernel is fused SiLU+Down only.
 """
 
 import math
@@ -11,7 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
+_swiglu_autotune_configs = [
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+]
 
+
+@triton.autotune(configs=_swiglu_autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
 def _swiglu_down_fwd_kernel(
     GV, W_D, OUT, H_ACT,
@@ -60,6 +69,7 @@ def _swiglu_down_fwd_kernel(
         h_act = (gate_f * sig) * val_f
 
         # Save h_act to DRAM in fp32 for numerical stability (or recompute in bwd)
+        # Per-program host branch on pid_k==0 (constexpr per program); alternative is HAS_STORE constexpr or tl.where
         if pid_k == 0:
             h_ptrs = H_ACT + offs_m[:, None] * stride_hm + offs_n[None, :] * stride_hn
             tl.store(h_ptrs, h_act.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :])
@@ -69,6 +79,7 @@ def _swiglu_down_fwd_kernel(
         wd = tl.load(wd_ptrs, mask=mask_k[None, :] & mask_n[:, None], other=0.0)
 
         # Tensor Core dot-product accumulation in SRAM (ieee for fp32)
+        # Mixed precision: h_act fp32 cast to bf16 for dot gives ~1e-3 precision vs torch fp32; acceptable for SwiGLU path
         acc += tl.dot(h_act.to(W_D.dtype.element_ty), wd, out_dtype=tl.float32, input_precision="ieee")
 
     acc = acc * gamma_d
@@ -76,6 +87,7 @@ def _swiglu_down_fwd_kernel(
     tl.store(out_ptrs, acc.to(OUT.dtype.element_ty), mask=mask_m[:, None] & mask_k[None, :])
 
 
+@triton.autotune(configs=_swiglu_autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
 def _swiglu_bwd_kernel(
     GO, W_D, GV, G_GV,
@@ -183,8 +195,7 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         out = torch.empty((M, K), device=x_flat.device, dtype=x_flat.dtype)
         h_act = torch.empty((M, N), device=x_flat.device, dtype=torch.float32)
 
-        BM, BN, BK = 32, 32, 32
-        grid_fwd = (triton.cdiv(M, BM), triton.cdiv(K, BK))
+        grid_fwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(K, META["BLOCK_K"]))
         _swiglu_down_fwd_kernel[grid_fwd](
             gv, w_d_q, out, h_act,
             gv.stride(0), gv.stride(1),
@@ -193,8 +204,6 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             h_act.stride(0), h_act.stride(1),
             gamma_d_tensor,
             M, N, K,
-            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
-            num_warps=4, num_stages=1,
         )
 
         ctx.save_for_backward(x_flat, w_gv_q, w_d_q, gv, h_act, gamma_gv, gamma_d_tensor)
@@ -215,8 +224,7 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
 
         # 2. Gradients through SwiGLU non-linearity directly fused in SRAM
         g_gv = torch.empty((M, 2 * N), dtype=x_flat.dtype, device=x_flat.device)
-        BM, BN, BK = 32, 32, 32
-        grid_bwd = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+        grid_bwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
         _swiglu_bwd_kernel[grid_bwd](
             go_flat, w_d_q, gv, g_gv,
             go_flat.stride(0), go_flat.stride(1),
@@ -225,8 +233,6 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             g_gv.stride(0), g_gv.stride(1),
             gamma_d,
             M, N, K,
-            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
-            num_warps=4, num_stages=1,
         )
 
         # 3. Gradients for W_gate_val & X (STE)

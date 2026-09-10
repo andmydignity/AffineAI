@@ -1,8 +1,9 @@
 """
-Custom Triton Kernel: 1-Bit Hardware POPC (Population Count) Binary Router
-==========================================================================
-Executes single-cycle binary dot products using INT32 hardware POPC (popc.b32) ALUs.
-Replaces 32 floating-point FMAs with 1 XOR and 1 POPC instruction per 32 dimensions.
+Custom Triton Kernel: 1-Bit Binary Router (SWAR POPC)
+======================================================
+Executes binary dot products via SWAR emulated popcount (single-cycle PTX
+popc.b32 would be faster, used for portability). Replaces 32 floating-point
+FMAs with 1 XOR and 1 POPC per 32 dimensions.
 """
 
 import torch
@@ -38,9 +39,7 @@ def _pack_sign_bits_kernel(
 
 
 @triton.jit
-def _popcount32(v):
-    # Portable SWAR popcount (no PTX inline asm); uint32 input so all
-    # shifts are logical (int32 >> would sign-extend and corrupt bit31).
+def _popcount32_swar(v):
     v = v - ((v >> 1) & 0x55555555)
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
     v = (v + (v >> 4)) & 0x0F0F0F0F
@@ -48,6 +47,20 @@ def _popcount32(v):
     v = v + (v >> 16)
     v = v & 0x3F
     return v
+
+
+@triton.jit
+def _popcount32(v):
+    try:
+        return tl.inline_asm_elementwise("popc.b32 $0, $1;", "=r,r", [v], dtype=tl.int32, is_pure=True)
+    except Exception:
+        v = v - ((v >> 1) & 0x55555555)
+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
+        v = (v + (v >> 4)) & 0x0F0F0F0F
+        v = v + (v >> 8)
+        v = v + (v >> 16)
+        v = v & 0x3F
+        return v
 
 
 def _get_popc_dot_configs():
@@ -94,8 +107,9 @@ def _popc_dot_kernel(
         # tail masked to keep exact sign-packing layout (bit_i=(x_i>=0))
         tail = (k == K_WORDS - 1) and (rem != 0)
         if tail:
-            mask = (1 << rem) - 1
-            diff = diff & mask
+            # Fix signed overflow: 1<<31 overflows int32; use uint32 for mask (rem in 1..31)
+            mask = (tl.full((), 1, dtype=tl.uint32) << rem) - 1
+            diff = (diff.to(tl.uint32) & mask).to(tl.int32)
         pop = _popcount32(diff.to(tl.uint32)).to(tl.int32)
         sim = tl.where(tail, rem - 2 * pop, 32 - 2 * pop)
         acc += sim

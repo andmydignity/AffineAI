@@ -4,9 +4,11 @@ Custom Triton Kernels for Local Predictive Coding (LPC)
 Implements fused Forward-Predict-Loss-Gradient operations specifically tailored
 for in-place, forward-only local error learning:
 1. Zero DRAM allocation for un-materialized intermediate logits [B, T, V].
+   For V<=1024 falls back to torch allocating [N,V] logits; fusion only for V>1024.
 2. Fused online Log-Sum-Exp (LSE) loss calculation in GPU SRAM.
 3. In-place gradient projection (dH = err @ W_head) and dW_head accumulation.
 4. Seamless integration with standard PyTorch autograd and forward-only execution.
+Coalesced access via tl.make_block_ptr with boundary_check for tails.
 """
 
 import torch
@@ -51,7 +53,7 @@ lpc_bwd_dw_configs = [
 
 @triton.autotune(
     configs=lpc_fwd_configs,
-    key=['D', 'V'],
+    key=['D', 'V', 'BLOCK_M'],
 )
 @triton.jit
 def _triton_lpc_fwd_kernel(
@@ -72,7 +74,8 @@ def _triton_lpc_fwd_kernel(
     target = tl.load(Targets_ptr + offs_m * stride_tb, mask=mask_m, other=ignore_index)
     valid_mask = mask_m & (target != ignore_index) & (target >= 0) & (target < V)
 
-    acc_dtype = tl.float64 if H_ptr.dtype.element_ty == tl.float64 else tl.float32
+    # acc_dtype derived from max(H,W): promote bf16/fp16 -> fp32, else fp64 if either is fp64
+    acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
 
     m_i = tl.full([BLOCK_M], -1e30, dtype=acc_dtype)
     l_i = tl.zeros([BLOCK_M], dtype=acc_dtype)
@@ -84,14 +87,11 @@ def _triton_lpc_fwd_kernel(
 
         acc = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
         for d_start in range(0, D, BLOCK_D):
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
-
-            h_ptrs = H_ptr + offs_m[:, None] * stride_hb + offs_d[None, :] * stride_hd
-            w_ptrs = W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd
-
-            h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-            w_tile = tl.load(w_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+            # coalesced block_ptr loads where D is contiguous (stride_hd==1, stride_wd==1) with boundary_check for tails
+            H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(pid_m * BLOCK_M, d_start), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
+            h_tile = tl.load(H_block, boundary_check=(0, 1))
+            W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_start), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+            w_tile = tl.load(W_block, boundary_check=(0, 1))
 
             acc += tl.dot(h_tile, tl.trans(w_tile), input_precision="ieee")
 
@@ -119,7 +119,7 @@ def _triton_lpc_fwd_kernel(
 
 @triton.autotune(
     configs=lpc_bwd_dh_configs,
-    key=['D', 'V'],
+    key=['D', 'V', 'BLOCK_M'],
 )
 @triton.jit
 def _triton_lpc_bwd_dh_kernel(
@@ -145,7 +145,7 @@ def _triton_lpc_bwd_dh_kernel(
     lse = tl.load(LSE_ptr + offs_m * stride_lse, mask=mask_m, other=0.0)
     grad_scale = tl.load(Grad_scale_ptr)
 
-    acc_dtype = tl.float64 if H_ptr.dtype.element_ty == tl.float64 else tl.float32
+    acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
     dh_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=acc_dtype)
 
     for v_start in range(0, V, BLOCK_V):
@@ -154,28 +154,28 @@ def _triton_lpc_bwd_dh_kernel(
 
         logits = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
         for d_k in range(0, D, BLOCK_D):
-            offs_dk = d_k + tl.arange(0, BLOCK_D)
-            mask_dk = offs_dk < D
-            h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
-            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+            H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(pid_m * BLOCK_M, d_k), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
+            h_k = tl.load(H_block, boundary_check=(0, 1))
+            W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_k), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+            w_k = tl.load(W_block, boundary_check=(0, 1))
             logits += tl.dot(h_k, tl.trans(w_k), input_precision="ieee")
 
         diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
         p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
         is_target = (target[:, None] == offs_v[None, :]) & valid_mask[:, None] & mask_v[None, :]
         dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
-        scaled_dlogits = (dlogits * grad_scale).to(H_ptr.dtype.element_ty)
+        scaled_fp32 = dlogits * grad_scale
+        Wd_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, pid_d * BLOCK_D), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+        w_d = tl.load(Wd_block, boundary_check=(0, 1))
+        dh_acc += tl.dot(scaled_fp32, w_d.to(tl.float32), input_precision="ieee")
 
-        w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-        dh_acc += tl.dot(scaled_dlogits, w_d, input_precision="ieee")
-
-    dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
-    tl.store(dh_ptrs, dh_acc.to(H_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+    DH_block = tl.make_block_ptr(base=DH_ptr, shape=(N, D), strides=(stride_dhb, stride_dhd), offsets=(pid_m * BLOCK_M, pid_d * BLOCK_D), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
+    tl.store(DH_block, dh_acc.to(H_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.autotune(
     configs=lpc_bwd_dw_configs,
-    key=['D', 'V'],
+    key=['D', 'V', 'BLOCK_M'],
 )
 @triton.jit
 def _triton_lpc_bwd_dw_kernel(
@@ -197,7 +197,7 @@ def _triton_lpc_bwd_dw_kernel(
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
 
-    acc_dtype = tl.float64 if W_ptr.dtype.element_ty == tl.float64 else tl.float32
+    acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
     grad_scale = tl.load(Grad_scale_ptr)
     dw_acc = tl.zeros([BLOCK_V, BLOCK_D], dtype=acc_dtype)
 
@@ -211,23 +211,23 @@ def _triton_lpc_bwd_dw_kernel(
 
         logits = tl.zeros([BLOCK_V, BLOCK_N], dtype=acc_dtype)
         for d_k in range(0, D, BLOCK_D):
-            offs_dk = d_k + tl.arange(0, BLOCK_D)
-            mask_dk = offs_dk < D
-            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
+            Wk_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(pid_v * BLOCK_V, d_k), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+            w_k = tl.load(Wk_block, boundary_check=(0, 1))
+            Hk_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(n_start, d_k), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+            h_k = tl.load(Hk_block, boundary_check=(0, 1))
             logits += tl.dot(w_k, tl.trans(h_k), input_precision="ieee")
 
         diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
         p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
         is_target = (offs_v[:, None] == target[None, :]) & mask_v[:, None] & valid_mask[None, :]
         dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
-        scaled_dlogits = (dlogits * grad_scale).to(W_ptr.dtype.element_ty)
+        scaled_fp32 = dlogits * grad_scale
+        Hd_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(n_start, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+        h_d = tl.load(Hd_block, boundary_check=(0, 1))
+        dw_acc += tl.dot(scaled_fp32, h_d.to(tl.float32), input_precision="ieee")
 
-        h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-        dw_acc += tl.dot(scaled_dlogits, h_d, input_precision="ieee")
-
-    dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
-    tl.store(dw_ptrs, dw_acc.to(W_ptr.dtype.element_ty), mask=mask_v[:, None] & mask_d[None, :])
+    DW_block = tl.make_block_ptr(base=DW_ptr, shape=(V, D), strides=(stride_dwv, stride_dwd), offsets=(pid_v * BLOCK_V, pid_d * BLOCK_D), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+    tl.store(DW_block, dw_acc.to(W_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 class _TritonFusedLPCHeadFunc(torch.autograd.Function):
@@ -239,10 +239,12 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         targets: torch.Tensor,
         ignore_index: int = -100
     ) -> torch.Tensor:
-        if weight.dtype != h.dtype:
-            weight = weight.to(h.dtype)
+        # Keep original weight untouched; compute matmuls in promoted dtype without mutating param
+        calc_dtype = torch.float32 if h.dtype in (torch.bfloat16, torch.float16) else (torch.float64 if h.dtype == torch.float64 else h.dtype)
+        weight_compute = weight.to(calc_dtype) if weight.dtype != calc_dtype else weight
         h = h.contiguous()
-        weight = weight.contiguous()
+        weight_compute = weight_compute.contiguous()
+        weight_orig = weight.contiguous()
         targets = targets.contiguous()
 
         orig_shape = h.shape
@@ -252,15 +254,17 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         N, D = h_flat.shape
         V = weight.shape[0]
 
-        calc_dtype = torch.float64 if h.dtype == torch.float64 else torch.float32
+        # For V<=1024 falls back to torch allocating [N,V] logits; fusion only for V>1024
+        alloc_dtype = torch.float64 if h.dtype == torch.float64 else torch.float32
         if _use_torch_path(V):
             # Capture-safe branchless small-V path (no .item()/sync, no nested
             # autograd), mirroring triton_cross_entropy semantics.
-            acc_dtype = h.dtype
-            valid = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)).to(acc_dtype)
-            n_valid = valid.sum().clamp(min=1)
-            lse = torch.empty(0, dtype=calc_dtype, device=h.device)
-            ctx.save_for_backward(h_flat, weight, targets_flat, lse, n_valid)
+            valid_bool = (targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)
+            # Use int64/float32 for n_valid sum to avoid bf16 mantissa loss
+            n_valid = valid_bool.sum().to(torch.float32).clamp(min=1)
+            valid = valid_bool.to(torch.float32)
+            lse = torch.empty(0, dtype=alloc_dtype, device=h.device)
+            ctx.save_for_backward(h_flat, weight_orig, targets_flat, lse, n_valid)
             ctx.orig_shape = orig_shape
             ctx.N = N
             ctx.D = D
@@ -268,20 +272,24 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
             ctx.ignore_index = ignore_index
             ctx.use_torch = True
             safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
-            logits = torch.matmul(h_flat.to(acc_dtype), weight.to(acc_dtype).t())
-            nll = -logits.log_softmax(dim=-1).gather(1, safe_idx).squeeze(1)
+            # Ensure matmul uses fp32 when bf16 for stable log_softmax
+            h_for_logits = h_flat.to(torch.float32) if h.dtype in (torch.bfloat16, torch.float16) else h_flat.to(calc_dtype)
+            w_for_logits = weight_compute.to(torch.float32) if h.dtype in (torch.bfloat16, torch.float16) else weight_compute
+            logits = torch.matmul(h_for_logits, w_for_logits.t())
+            # log_softmax in fp32 when bf16: keep logits fp32
+            nll = -logits.log_softmax(dim=-1).gather(1, safe_idx).squeeze(1).to(torch.float32)
             total_loss = (nll * valid).sum() / n_valid
             return total_loss.to(h.dtype)
 
-        losses = torch.empty(N, dtype=calc_dtype, device=h.device)
-        lse = torch.empty(N, dtype=calc_dtype, device=h.device)
+        losses = torch.empty(N, dtype=alloc_dtype, device=h.device)
+        lse = torch.empty(N, dtype=alloc_dtype, device=h.device)
 
-        grid = lambda META: (triton.cdiv(N, META['BLOCK_M']),)
+        grid = lambda META: (triton.cdiv(N, META['BLOCK_M']),)  # N varies: grid depends on N via cdiv
 
         _triton_lpc_fwd_kernel[grid](
-            h_flat, weight, targets_flat, losses, lse,
+            h_flat, weight_orig, targets_flat, losses, lse,
             h_flat.stride(0), h_flat.stride(1),
-            weight.stride(0), weight.stride(1),
+            weight_orig.stride(0), weight_orig.stride(1),
             targets_flat.stride(0),
             losses.stride(0),
             lse.stride(0),
@@ -290,10 +298,10 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         )
 
         valid_mask = (targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)
-        n_valid = valid_mask.sum().clamp(min=1)
+        n_valid = valid_mask.sum().to(torch.float32).clamp(min=1)
         total_loss = losses.sum() / n_valid
 
-        ctx.save_for_backward(h_flat, weight, targets_flat, lse, n_valid)
+        ctx.save_for_backward(h_flat, weight_orig, targets_flat, lse, n_valid)
         ctx.orig_shape = orig_shape
         ctx.N = N
         ctx.D = D
@@ -316,18 +324,22 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
             need_dw = ctx.needs_input_grad[1]
             if not need_dx and not need_dw:
                 return None, None, None, None
-            valid = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V))
+            valid_bool = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V))
             safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
-            acc_dtype = h_flat.dtype
-            valid = valid.to(acc_dtype)
-            logits = torch.matmul(h_flat.to(acc_dtype), weight.to(acc_dtype).t())
+            # Promote bf16/fp16 to fp32 for stable log_softmax and to avoid mantissa loss
+            acc_dtype = torch.float32 if h_flat.dtype in (torch.bfloat16, torch.float16) else (torch.float64 if h_flat.dtype == torch.float64 else h_flat.dtype)
+            valid = valid_bool.to(torch.float32)
+            # Ensure matmul uses fp32 when bf16 for stable log_softmax
+            h_for_logits = h_flat.to(torch.float32) if h_flat.dtype in (torch.bfloat16, torch.float16) else h_flat.to(acc_dtype)
+            w_for_logits = weight.to(torch.float32) if h_flat.dtype in (torch.bfloat16, torch.float16) else weight.to(acc_dtype)
+            logits = torch.matmul(h_for_logits, w_for_logits.t())
             probs = logits.log_softmax(dim=-1).exp()
             one_hot = torch.zeros_like(probs)
             one_hot.scatter_(1, safe_idx, valid.unsqueeze(1))
             dlogits = (probs - one_hot) * valid.unsqueeze(1)
             dlogits = dlogits * (grad_output / n_valid).to(dlogits.dtype)
-            dh_flat = torch.matmul(dlogits, weight.to(acc_dtype)).to(h_flat.dtype).view(ctx.orig_shape) if need_dx else None
-            dw = torch.matmul(dlogits.t(), h_flat.to(acc_dtype)).to(weight.dtype) if need_dw else None
+            dh_flat = torch.matmul(dlogits, w_for_logits).to(h_flat.dtype).view(ctx.orig_shape) if need_dx else None
+            dw = torch.matmul(dlogits.t(), h_flat.to(torch.float32) if h_flat.dtype in (torch.bfloat16, torch.float16) else h_flat.to(acc_dtype)).to(weight.dtype) if need_dw else None
             return dh_flat, dw, None, None
 
         scale_dtype = torch.float64 if h_flat.dtype == torch.float64 else torch.float32
@@ -378,7 +390,9 @@ def triton_fused_lpc_head(
 ) -> torch.Tensor:
     """
     Computes Local Predictive Coding loss and exact in-place gradients via Triton.
-    Eliminates intermediate logits allocation in DRAM.
+    Eliminates intermediate logits allocation in DRAM. For V<=1024 falls back to
+    torch allocating [N,V] logits; fusion only for V>1024. Masking OOB (ignore_index,
+    target <0 or >=V) is handled via valid_mask with masked stores/loads.
 
     Args:
         h: Local layer hidden representation of shape (B, T, D) or (N, D).

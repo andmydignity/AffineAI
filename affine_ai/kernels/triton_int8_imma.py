@@ -51,14 +51,15 @@ def _int8_imma_gemm_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
+    # INT8 overflow bound: int32 acc safe for K <= 16384 (127*127*16384 < 2^31); overflow beyond that.
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
 
     for k in range(0, K, BLOCK_K):
-        kk = k + offs_k
-        mask_k = kk < K
-        a = tl.load(X_ptr + offs_m[:, None] * stride_xm + kk[None, :] * stride_xk, mask=mask_m[:, None] & mask_k[None, :], other=0)
-        b = tl.load(W_ptr + offs_n[:, None] * stride_wn + kk[None, :] * stride_wk, mask=mask_n[:, None] & mask_k[None, :], other=0)
-        # Lowers directly to hardware mma.sync INT8 Tensor Core instruction
+        a_ptr = tl.make_block_ptr(base=X_ptr, shape=(M, K), strides=(stride_xm, stride_xk), offsets=(pid_m * BLOCK_M, k), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
+        a = tl.load(a_ptr, boundary_check=(0, 1))
+        b_ptr = tl.make_block_ptr(base=W_ptr, shape=(N, K), strides=(stride_wn, stride_wk), offsets=(pid_n * BLOCK_N, k), block_shape=(BLOCK_N, BLOCK_K), order=(1, 0))
+        b = tl.load(b_ptr, boundary_check=(0, 1))
+        # Lowers directly to hardware mma.sync INT8 Tensor Core instruction (mma.sync.aligned.m16n8k32.s32.s8.s8)
         acc += tl.dot(a, tl.trans(b), out_dtype=tl.int32)
 
     sx = tl.load(Scale_x_ptr + offs_m * stride_sx, mask=mask_m, other=1.0)
@@ -87,10 +88,12 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
         N = weight.shape[0]
 
         # Dynamic activation INT8 quantization
+        # Clamp asymmetric -128 vs ternary ±127: bias ~0.8% at extremes (1/127), kept for INT8 range
         sx = (x_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1).contiguous()
         x_int8 = (x_flat / sx.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
 
         # Weight INT8 quantization
+        # Clamp asymmetric -128 vs ternary ±127: bias ~0.8% at extremes
         w_f = weight.contiguous()
         sw = (w_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1).contiguous()
         w_int8 = (w_f / sw.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
@@ -104,6 +107,8 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             bias_tensor = x_flat
             stride_b = 0
 
+        # INT8 int32 acc overflow at K>16384; assert for safety
+        assert K <= 16384, f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384"
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
         _int8_imma_gemm_kernel[grid](
@@ -124,6 +129,7 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # Backward STE ignores quantization: gx/gw use FP weight/x not int8 (inconsistent vs ternary STE which re-quantizes x_q)
         x_flat, weight, bias = ctx.saved_tensors
         orig_shape = ctx.orig_shape
         go_flat = grad_output.reshape(-1, weight.shape[0]).contiguous()

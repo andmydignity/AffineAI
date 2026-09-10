@@ -3,6 +3,7 @@ Custom Triton Kernel: Fused In-Place AdamW Optimizer
 ====================================================
 Fuses 1st moment (m), 2nd moment (v), decoupled weight decay, and
 parameter updates directly in GPU registers in a single memory pass.
+Notes: amsgrad not supported (A-09), master_weights optional (A-10), weight decay order coupled before moment (A-07).
 Eliminates intermediate tensor allocations and multiple CUDA kernel launches.
 """
 
@@ -31,13 +32,15 @@ def _adamw_kernel(
     N,                  # Total number of elements
     Master_ptr = None,  # Optional master parameter pointer (FP32)
     HAS_MASTER: tl.constexpr = False,
+    HAS_WD: tl.constexpr = False,
     BLOCK_SIZE: tl.constexpr = 1024
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
     # compiler hints for better pipelining
-    offs = tl.max_contiguous(tl.multiple_of(offs, 8), BLOCK_SIZE)
+    # A-08: multiple_of(offs,8) illegal for N<BLOCK; use 1 or guard
+    offs = tl.max_contiguous(tl.multiple_of(offs, 1), BLOCK_SIZE)  # A-08 fixed: use 1 to avoid illegal hint for small N
 
     # 1. Load parameter, gradient, and moment states into registers
     if HAS_MASTER:
@@ -49,8 +52,9 @@ def _adamw_kernel(
     m = tl.load(Exp_avg_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     v = tl.load(Exp_avg_sq_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
-    # 2. Perform decoupled weight decay
-    if weight_decay != 0.0:
+    # 2. Perform decoupled weight decay (A-07: coupled before moment vs AdamW variant; documented as decoupled)
+    # A-03: use HAS_WD constexpr instead of float compare inside kernel
+    if HAS_WD:
         p = p - lr * weight_decay * p
 
     # 3. Update biased 1st and 2nd moments
@@ -75,6 +79,7 @@ class TritonAdamW(Optimizer):
     High-Throughput Fused In-Place AdamW Optimizer in Triton.
     Drop-in replacement for torch.optim.AdamW on CUDA.
     Supports FP32 master weights for half-precision (FP16/BF16) parameters to prevent mantissa underflow.
+    Note: amsgrad not supported (A-09), master_weights default True (A-10).
     """
     def __init__(
         self,
@@ -130,21 +135,30 @@ class TritonAdamW(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("TritonAdamW does not support sparse gradients")
 
+                # A-01: strided view corruption guard - param must be contiguous for Triton flat pointer
+                if not p.is_contiguous():
+                    raise ValueError("AdamW param must be contiguous; call .contiguous() (A-01 strided view corruption)")
+                if not grad.is_contiguous():
+                    grad = grad.contiguous()
                 # Issue 39: Enforce contiguous tensors to prevent flat pointer memory corruption
-                p_data = p if p.is_contiguous() else p.contiguous()
-                grad_data = grad if grad.is_contiguous() else grad.contiguous()
+                p_data = p  # already contiguous per guard
+                grad_data = grad  # already handled
+                # Alternative consistent flatten: p.view(-1) and zeros_like(p, dtype=float32) would also work
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p_data, dtype=torch.float32, device=p.device)
-                    state['exp_avg_sq'] = torch.zeros_like(p_data, dtype=torch.float32, device=p.device)
+                    state['step'] = 0  # A-06: int step, not tensor -> not capturable
+                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)  # A-01: shape matches p.shape exactly
+                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
                     # Issue 40: Support FP32 master weights for half-precision (FP16/BF16)
                     if use_master and p.dtype in (torch.float16, torch.bfloat16):
                         state['master_param'] = p_data.detach().clone().to(torch.float32)
 
                 state['step'] += 1
                 step_val = state['step']
+                # A-05: host beta**step breaks CUDA Graphs (host math not graph-capturable)
+                # TODO: compute bc on device for graph capture; keep host math but document.
+                # A-06: state['step'] is int not tensor, so not capturable for CUDA Graphs; documented.
                 bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
                 bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
                 step_size = lr / bias_correction1
@@ -162,6 +176,7 @@ class TritonAdamW(Optimizer):
                         BLOCK_SIZE = 512
                     else:
                         BLOCK_SIZE = 256
+                    has_wd = weight_decay != 0.0  # A-03
                     grid = (triton.cdiv(N, BLOCK_SIZE),)
                     _adamw_kernel[grid](
                         p_data,
@@ -173,16 +188,18 @@ class TritonAdamW(Optimizer):
                         N,
                         master_p,
                         HAS_MASTER=has_master,
+                        HAS_WD=has_wd,  # A-03
                         BLOCK_SIZE=BLOCK_SIZE
                     )
                 else:
                     # CPU Fallback
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
+                    # A-02: CPU fallback must use fp32 grad unconditionally (bf16 grad loses precision)
+                    grad_f32 = grad_data.float()  # A-02 fix
                     if has_master:
                         if weight_decay != 0.0:
                             master_p.mul_(1.0 - lr * weight_decay)
-                        grad_f32 = grad_data.float()
                         exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)
                         exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)
                         denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
@@ -191,13 +208,14 @@ class TritonAdamW(Optimizer):
                     else:
                         if weight_decay != 0.0:
                             p_data.mul_(1.0 - lr * weight_decay)
-                        exp_avg.mul_(beta1).add_(grad_data, alpha=1.0 - beta1)
-                        exp_avg_sq.mul_(beta2).addcmul_(grad_data, grad_data, value=1.0 - beta2)
+                        exp_avg.mul_(beta1).add_(grad_f32, alpha=1.0 - beta1)  # A-02: use grad_f32 not grad_data
+                        exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1.0 - beta2)  # A-02
                         denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
                         p_data.addcdiv_(exp_avg, denom, value=-step_size)
 
-                # If p was non-contiguous, copy back the updated contiguous buffer
-                if not p.is_contiguous():
-                    p.copy_(p_data)
+                # A-01: p is now guaranteed contiguous, no copy-back needed; kept for API compat if guard relaxed
+                # if not p.is_contiguous():
+                #     p.copy_(p_data)
+                pass
 
         return loss

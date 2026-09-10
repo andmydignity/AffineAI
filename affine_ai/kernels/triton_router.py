@@ -1,13 +1,15 @@
-"""Triton fused hierarchical sign-router cascade + top-k (CUDA).
+"""Hierarchical sign-router cascade + top-k (CUDA, cuBLAS + Triton).
 
 Mirrors HierarchicalSignRouter.route_tokens + top-k normalize:
-  logits [B, I] (cuBLAS, kept outside) -> sigmoid cascade over tree
-  levels -> 16 leaf probs -> normalize -> exact top-2 (lower-index-first
-  ties, matching torch.topk) + weights.
+  logits [B, I] computed via cuBLAS matmul (dominates cost) before Triton cascade
+  -> sigmoid cascade over tree levels -> N leaf probs -> normalize -> exact top-k
+  (lower-index-first ties, matching torch.topk which has undefined tie behavior) + weights.
 
 Backward recomputes with plain torch ops under enable_grad (same
 pattern as triton_ternary / triton_tree / triton_gla). Elementwise only
 (SIMT); the matmul stays in cuBLAS.
+
+TODO: use tl.make_block_ptr for coalesced access.
 """
 
 import torch
@@ -23,6 +25,7 @@ def _router_cascade_topk_kernel(
     NLEAF: tl.constexpr, DEPTH: tl.constexpr, TOPK: tl.constexpr,
     MAXW: tl.constexpr, BLOCK_M: tl.constexpr,
 ):
+    tl.device_assert(DEPTH <= 6, "DEPTH >6 would blow registers (MAXW=1<<DEPTH)")
     # constexpr depth guard to prevent register blowup
     if DEPTH > 6:
         return
@@ -42,11 +45,13 @@ def _router_cascade_topk_kernel(
         nxt = tl.zeros((BLOCK_M, MAXW), dtype=tl.float32)
         for j in range(1 << d):
             node = start_node + j
+            # OOB guard: node must be < I (logits width = (1<<DEPTH)-1)
+            tl.device_assert(node < I, "node OOB")
             logit = tl.load(
                 Logits + offs_m * stride_lm + node * stride_li,
-                mask=mask_m, other=0.0,
+                mask=mask_m & (node < I), other=0.0,
             )
-            sr = tl.sigmoid(tl.clamp(2.0 * logit, -30.0, 30.0))
+            sr = tl.where(node < I, tl.sigmoid(tl.clamp(2.0 * logit, -30.0, 30.0)), 0.0)
             pv = tl.sum(tl.where(col[None, :] == j, cur, 0.0), axis=1)
             nxt = tl.where(col[None, :] == 2 * j, (pv * (1.0 - sr))[:, None], nxt)
             nxt = tl.where(col[None, :] == 2 * j + 1, (pv * sr)[:, None], nxt)
@@ -86,6 +91,7 @@ def _grid(m, bm=64):
 
 def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):
     B, I = node_logits.shape
+    assert node_logits.shape[1] == (1 << tree_depth) - 1, f"logits width {node_logits.shape[1]} != (1<<DEPTH)-1 {(1<<tree_depth)-1}"
     if num_leaves is None:
         num_leaves = 1 << tree_depth
     # depth guard for register blowup (MAXW=1<<DEPTH lives in registers)
@@ -96,10 +102,11 @@ def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):
     top_k = min(top_k, num_leaves)
     top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int64)
     top_w = torch.empty((B, top_k), device=node_logits.device, dtype=torch.float32)
-    _router_cascade_topk_kernel[_grid(B, 64)](
+    BLOCK_M = 32 if B < 64 else 64
+    _router_cascade_topk_kernel[_grid(B, BLOCK_M)](
         node_logits, top_idx, top_w,
         node_logits.stride(0), node_logits.stride(1),
-        B, I, num_leaves, tree_depth, top_k, 1 << tree_depth, BLOCK_M=64, num_warps=4)
+        B, I, num_leaves, tree_depth, top_k, 1 << tree_depth, BLOCK_M=BLOCK_M, num_warps=4)
     return top_idx, top_w
 
 
@@ -122,7 +129,6 @@ class TritonRouterTopkFunction(torch.autograd.Function):
     def backward(ctx, grad_idx, grad_w):
         if grad_w is None or not (ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]):
             return None, None, None, None, None, None
-        x_flat, hyperplanes, biases = ctx.saved_tensors
         x_flat, hyperplanes, biases = ctx.saved_tensors
         from affine_ai.core.ast_dag import ternarize
         W_route = ternarize(hyperplanes)

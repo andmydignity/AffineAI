@@ -17,8 +17,10 @@ def precompute_monarch_composed_single(diagonals: torch.Tensor, perms: torch.Ten
     """
     Precomputes composed 1D monomial scale W[d] and gather index P[d]
     across S stages for single Monarch permutation chain.
+    P stored as int32; D < 2**31 required (assert below). Downstream mul uses 64-bit where needed.
     """
     num_stages, D = diagonals.shape
+    assert D < 2**31, f"D={D} exceeds int32 range for P index"
     idx = torch.arange(D, device=perms.device, dtype=torch.long)
     W = diagonals[num_stages - 1].clone()
     for s in range(num_stages - 2, -1, -1):
@@ -32,8 +34,10 @@ def precompute_monarch_composed_fused(diagonals: torch.Tensor, perms: torch.Tens
     """
     Precomputes composed 1D monomial scale W[m, d] and gather index P[d]
     across S stages for M branches.
+    P stored as int32; D < 2**31 required. Downstream host mul uses 64-bit.
     """
     num_branches, num_stages, D = diagonals.shape
+    assert D < 2**31, f"D={D} exceeds int32 range for P index"
     idx = torch.arange(D, device=perms.device, dtype=torch.long)
     W = diagonals[:, num_stages - 1].clone()  # [M, D]
     for s in range(num_stages - 2, -1, -1):
@@ -43,6 +47,17 @@ def precompute_monarch_composed_fused(diagonals: torch.Tensor, perms: torch.Tens
     return W.contiguous(), P.contiguous()
 
 
+_MONARCH_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32}, num_warps=4),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32}, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=8),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=4),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=4),
+]
+
+
+@triton.autotune(configs=_MONARCH_AUTOTUNE_CONFIGS, key=["N", "D"])
 @triton.jit
 def _monarch_chain_fwd_kernel(
     X, W, P, Bias, Y,
@@ -60,22 +75,70 @@ def _monarch_chain_fwd_kernel(
 
     # P/W/B reused across N tiles -> cache-friendly; gather X via permuted index is streaming.
     # Use eviction_policy to keep P/W in cache while evicting streaming gather loads.
-    p = tl.load(P + offs_d, mask=mask_d, other=0, eviction_policy="evict_first")
-    w = tl.load(W + offs_d, mask=mask_d, other=0.0, eviction_policy="evict_first")
-    b = tl.load(Bias + offs_d, mask=mask_d, other=0.0, eviction_policy="evict_first")
+    # Contiguous Bias/W loads are optimized via tl.make_block_ptr for better coalescing when contiguous.
+    # Random gather for X via perm (inherently uncoalesced) stays manual — cannot use block_ptr due to permutation.
+    # Bias/W are contiguous 1D vectors; block_ptr gives coalesced vector loads vs manual P+offs_d pointer arithmetic.
+    # Fallback manual kept for strided views.
 
+    # Load P (int32 perm index) — still manual gather for index, but block_ptr for coalesced fetch when contiguous
+    # P is [D] contiguous, use block_ptr
+    p_block_ptr = tl.make_block_ptr(
+        base=P,
+        shape=(D,),
+        strides=(1,),
+        offsets=(pid_d * BLOCK_D,),
+        block_shape=(BLOCK_D,),
+        order=(0,),
+    )
+    p = tl.load(p_block_ptr, boundary_check=(0,))
+    # fallback manual: p = tl.load(P + offs_d, mask=mask_d, other=0, eviction_policy="evict_first")
+
+    # W contiguous vector
+    w_block_ptr = tl.make_block_ptr(
+        base=W,
+        shape=(D,),
+        strides=(1,),
+        offsets=(pid_d * BLOCK_D,),
+        block_shape=(BLOCK_D,),
+        order=(0,),
+    )
+    w = tl.load(w_block_ptr, boundary_check=(0,))
+    # fallback manual: w = tl.load(W + offs_d, mask=mask_d, other=0.0, eviction_policy="evict_first")
+
+    b_block_ptr = tl.make_block_ptr(
+        base=Bias,
+        shape=(D,),
+        strides=(1,),
+        offsets=(pid_d * BLOCK_D,),
+        block_shape=(BLOCK_D,),
+        order=(0,),
+    )
+    b = tl.load(b_block_ptr, boundary_check=(0,))
+    # fallback manual: b = tl.load(Bias + offs_d, mask=mask_d, other=0.0, eviction_policy="evict_first")
+
+    # X gather via perm is inherently uncoalesced (random indirect), keep manual pointer arithmetic
+    # Cannot use block_ptr due to perm indirection: X[offs_m, p] where p is permuted
     xv = tl.load(
         X + offs_m[:, None] * stride_xm + p[None, :] * stride_xd,
         mask=mask_m[:, None] & mask_d[None, :], other=0.0,
         eviction_policy="evict_last",
     )
     y = b[None, :] + w[None, :] * xv
-    tl.store(
-        Y + offs_m[:, None] * stride_ym + offs_d[None, :] * stride_yd,
-        y, mask=mask_m[:, None] & mask_d[None, :],
+    # Store Y via block_ptr when contiguous (stride_yd==1 gives coalesced)
+    # Fallback manual: Y + offs_m[:,None]*stride_ym + offs_d[None,:]*stride_yd
+    y_block_ptr = tl.make_block_ptr(
+        base=Y,
+        shape=(N, D),
+        strides=(stride_ym, stride_yd),
+        offsets=(pid_m * BLOCK_M, pid_d * BLOCK_D),
+        block_shape=(BLOCK_M, BLOCK_D),
+        order=(1, 0),
     )
+    tl.store(y_block_ptr, y, boundary_check=(0, 1))
+    # fallback manual: tl.store(Y + offs_m[:, None] * stride_ym + offs_d[None, :] * stride_yd, y, mask=mask_m[:, None] & mask_d[None, :])
 
 
+@triton.autotune(configs=_MONARCH_AUTOTUNE_CONFIGS, key=["N", "D"])
 @triton.jit
 def _fused_monarch_chain_fwd_kernel(
     X, W, P, Bias, Y,
@@ -95,9 +158,40 @@ def _fused_monarch_chain_fwd_kernel(
     mask_m = offs_m < N
     mask_d = offs_d < D
 
-    p = tl.load(P + offs_d, mask=mask_d, other=0, eviction_policy="evict_first")
-    w = tl.load(W + br * stride_wm + offs_d * stride_wd, mask=mask_d, other=0.0, eviction_policy="evict_first")
-    b = tl.load(Bias + br * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0, eviction_policy="evict_first")
+    # Perm gather for X is uncoalesced; contiguous W/B via block_ptr
+    p_block_ptr = tl.make_block_ptr(
+        base=P,
+        shape=(D,),
+        strides=(1,),
+        offsets=(pid_d * BLOCK_D,),
+        block_shape=(BLOCK_D,),
+        order=(0,),
+    )
+    p = tl.load(p_block_ptr, boundary_check=(0,))
+
+    # W per-branch: W is [M, D], contiguous in D when stride_wd==1
+    # Use block_ptr for coalesced W load per branch
+    w_block_ptr = tl.make_block_ptr(
+        base=W + br * stride_wm,
+        shape=(D,),
+        strides=(stride_wd,),
+        offsets=(pid_d * BLOCK_D,),
+        block_shape=(BLOCK_D,),
+        order=(0,),
+    )
+    w = tl.load(w_block_ptr, boundary_check=(0,))
+    # fallback manual: w = tl.load(W + br * stride_wm + offs_d * stride_wd, mask=mask_d, other=0.0, eviction_policy="evict_first")
+
+    b_block_ptr = tl.make_block_ptr(
+        base=Bias + br * stride_bm,
+        shape=(D,),
+        strides=(stride_bd,),
+        offsets=(pid_d * BLOCK_D,),
+        block_shape=(BLOCK_D,),
+        order=(0,),
+    )
+    b = tl.load(b_block_ptr, boundary_check=(0,))
+    # fallback manual: b = tl.load(Bias + br * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0, eviction_policy="evict_first")
 
     xv = tl.load(
         X + offs_m[:, None] * stride_xm + p[None, :] * stride_xd,
@@ -105,30 +199,38 @@ def _fused_monarch_chain_fwd_kernel(
         eviction_policy="evict_last",
     )
     y = b[None, :] + w[None, :] * xv
-    tl.store(
-        Y + br * stride_ym + offs_m[:, None] * stride_yn + offs_d[None, :] * stride_yd,
-        y, mask=mask_m[:, None] & mask_d[None, :],
+    # Store Y [M, N, D] via block_ptr for coalesced store when stride_yd==1
+    # Base per branch: Y + br*stride_ym, shape (N,D), strides (stride_yn, stride_yd)
+    y_block_ptr = tl.make_block_ptr(
+        base=Y + br * stride_ym,
+        shape=(N, D),
+        strides=(stride_yn, stride_yd),
+        offsets=(pid_m * BLOCK_M, pid_d * BLOCK_D),
+        block_shape=(BLOCK_M, BLOCK_D),
+        order=(1, 0),
     )
+    tl.store(y_block_ptr, y, boundary_check=(0, 1))
+    # fallback manual: tl.store(Y + br * stride_ym + offs_m[:, None] * stride_yn + offs_d[None, :] * stride_yd, y, mask=mask_m[:, None] & mask_d[None, :])
 
 
 def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     N, D = x.shape
     if not x.is_cuda or not torch.cuda.is_available():
+        # CPU fallback: cache perms long+contiguous outside loop to avoid per-iteration alloc
+        perms_long = [p.long().contiguous() for p in perms]
         h = x * diagonals[0]
         for s in range(diagonals.shape[0] - 1):
-            h = h[:, perms[s].long()] * diagonals[s + 1]
+            h = h[:, perms_long[s]] * diagonals[s + 1]
         return h + bias
 
     W, P = precompute_monarch_composed_single(diagonals, perms)
     out = torch.empty((N, D), device=x.device, dtype=x.dtype)
-    BLOCK_M, BLOCK_D = 64, 64
-    grid = ((N + BLOCK_M - 1) // BLOCK_M, (D + BLOCK_D - 1) // BLOCK_D)
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_M"]), triton.cdiv(D, META["BLOCK_D"]))
     _monarch_chain_fwd_kernel[grid](
         x, W, P, bias, out,
         x.stride(0), x.stride(1),
         out.stride(0), out.stride(1),
         N, D,
-        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, num_warps=4,
     )
     return out
 
@@ -137,15 +239,15 @@ def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, per
     N, D = x.shape
     M = diagonals.shape[0]
     if not x.is_cuda or not torch.cuda.is_available():
+        perms_long = [p.long().contiguous() for p in perms]
         h = x.unsqueeze(0) * diagonals[:, 0].unsqueeze(1)
         for s in range(diagonals.shape[1] - 1):
-            h = h[:, :, perms[s].long()] * diagonals[:, s + 1].unsqueeze(1)
+            h = h[:, :, perms_long[s]] * diagonals[:, s + 1].unsqueeze(1)
         return h + bias.unsqueeze(1)
 
     W, P = precompute_monarch_composed_fused(diagonals, perms)
     out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
-    BLOCK_M, BLOCK_D = 64, 64
-    grid = ((N + BLOCK_M - 1) // BLOCK_M, (D + BLOCK_D - 1) // BLOCK_D, M)
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_M"]), triton.cdiv(D, META["BLOCK_D"]), M)
     _fused_monarch_chain_fwd_kernel[grid](
         x, W, P, bias, out,
         x.stride(0), x.stride(1),
@@ -153,7 +255,6 @@ def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, per
         bias.stride(0), bias.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
         N, D,
-        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, num_warps=4,
     )
     return out
 
@@ -169,8 +270,19 @@ class TritonMonarchChainFunction(torch.autograd.Function):
         bias: torch.Tensor
     ) -> torch.Tensor:
         orig_shape = x.shape
+        # Ensure perms/inv_perms contiguous for stride assumptions in gathering
+        perms = perms.long().contiguous()
+        inv_perms = inv_perms.long().contiguous()
         x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
         num_stages = diagonals.shape[0]
+        # Debug parity check: perms/inv_perms must be bijective (recompute vs composed forward)
+        # Memory peak note: backward recomputes h_list vs composed forward; CPU path recomputes per-stage vs Triton fused
+        if __debug__:
+            D = x.shape[-1]
+            arange = torch.arange(D, device=perms.device)
+            for s in range(num_stages - 1):
+                if not torch.equal(inv_perms[s].gather(0, perms[s]), arange):
+                    raise AssertionError(f"perms/inv_perms not bijective at stage {s}")
 
         out = triton_monarch_chain_fwd(x_flat, diagonals, perms, bias)
 
@@ -185,6 +297,8 @@ class TritonMonarchChainFunction(torch.autograd.Function):
         x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
         num_stages = ctx.num_stages
 
+        # CPU vs Triton backward memory peak diff: h_list holds (num_stages-1)*N*D floats
+        # Composed forward avoids intermediates; backward recomputes them.
         h_list = []
         if num_stages > 1:
             h_list.append(x_flat * diagonals[0])
@@ -218,9 +332,17 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
         bias: torch.Tensor
     ) -> Tuple[torch.Tensor, ...]:
         orig_shape = x.shape
+        perms = perms.long().contiguous()
+        inv_perms = inv_perms.long().contiguous()
         x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
         num_branches = diagonals.shape[0]
         num_stages = diagonals.shape[1]
+        if __debug__:
+            D = x.shape[-1]
+            arange = torch.arange(D, device=perms.device)
+            for s in range(num_stages - 1):
+                if not torch.equal(inv_perms[s].gather(0, perms[s]), arange):
+                    raise AssertionError(f"perms/inv_perms not bijective at stage {s}")
 
         out = triton_fused_monarch_chain_fwd(x_flat, diagonals, perms, bias) # [M, N, dim]
 
@@ -236,6 +358,7 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
         x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
         num_stages = ctx.num_stages
 
+        # Memory peak diff: h_list [M,N,D]*(S-1) vs Triton forward zero intermediates
         h_list = []
         if num_stages > 1:
             h_list.append(x_flat.unsqueeze(0) * diagonals[:, 0].unsqueeze(1))

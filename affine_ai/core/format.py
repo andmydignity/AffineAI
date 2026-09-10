@@ -138,9 +138,7 @@ def unpack_ternary_tensor(
     CUDA drop-in: when device is cuda and Triton available, could use triton_unpack,
     but for format correctness we keep NumPy path; caller may use Triton for matmul.
     """
-    total_elements = 1
-    for dim in shape:
-        total_elements *= dim
+    total_elements = math.prod(shape) if shape else 1
 
     if flag == FLAG_SPARSE_TERNARY:
         buf = io.BytesIO(data)
@@ -261,9 +259,7 @@ def unpack_pot5_3bitplane(
     Unpacks a 3-bitplane packed 5-State POT tensor back to continuous PyTorch tensor.
     Formula: W = nz * (0.5 + 0.5 * mag) * (1 - 2 * sign) * alpha
     """
-    total_elements = 1
-    for dim in shape:
-        total_elements *= dim
+    total_elements = math.prod(shape) if shape else 1
 
     buf = io.BytesIO(data)
     len_nz, len_mag, len_sign = struct.unpack("<III", buf.read(12))
@@ -365,9 +361,7 @@ def unpack_pot5_residual_fp16(
     """
     Unpacks a Top-p% Sparse FP16 Residual + 3-Bitplane 5-State POT tensor back to continuous tensor.
     """
-    total_elements = 1
-    for dim in shape:
-        total_elements *= dim
+    total_elements = math.prod(shape) if shape else 1
 
     buf = io.BytesIO(data)
     num_outliers = struct.unpack("<I", buf.read(4))[0]
@@ -501,9 +495,7 @@ def unpack_pot5_residual_q4(
     """
     Unpacks a Top-p% Sparse Q4 Residual + 3-Bitplane 5-State POT tensor back to continuous tensor.
     """
-    total_elements = 1
-    for dim in shape:
-        total_elements *= dim
+    total_elements = math.prod(shape) if shape else 1
 
     buf = io.BytesIO(data)
     num_outliers, block_size = struct.unpack("<II", buf.read(8))
@@ -593,6 +585,7 @@ def save_toros_model(
     payload_buf = io.BytesIO()
     payload_buf.write(struct.pack("<I", len(state_dict)))
 
+    # UNVECTORIZABLE: per-tensor pack loop — heterogeneous flags/shapes/quant modes require branch per tensor
     for name, tensor in state_dict.items():
         name_bytes = name.encode("utf-8")
 
@@ -626,8 +619,8 @@ def save_toros_model(
             payload_buf.write(struct.pack("<B", flag))
             payload_buf.write(struct.pack("<f", gamma))
             payload_buf.write(struct.pack("<B", len(shape)))
-            for d in shape:
-                payload_buf.write(struct.pack("<I", d))
+            if shape:
+                payload_buf.write(struct.pack(f"<{len(shape)}I", *shape))
             payload_buf.write(struct.pack("<I", len(packed_bytes)))
             payload_buf.write(packed_bytes)
         else:
@@ -641,8 +634,8 @@ def save_toros_model(
             payload_buf.write(struct.pack("<B", flag))
             payload_buf.write(struct.pack("<f", 1.0))
             payload_buf.write(struct.pack("<B", len(shape)))
-            for d in shape:
-                payload_buf.write(struct.pack("<I", d))
+            if shape:
+                payload_buf.write(struct.pack(f"<{len(shape)}I", *shape))
             payload_buf.write(struct.pack("<I", len(t_bytes)))
             payload_buf.write(t_bytes)
             fp16_tensors += 1
@@ -940,6 +933,7 @@ def _set_submodule(model: nn.Module, target_path: str, new_module: nn.Module):
     """Replaces a submodule at target_path (e.g. 'blocks.0.time_mixer.qkv_proj') with new_module."""
     parts = target_path.split(".")
     curr = model
+    # UNVECTORIZABLE: path depth variable (1-5) and heterogeneous container types require sequential traversal
     for p in parts[:-1]:
         curr = _get_child(curr, p)
     attr = parts[-1]
@@ -962,6 +956,7 @@ def _assign_tensor(model: nn.Module, target_path: str, tensor: torch.Tensor):
     """Assigns a parameter or buffer at target_path without intermediate dictionary."""
     parts = target_path.split(".")
     curr = model
+    # UNVECTORIZABLE: same as _set_submodule path traversal
     for p in parts[:-1]:
         curr = _get_child(curr, p)
     attr = parts[-1]

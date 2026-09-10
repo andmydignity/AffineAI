@@ -68,7 +68,11 @@ class StickBreakingGrowthController:
     def should_grow(self) -> Tuple[bool, float]:
         if len(self._surprisals) < 16:
             return False, 0.0
-        mean_surprisal = sum(self._surprisals) / len(self._surprisals)
+        # Vectorized window mean: use tensor path if available, else numpy (no Python sum loop)
+        if self._surprisal_tensor is not None and self._surprisal_tensor.numel() == len(self._surprisals):
+            mean_surprisal = float(self._surprisal_tensor.float().mean().item())
+        else:
+            mean_surprisal = float(np.mean(np.fromiter(self._surprisals, dtype=np.float64)))
         # Map surprisal to pseudo mass on new component (higher surprisal -> grow)
         # Heuristic: unexplained mass ~ sigmoid((surprisal - 1.0) * 2)
         unexplained = 1.0 / (1.0 + math.exp(-(mean_surprisal - 1.0) * 2.0))

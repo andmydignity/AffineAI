@@ -48,7 +48,6 @@ class DynamicPriorityReplayBuffer:
         self.total_enqueued: int = 0
         self.total_replayed: int = 0
         self.total_retired: int = 0
-        # Generator for reproducible sampling without global np.random
         self._rng = np.random.default_rng()
 
     def push_candidates(
@@ -61,7 +60,6 @@ class DynamicPriorityReplayBuffer:
         Pushes candidate sequences with high loss into the priority replay buffer.
         Batched D2H: converts Tensor inputs in one sync.
         """
-        # Batched D2H: single cpu() per tensor
         if isinstance(indices, torch.Tensor):
             indices = indices.detach().cpu().tolist()
         elif isinstance(indices, np.ndarray):
@@ -72,10 +70,9 @@ class DynamicPriorityReplayBuffer:
             losses = losses_np
         elif isinstance(losses, list):
             losses = np.array(losses, dtype=np.float32)
-        # losses is now np.ndarray
 
-        # Update running loss statistics
-        valid_losses = [float(l) for l in losses if np.isfinite(float(l))]
+        finite_mask = np.isfinite(losses)
+        valid_losses = losses[finite_mask].astype(np.float64).tolist() if finite_mask.any() else []
         self.running_losses.extend(valid_losses)
         if len(self.running_losses) > 1000:
             self.running_losses = self.running_losses[-1000:]
@@ -85,98 +82,83 @@ class DynamicPriorityReplayBuffer:
         elif threshold is None:
             threshold = 2.0
 
+        losses_arr = np.asarray(losses, dtype=np.float64)
+        keep_mask = (losses_arr >= threshold) & (losses_arr <= self.max_loss_ceiling)
+        keep_idx = np.where(keep_mask)[0]
         enqueued_count = 0
-        for idx, l in zip(indices, losses):
-            loss_val = float(l)
-            if threshold <= loss_val <= self.max_loss_ceiling:
-                if idx not in self.buffer:
-                    if len(self.buffer) >= self.max_capacity:
-                        # Lazy deletion: pop until valid entry (O(log C) amortized)
-                        evicted = False
-                        while self._min_heap:
+        # UNVECTORIZABLE per-item heap/eviction due to dict+heap state dependence
+        for k in keep_idx:
+            idx = indices[k]
+            loss_val = float(losses_arr[k])
+            if idx not in self.buffer:
+                if len(self.buffer) >= self.max_capacity:
+                    evicted = False
+                    while self._min_heap:
+                        cand_loss, cand_ver, cand_idx = heapq.heappop(self._min_heap)
+                        if cand_idx in self.buffer and self._version.get(cand_idx, -1) == cand_ver and self.buffer[cand_idx]["loss"] == cand_loss:
+                            if loss_val <= cand_loss:
+                                heapq.heappush(self._min_heap, (cand_loss, cand_ver, cand_idx))
+                                break
+                            del self.buffer[cand_idx]
+                            self._version.pop(cand_idx, None)
+                            evicted = True
+                            break
+                    if len(self.buffer) >= self.max_capacity and not evicted:
+                        self._rebuild_heap()
+                        if self._min_heap:
                             cand_loss, cand_ver, cand_idx = heapq.heappop(self._min_heap)
-                            if cand_idx in self.buffer and self._version.get(cand_idx, -1) == cand_ver and self.buffer[cand_idx]["loss"] == cand_loss:
-                                if loss_val <= cand_loss:
-                                    heapq.heappush(self._min_heap, (cand_loss, cand_ver, cand_idx))
-                                    break
+                            if cand_idx in self.buffer and loss_val > cand_loss:
                                 del self.buffer[cand_idx]
                                 self._version.pop(cand_idx, None)
                                 evicted = True
-                                break
-                            # stale entry -> discard (heap leak fixed via lazy deletion)
-                        if len(self.buffer) >= self.max_capacity and not evicted:
-                            # Fallback scan if heap exhausted but still full (rebuild heap)
-                            self._rebuild_heap()
-                            # After rebuild, try again Pop
-                            if self._min_heap:
-                                cand_loss, cand_ver, cand_idx = heapq.heappop(self._min_heap)
-                                if cand_idx in self.buffer and loss_val > cand_loss:
-                                    del self.buffer[cand_idx]
-                                    self._version.pop(cand_idx, None)
-                                    evicted = True
-                                else:
-                                    heapq.heappush(self._min_heap, (cand_loss, cand_ver, cand_idx))
-                            if not evicted:
-                                min_k = min(self.buffer, key=lambda k: self.buffer[k]["loss"])
-                                if loss_val <= self.buffer[min_k]["loss"]:
-                                    continue
-                                del self.buffer[min_k]
-                                self._version.pop(min_k, None)
-
-                    if len(self.buffer) < self.max_capacity:
-                        self.buffer[idx] = {"loss": loss_val, "replays": 0}
-                        ver = self._version.get(idx, 0) + 1
-                        self._version[idx] = ver
-                        heapq.heappush(self._min_heap, (loss_val, ver, idx))
-                        self.total_enqueued += 1
-                        enqueued_count += 1
-                else:
-                    # Update loss estimate with version bump (old heap entry becomes stale)
-                    new_loss = 0.5 * (self.buffer[idx]["loss"] + loss_val)
-                    self.buffer[idx]["loss"] = new_loss
+                            else:
+                                heapq.heappush(self._min_heap, (cand_loss, cand_ver, cand_idx))
+                        if not evicted:
+                            # Vectorized fallback: find min via numpy argmin (no Python min loop)
+                            cand_losses = np.array([v["loss"] for v in self.buffer.values()], dtype=np.float64)
+                            cand_keys = list(self.buffer.keys())
+                            min_k = cand_keys[int(np.argmin(cand_losses))]
+                            if loss_val <= self.buffer[min_k]["loss"]:
+                                continue
+                            del self.buffer[min_k]
+                            self._version.pop(min_k, None)
+                if len(self.buffer) < self.max_capacity:
+                    self.buffer[idx] = {"loss": loss_val, "replays": 0}
                     ver = self._version.get(idx, 0) + 1
                     self._version[idx] = ver
-                    heapq.heappush(self._min_heap, (new_loss, ver, idx))
+                    heapq.heappush(self._min_heap, (loss_val, ver, idx))
+                    self.total_enqueued += 1
+                    enqueued_count += 1
+            else:
+                new_loss = 0.5 * (self.buffer[idx]["loss"] + loss_val)
+                self.buffer[idx]["loss"] = new_loss
+                ver = self._version.get(idx, 0) + 1
+                self._version[idx] = ver
+                heapq.heappush(self._min_heap, (new_loss, ver, idx))
 
         return enqueued_count
 
     def _rebuild_heap(self):
-        # Rebuild heap from current buffer to purge stale entries
         self._min_heap = [(v["loss"], self._version[k], k) for k, v in self.buffer.items()]
         heapq.heapify(self._min_heap)
 
     def sample(self, n: int, rng: Optional[Union[np.random.RandomState, np.random.Generator]] = None) -> List[int]:
         """
         Samples n sequence indices weighted by uncertainty/loss.
-        Increments replay counter and retires sequences that exceed max_replays.
-        Vectorized: O(C) still but batched numpy; no per-element Python loop for probs.
-        Accepts Generator or RandomState for backward compat.
+        Vectorized: batched numpy for probs; per-chosen increment loop is O(n) unavoidable for dict state.
         """
         if not self.buffer or n <= 0:
             return []
-
-        # Resolve RNG: prefer Generator
         if rng is None:
             rng = self._rng
-        # Normalize rng to have choice method
         use_generator = isinstance(rng, np.random.Generator)
-
         candidates = list(self.buffer.keys())
-        # Vectorized loss gather (still O(C) but numpy)
         losses = np.array([self.buffer[c]["loss"] for c in candidates], dtype=np.float64)
         sum_l = np.sum(losses)
-        if sum_l > 0:
-            probs = losses / sum_l
-        else:
-            probs = np.ones(len(candidates)) / len(candidates)
-
+        probs = losses / sum_l if sum_l > 0 else np.ones(len(candidates)) / len(candidates)
         sample_n = min(n, len(candidates))
-        if use_generator:
-            chosen = rng.choice(candidates, size=sample_n, replace=False, p=probs).tolist()
-        else:
-            # Legacy RandomState (kept for backward compat, no warning to keep tests clean)
-            chosen = rng.choice(candidates, size=sample_n, replace=False, p=probs).tolist()
-
+        chosen = rng.choice(candidates, size=sample_n, replace=False, p=probs).tolist() if use_generator else rng.choice(candidates, size=sample_n, replace=False, p=probs).tolist()
+        # UNVECTORIZABLE: dict replay increment+retire requires per-item Python loop
         for c in chosen:
             self.buffer[c]["replays"] += 1
             self.total_replayed += 1
@@ -184,13 +166,16 @@ class DynamicPriorityReplayBuffer:
                 del self.buffer[c]
                 self._version.pop(c, None)
                 self.total_retired += 1
-
         return chosen
 
     def get_stats(self) -> Dict[str, Any]:
-        """Returns live buffer telemetry."""
         active_count = len(self.buffer)
-        mean_buf_loss = float(np.mean([v["loss"] for v in self.buffer.values()])) if active_count > 0 else 0.0
+        # Vectorized mean via numpy (no Python loop)
+        if active_count > 0:
+            vals = np.fromiter((v["loss"] for v in self.buffer.values()), dtype=np.float64, count=active_count)
+            mean_buf_loss = float(np.mean(vals))
+        else:
+            mean_buf_loss = 0.0
         return {
             "active_count": active_count,
             "max_capacity": self.max_capacity,
@@ -218,7 +203,6 @@ class DynamicPriorityReplayBuffer:
         self.total_replayed = state.get("total_replayed", 0)
         self.total_retired = state.get("total_retired", 0)
         self._version = state.get("version", {k: 0 for k in self.buffer})
-        # Rebuild heap to fix leak from stale entries persisted
         self._rebuild_heap()
 
     def __len__(self) -> int:

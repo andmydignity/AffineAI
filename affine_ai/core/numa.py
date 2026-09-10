@@ -74,6 +74,7 @@ def node_cpus(node: int) -> List[int]:
     try:
         with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
             out = []
+            # UNVECTORIZABLE: cpulist string parsing (variable ranges like 0-3,7) requires sequential split; tiny input
             for part in f.read().strip().split(","):
                 if "-" in part:
                     a, b = part.split("-")
@@ -110,6 +111,7 @@ def interleave_model_weights(model) -> int:
         # Prototype mbind
         libc.mbind.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint]
         libc.mbind.restype = ctypes.c_int
+        # UNVECTORIZABLE: per-parameter distinct storage (different addr/size) requires loop; mbind syscall per storage
         for p in model.parameters():
             try:
                 addr = p.data_ptr()

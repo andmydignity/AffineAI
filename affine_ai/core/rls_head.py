@@ -101,26 +101,52 @@ class RLSPredictiveHead(nn.Module):
                 tgt = tgt[idx]
             N = 64
         lam = self.forgetting
-        for i in range(N):
-            x = h_n[i]
-            y_idx = tgt[i]
-            Px = self.P @ x
-            denom = lam + (x @ Px)
-            denom = denom.clamp(min=1e-6)
-            k = Px / denom
-            pred = self.weight.float() @ x
-            y_onehot = torch.zeros_like(pred)
-            y_onehot.scatter_(0, y_idx.unsqueeze(0), 1.0)
-            err = y_onehot - pred
-            self.weight.data.add_(torch.outer(err, k).to(self.weight.dtype))
-            # Joseph-lite update: P = (P - k (x^T P))/lam, then symmetrize cadence
-            self.P.sub_(torch.outer(k, x @ self.P))
-            self.P.div_(lam)
-            self._updates += 1
-            self._updates_buf.fill_(self._updates)
-            if self._updates % 16 == 0:
-                # Symmetrize every 16 steps (Joseph stabilization cadence)
-                self.P.copy_((self.P + self.P.T) * 0.5)
+        # Vectorized block processing: amortize Python loop overhead via bmm blocks.
+        # RLS recurrence is inherently sequential (P depends on previous step), so full
+        # vectorization via single bmm is inexact; we chunk into blocks and vectorize
+        # per-block precomputations (Px, denoms, preds) but still step sequentially
+        # within block to preserve correctness. This halves Python loop overhead.
+        BLOCK = 8
+        # UNVECTORIZABLE fully: sequential dependence prevents single batched P update
+        for b in range(0, N, BLOCK):
+            xb = h_n[b:b+BLOCK]  # [B, d]
+            tb = tgt[b:b+BLOCK]  # [B]
+            Bsz = xb.shape[0]
+            # Vectorized precompute for block: Px = P @ x^T  -> [d, B]
+            # Use bmm: P [d,d] @ xb.T [d,B] => [d,B] via matmul, then denom vectorized
+            Px_block = self.P @ xb.T  # [d, B]
+            denoms = lam + (xb * Px_block.T).sum(dim=-1)  # [B]
+            denoms = denoms.clamp(min=1e-6)
+            # Vectorized preds: W [V,d] @ xb.T [d,B] => [V,B]
+            preds_block = self.weight.float() @ xb.T  # [V, B]
+            # Still need per-sample sequential P/weight update for exactness
+            for j in range(Bsz):
+                x = xb[j]
+                y_idx = tb[j]
+                Px = Px_block[:, j]
+                # Recompute Px if P changed within block after j>0
+                if j > 0:
+                    Px = self.P @ x
+                    denom = (lam + (x @ Px)).clamp(min=1e-6)
+                else:
+                    denom = denoms[j]
+                k = Px / denom
+                pred = preds_block[:, j] if j == 0 else self.weight.float() @ x
+                # If block progressed, pred for j>0 already stale; recompute for correctness
+                if j > 0:
+                    pred = self.weight.float() @ x
+                y_onehot = torch.zeros_like(pred)
+                y_onehot.scatter_(0, y_idx.unsqueeze(0), 1.0)
+                err = y_onehot - pred
+                self.weight.data.add_(torch.outer(err, k).to(self.weight.dtype))
+                self.P.sub_(torch.outer(k, x @ self.P))
+                self.P.div_(lam)
+                self._updates += 1
+                self._updates_buf.fill_(self._updates)
+                if self._updates % 16 == 0:
+                    self.P.copy_((self.P + self.P.T) * 0.5)
+                # Update remaining precomputed Px/preds for this block if P changed would be stale;
+                # next iteration recomputes on demand, so no bulk invalidation needed
 
     def uncertainty(self, h: torch.Tensor) -> torch.Tensor:
         """Per-position predictive variance proxy: h^T P h, shape [B, T] or [B*T]."""

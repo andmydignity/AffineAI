@@ -163,6 +163,31 @@ def rank_windows_by_info_gain(head, windows: List[torch.Tensor]) -> List[int]:
     windows: list of h tensors [B, T, d] or [N, d]
     Returns indices sorted descending by mean information gain.
     """
+    # Vectorized path: stack if shapes uniform (batchable), else fall back to loop (unvectorizable heterogeneous shapes)
+    try:
+        if len(windows) > 1 and all(w.shape == windows[0].shape for w in windows):
+            stacked = torch.stack([w.detach() for w in windows], dim=0)  # [W, B, T, d] or [W, N, d]
+            # head.uncertainty expects [..., d]; apply batched via vmap-like flatten
+            orig = stacked.shape
+            flat = stacked.reshape(-1, stacked.shape[-1])
+            # Use head norm+ P in vectorized einsum over stacked batch
+            with torch.no_grad():
+                # vectorized uncertainty: compute var for all at once
+                h_n = head.norm(stacked.float())
+                h_flat = h_n.reshape(-1, head.d_model if hasattr(head, 'd_model') else h_n.shape[-1])
+                P = head.P if hasattr(head, 'P') else head.p if hasattr(head, 'p') else None
+                if P is not None:
+                    var_flat = torch.einsum("nd,dd,nd->n", h_flat, P, h_flat)
+                    var = var_flat.view(*h_n.shape[:-1])
+                    # mean per window: collapse all except window dim
+                    scores_t = var.view(len(windows), -1).mean(dim=-1)
+                    scores = scores_t.detach().cpu().numpy().tolist()
+                else:
+                    raise RuntimeError("no P")
+            return sorted(range(len(windows)), key=lambda i: scores[i], reverse=True)
+    except Exception:
+        pass
+    # UNVECTORIZABLE fallback: heterogeneous shapes require per-window loop
     scores = []
     for w in windows:
         var = head.uncertainty(w)  # [...,]

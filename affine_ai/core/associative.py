@@ -1,11 +1,26 @@
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, Union
 
+import affine_ai.kernels as kernels
 from affine_ai.core.norm import RMSNorm
 from affine_ai.core.backpressure_tree import ternary_ste
+
+def _maybe_compile(fn):
+    try:
+        if hasattr(torch, 'compile'):
+            return torch.compile(fn)
+    except Exception:
+        pass
+    return fn
+
+def _clamp_min_for_dtype(dtype: torch.dtype) -> float:
+    """Return underflow-safe clamp for GLA decay diff: -11 for fp16, -30 otherwise."""
+    return -11.0 if dtype == torch.float16 else -30.0
+
 
 
 class MonarchChainCUDAAutogradFunction(torch.autograd.Function):
@@ -127,13 +142,22 @@ class MonarchPermutationChain(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_monarch_chain
             return asdag_cpu_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
+        if getattr(kernels, "TRITON_AVAILABLE", False) and getattr(kernels, "triton_monarch_chain", None) is not None:
+            try:
+                return kernels.triton_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+            except Exception as e:
+                warnings.warn(f"triton_monarch_chain failed: {e}; falling back", stacklevel=2)
         try:
-            from affine_ai.kernels.triton_gla import triton_monarch_chain
-            return triton_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
-        except Exception:
-            pass
-        from affine_ai.kernels.triton_monarch import triton_monarch_chain
-        return triton_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+            from affine_ai.kernels.triton_monarch import triton_monarch_chain as _fallback_chain
+            return _fallback_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+        except Exception as e:
+            warnings.warn(f"triton_monarch_chain fallback failed: {e}; using Python path", stacklevel=2)
+        # Python fallback (exact but slower)
+        num_stages = self.diagonals.shape[0]
+        h = x * self.diagonals[0]
+        for s in range(num_stages - 1):
+            h = h[:, self.perms[s]] * self.diagonals[s + 1]
+        return h + self.bias
 
 
 class FusedMonarchChain(nn.Module):
@@ -177,8 +201,24 @@ class FusedMonarchChain(nn.Module):
             from affine_ai.core.cpp_ops import asdag_cpu_fused_monarch_chain
             return asdag_cpu_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
 
-        from affine_ai.kernels.triton_monarch import triton_fused_monarch_chain
-        return triton_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+        if getattr(kernels, "TRITON_AVAILABLE", False) and getattr(kernels, "triton_fused_monarch_chain", None) is not None:
+            try:
+                return kernels.triton_fused_monarch_chain(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+            except Exception as e:
+                warnings.warn(f"triton_fused_monarch_chain failed: {e}; falling back", stacklevel=2)
+        try:
+            from affine_ai.kernels.triton_monarch import triton_fused_monarch_chain as _fallback_fused
+            return _fallback_fused(x, self.diagonals, self.perms, self.inv_perms, self.bias)
+        except Exception as e:
+            warnings.warn(f"triton_fused_monarch_chain fallback failed: {e}; using Python path", stacklevel=2)
+        # Python fallback
+        num_branches = self.diagonals.shape[0]
+        num_stages = self.diagonals.shape[1]
+        h = x.unsqueeze(0) * self.diagonals[:, 0].unsqueeze(1)
+        for s in range(num_stages - 1):
+            h = h[:, :, self.perms[s]] * self.diagonals[:, s + 1].unsqueeze(1)
+        out = h + self.bias.unsqueeze(1)
+        return tuple(out[m] for m in range(num_branches))
 
 
 class PermutationProjection(nn.Module):
@@ -229,12 +269,19 @@ class PermutationProjection(nn.Module):
             out = asdag_cpu_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
             return out[0].reshape(*orig_shape)
 
-        try:
-            from affine_ai.kernels.triton_perm_proj import triton_fused_perm_proj
-            out = triton_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
-            return out[0].reshape(*orig_shape)
-        except Exception:
-            pass
+        if getattr(kernels, "TRITON_AVAILABLE", False) and getattr(kernels, "triton_fused_perm_proj", None) is not None:
+            try:
+                out = kernels.triton_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
+                return out[0].reshape(*orig_shape)
+            except Exception as e:
+                warnings.warn(f"triton_fused_perm_proj failed: {e}; falling back", stacklevel=2)
+        else:
+            try:
+                from affine_ai.kernels.triton_perm_proj import triton_fused_perm_proj as _perm
+                out = _perm(x_flat, w, self.perms, self.inv_perms, self.bias)
+                return out[0].reshape(*orig_shape)
+            except Exception as e:
+                warnings.warn(f"triton_fused_perm_proj fallback failed: {e}", stacklevel=2)
 
         x_gathered = torch.gather(
             x_flat.unsqueeze(1).expand(-1, self.num_perms, -1),
@@ -293,13 +340,21 @@ class FusedPermutationProjection(nn.Module):
             branch_outs = tuple(out[m].reshape(*orig_shape) for m in range(self.num_branches))
             return branch_outs
 
-        try:
-            from affine_ai.kernels.triton_perm_proj import triton_fused_perm_proj
-            out = triton_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
-            branch_outs = tuple(out[m].reshape(*orig_shape) for m in range(self.num_branches))
-            return branch_outs
-        except Exception:
-            pass
+        if getattr(kernels, "TRITON_AVAILABLE", False) and getattr(kernels, "triton_fused_perm_proj", None) is not None:
+            try:
+                out = kernels.triton_fused_perm_proj(x_flat, w, self.perms, self.inv_perms, self.bias)
+                branch_outs = tuple(out[m].reshape(*orig_shape) for m in range(self.num_branches))
+                return branch_outs
+            except Exception as e:
+                warnings.warn(f"triton_fused_perm_proj failed: {e}; falling back", stacklevel=2)
+        else:
+            try:
+                from affine_ai.kernels.triton_perm_proj import triton_fused_perm_proj as _perm2
+                out = _perm2(x_flat, w, self.perms, self.inv_perms, self.bias)
+                branch_outs = tuple(out[m].reshape(*orig_shape) for m in range(self.num_branches))
+                return branch_outs
+            except Exception as e:
+                warnings.warn(f"triton_fused_perm_proj fallback failed: {e}", stacklevel=2)
 
         x_gathered = torch.gather(
             x_flat.unsqueeze(1).expand(-1, self.num_perms, -1),
@@ -327,7 +382,8 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
         
         log_gc = torch.log(gc.float().clamp(min=1e-5, max=1.0))
         cum_log_c = torch.cumsum(log_gc, dim=-1)
-        decay_intra = (cum_log_c.unsqueeze(-1) - cum_log_c.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
+        clamp_min = _clamp_min_for_dtype(dtype)
+        decay_intra = (cum_log_c.unsqueeze(-1) - cum_log_c.unsqueeze(-2)).clamp(min=clamp_min, max=0.0)
         mask_intra = torch.tril(torch.ones(C_eff, C_eff, device=q.device, dtype=torch.bool))
         decay_mat_intra = torch.where(mask_intra, torch.exp(decay_intra), torch.zeros_like(decay_intra)).to(dtype)
         
@@ -347,7 +403,8 @@ class FusedGLAAnalyticalCUDA(torch.autograd.Function):
             c = cum_log_c[:, :, :, -1]  # [B, H, NC]
             c_cum = torch.cumsum(c, dim=-1)
             c_cum_prev = torch.cat([torch.zeros(B, H, 1, device=c.device, dtype=c.dtype), c_cum[:, :, :-1]], dim=-1)
-            diff = (c_cum_prev.unsqueeze(-1) - c_cum.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
+            clamp_min_inter = _clamp_min_for_dtype(dtype)
+            diff = (c_cum_prev.unsqueeze(-1) - c_cum.unsqueeze(-2)).clamp(min=clamp_min_inter, max=0.0)
             strict_tril = torch.tril(torch.ones(NC, NC, device=c.device, dtype=torch.bool), diagonal=-1)
             M_mat = torch.where(strict_tril, torch.exp(diff), torch.zeros_like(diff)).to(dtype)
             S_all = torch.matmul(M_mat, S_local.view(B, H, NC, D * D)).view(B, H, NC, D, D)
@@ -584,20 +641,42 @@ class NativeASDAGAssociativeMixer(nn.Module):
             state_S, state_z = state
 
             if self.rule == "delta":
-                # Delta recurrence, O(1) per step, autograd-exact (used for both
-                # state-carry stepping and short-sequence training):
-                #   S <- gamma * S (I - b k k^T) + b k v^T        (k unit-normalized)
-                #   z <- gamma * z (I - b k k^T) + b k            (delta-aware denom)
-                #   y_t = (q S) / (q z + eps)
+                # Delta recurrence, O(1) per step, autograd-exact.
+                # On CUDA dispatch via torch.compile to avoid Python-loop overhead (no new kernels).
                 beta = self.delta_beta
+                if x.is_cuda:
+                    def _delta_state_loop(phi_q_, phi_k_, v_, gamma_, state_S_, state_z_, beta_):
+                        outs_ = []
+                        S_ = state_S_
+                        z_ = state_z_
+                        for t in range(phi_q_.shape[2]):
+                            q_t = phi_q_[:, :, t]
+                            k_t = phi_k_[:, :, t]
+                            v_t = v_[:, :, t]
+                            gam_t = gamma_[:, :, t]
+                            khat = k_t / (k_t.norm(dim=-1, keepdim=True) + 1e-9)
+                            P = beta_ * (khat.unsqueeze(-1) @ khat.unsqueeze(-2))
+                            S_ = S_ * gam_t[:, :, None, None] - (S_ * gam_t[:, :, None, None]) @ P + beta_ * (khat.unsqueeze(-1) * v_t.unsqueeze(-2))
+                            z_ = z_ * gam_t[:, :, None] - (z_ * khat).sum(dim=-1, keepdim=True) * beta_ * khat + beta_ * khat
+                            num = (q_t.unsqueeze(-2) @ S_).squeeze(-2)
+                            den = (q_t * z_).sum(dim=-1, keepdim=True).clamp(min=1e-5)
+                            outs_.append((num / den).unsqueeze(2))
+                        return torch.cat(outs_, dim=1), S_, z_
+                    try:
+                        compiled = _maybe_compile(_delta_state_loop)
+                        out_cat, state_S, state_z = compiled(phi_q, phi_k, v, gamma, state_S, state_z, beta)
+                        out = out_cat.transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+                        return self.out_proj(out * g), (state_S, state_z)
+                    except Exception as e:
+                        warnings.warn(f"delta state compile failed: {e}; using eager loop", stacklevel=2)
                 outs = []
                 for t in range(T):
-                    q_t = phi_q[:, :, t]                                    # [B, H, D]
+                    q_t = phi_q[:, :, t]
                     k_t = phi_k[:, :, t]
                     v_t = v[:, :, t]
-                    gam_t = gamma[:, :, t]                                  # [B, H]
+                    gam_t = gamma[:, :, t]
                     khat = k_t / (k_t.norm(dim=-1, keepdim=True) + 1e-9)
-                    P = beta * (khat.unsqueeze(-1) @ khat.unsqueeze(-2))     # [B, H, D, D] outer
+                    P = beta * (khat.unsqueeze(-1) @ khat.unsqueeze(-2))
                     state_S = state_S * gam_t[:, :, None, None] - (state_S * gam_t[:, :, None, None]) @ P + beta * (khat.unsqueeze(-1) * v_t.unsqueeze(-2))
                     state_z = state_z * gam_t[:, :, None] - (state_z * khat).sum(dim=-1, keepdim=True) * beta * khat + beta * khat
                     num = (q_t.unsqueeze(-2) @ state_S).squeeze(-2)
@@ -628,7 +707,7 @@ class NativeASDAGAssociativeMixer(nn.Module):
                 out = torch.cat(outs, dim=1).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
                 return self.out_proj(out * g), (state_S, state_z)
             else:
-                # Native PyTorch CUDA recurrent step
+                # Native PyTorch CUDA recurrent step — compile to avoid Python loop overhead
                 if T == 1:
                     q_t = phi_q[:, :, 0]
                     k_t = phi_k[:, :, 0]
@@ -641,6 +720,28 @@ class NativeASDAGAssociativeMixer(nn.Module):
                     out = (num / den).unsqueeze(2).transpose(1, 2).reshape(B, 1, C).to(orig_dtype)
                     return self.out_proj(out * g), (state_S, state_z)
 
+                def _gla_state_loop(phi_q_, phi_k_, v_, gamma_, state_S_, state_z_):
+                    S_ = state_S_
+                    z_ = state_z_
+                    outs_ = []
+                    for t in range(phi_q_.shape[2]):
+                        q_t = phi_q_[:, :, t]
+                        k_t = phi_k_[:, :, t]
+                        v_t = v_[:, :, t]
+                        gam_t = gamma_[:, :, t]
+                        S_ = S_ * gam_t.unsqueeze(-1).unsqueeze(-1) + (k_t.unsqueeze(-1) * v_t.unsqueeze(-2))
+                        z_ = z_ * gam_t.unsqueeze(-1) + k_t
+                        num = torch.matmul(q_t.unsqueeze(-2), S_).squeeze(-2)
+                        den = (q_t * z_).sum(dim=-1, keepdim=True).clamp(min=1e-5)
+                        outs_.append((num / den).unsqueeze(2))
+                    return torch.cat(outs_, dim=1), S_, z_
+                try:
+                    compiled = _maybe_compile(_gla_state_loop)
+                    out_cat, state_S, state_z = compiled(phi_q, phi_k, v, gamma, state_S, state_z)
+                    out = out_cat.transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+                    return self.out_proj(out * g), (state_S, state_z)
+                except Exception as e:
+                    warnings.warn(f"gla state compile failed: {e}; using eager loop", stacklevel=2)
                 outs = []
                 for t in range(T):
                     q_t = phi_q[:, :, t]
@@ -656,14 +757,37 @@ class NativeASDAGAssociativeMixer(nn.Module):
                 return self.out_proj(out * g), (state_S, state_z)
 
         # 3. Delta-rule training forward: sequential recurrence from zero state,
-        #    autograd-exact. Reruns the state branch with S=0, z=0, collecting
-        #    per-step outputs and the final state.
+        #    autograd-exact. Dispatch via torch.compile on CUDA to avoid Python loops.
         if self.rule == "delta":
-            B_, H, T_ = phi_q.shape[0], self.n_heads, T
+            beta = self.delta_beta
+            if x.is_cuda:
+                def _delta_train_loop(phi_q_, phi_k_, v_, gamma_, beta_):
+                    S_ = torch.zeros(phi_q_.shape[0], phi_q_.shape[1], phi_q_.shape[3], phi_q_.shape[3], device=phi_q_.device, dtype=phi_q_.dtype)
+                    z_ = torch.zeros(phi_q_.shape[0], phi_q_.shape[1], phi_q_.shape[3], device=phi_q_.device, dtype=phi_q_.dtype)
+                    outs_ = []
+                    for t in range(phi_q_.shape[2]):
+                        q_t = phi_q_[:, :, t]
+                        k_t = phi_k_[:, :, t]
+                        v_t = v_[:, :, t]
+                        gam_t = gamma_[:, :, t]
+                        khat = k_t / (k_t.norm(dim=-1, keepdim=True) + 1e-9)
+                        P = beta_ * (khat.unsqueeze(-1) @ khat.unsqueeze(-2))
+                        S_ = S_ * gam_t[:, :, None, None] - (S_ * gam_t[:, :, None, None]) @ P + beta_ * (khat.unsqueeze(-1) * v_t.unsqueeze(-2))
+                        z_ = z_ * gam_t[:, :, None] - (z_ * khat).sum(dim=-1, keepdim=True) * beta_ * khat + beta_ * khat
+                        num = (q_t.unsqueeze(-2) @ S_).squeeze(-2)
+                        den = (q_t * z_).sum(dim=-1, keepdim=True).clamp(min=1e-5)
+                        outs_.append((num / den).unsqueeze(2))
+                    return torch.cat(outs_, dim=1), S_, z_
+                try:
+                    compiled = _maybe_compile(_delta_train_loop)
+                    out_cat, state_S, state_z = compiled(phi_q, phi_k, v, gamma, beta)
+                    out = out_cat.transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+                    return self.out_proj(out * g), (state_S, state_z)
+                except Exception as e:
+                    warnings.warn(f"delta train compile failed: {e}; using eager loop", stacklevel=2)
             state_S = phi_q.new_zeros(B, H, D, D)
             state_z = phi_q.new_zeros(B, H, D)
             outs = []
-            beta = self.delta_beta
             for t in range(T):
                 q_t = phi_q[:, :, t]
                 k_t = phi_k[:, :, t]
@@ -687,20 +811,79 @@ class NativeASDAGAssociativeMixer(nn.Module):
             return self.out_proj(y * g), None
 
         eps = 1e-4 if orig_dtype == torch.float16 else 1e-5
-        # Chunked fast path on CUDA avoids materializing dense [B, H, T, T] tensors (Issue 18)
-        # When reset_mask is passed, route to exact same_doc masked path to guarantee zero cross-doc attention
+        clamp_min = _clamp_min_for_dtype(orig_dtype)
+        # Reset-mask path: avoid dense [B,H,T,T] via sequential scan (no T*T alloc).
+        # Uses masked gamma (0 at boundaries) which zeroes decay across docs.
         if reset_mask is not None:
-            # Exact document boundary masking: guarantees 0.0 attention/decay across document boundaries
-            doc_id = torch.cumsum(reset_mask.long(), dim=-1)  # [B, T]
-            same_doc = (doc_id.unsqueeze(-1) == doc_id.unsqueeze(-2)).unsqueeze(1)  # [B, 1, T, T]
-            log_gam = torch.log(gamma.clamp(min=1e-5, max=1.0))
-            cum_log_gam = torch.cumsum(log_gam, dim=-1)
-            decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=-30.0, max=0.0)
-            causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-            decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
-            decay_mat = decay_mat * same_doc
-            scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat
-            scores = scores * same_doc
+            # gamma already masked above (gamma=0 at reset positions) so recurrence resets.
+            # Dispatch via chunked scan or torch.compile, no dense materialization.
+            def _reset_seq(phi_q_, phi_k_, v_, gamma_, eps_):
+                B_ = phi_q_.shape[0]
+                H_ = phi_q_.shape[1]
+                T_ = phi_q_.shape[2]
+                D_ = phi_q_.shape[3]
+                S_ = torch.zeros(B_, H_, D_, D_, device=phi_q_.device, dtype=phi_q_.dtype)
+                z_ = torch.zeros(B_, H_, D_, device=phi_q_.device, dtype=phi_q_.dtype)
+                outs_ = []
+                for t in range(T_):
+                    q_t = phi_q_[:, :, t]
+                    k_t = phi_k_[:, :, t]
+                    v_t = v_[:, :, t]
+                    gam_t = gamma_[:, :, t]
+                    S_ = S_ * gam_t.unsqueeze(-1).unsqueeze(-1) + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
+                    z_ = z_ * gam_t.unsqueeze(-1) + k_t
+                    num = torch.matmul(q_t.unsqueeze(-2), S_).squeeze(-2)
+                    den = (q_t * z_).sum(dim=-1, keepdim=True).clamp(min=eps_)
+                    outs_.append((num / den).unsqueeze(2))
+                y_ = torch.cat(outs_, dim=2).transpose(1, 2).reshape(B_, T_, -1)
+                # -1 will be inferred but need C; caller reshapes with C
+                return y_
+            if x.is_cuda:
+                try:
+                    compiled = _maybe_compile(_reset_seq)
+                    y = compiled(phi_q, phi_k, v, gamma, eps)
+                    # y currently [B,T,?], need reshape to [B,T,C] via transpose logic
+                    # Our helper returns [B,T,C?] but we built with -1; more precise: use phi_q shape
+                    # Instead recompute directly if shape mismatched: fallback to eager
+                    if y.shape != (B, T, C):
+                        # fallback eager path with correct C handling
+                        raise ValueError("shape mismatch, fallback")
+                    return self.out_proj(y.to(orig_dtype) * g), None
+                except Exception as e:
+                    warnings.warn(f"reset_mask sequential compile failed: {e}; using eager loop", stacklevel=2)
+                # Eager fallback
+                S = torch.zeros(B, H, D, D, device=phi_q.device, dtype=phi_q.dtype)
+                z = torch.zeros(B, H, D, device=phi_q.device, dtype=phi_q.dtype)
+                outs = []
+                for t in range(T):
+                    q_t = phi_q[:, :, t]
+                    k_t = phi_k[:, :, t]
+                    v_t = v[:, :, t]
+                    gam_t = gamma[:, :, t]
+                    S = S * gam_t.unsqueeze(-1).unsqueeze(-1) + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
+                    z = z * gam_t.unsqueeze(-1) + k_t
+                    num = torch.matmul(q_t.unsqueeze(-2), S).squeeze(-2)
+                    den = (q_t * z).sum(dim=-1, keepdim=True).clamp(min=eps)
+                    outs.append((num / den).unsqueeze(2))
+                y = torch.cat(outs, dim=2).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+                return self.out_proj(y * g), None
+            else:
+                # CPU: also avoid dense T*T, use same eager loop
+                S = torch.zeros(B, H, D, D, device=phi_q.device, dtype=phi_q.dtype)
+                z = torch.zeros(B, H, D, device=phi_q.device, dtype=phi_q.dtype)
+                outs = []
+                for t in range(T):
+                    q_t = phi_q[:, :, t]
+                    k_t = phi_k[:, :, t]
+                    v_t = v[:, :, t]
+                    gam_t = gamma[:, :, t]
+                    S = S * gam_t.unsqueeze(-1).unsqueeze(-1) + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
+                    z = z * gam_t.unsqueeze(-1) + k_t
+                    num = torch.matmul(q_t.unsqueeze(-2), S).squeeze(-2)
+                    den = (q_t * z).sum(dim=-1, keepdim=True).clamp(min=eps)
+                    outs.append((num / den).unsqueeze(2))
+                y = torch.cat(outs, dim=2).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
+                return self.out_proj(y * g), None
         elif x.is_cuda and not return_state:
             if T <= 64:
                 y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma, T).transpose(1, 2).reshape(B, T, C)
@@ -719,15 +902,27 @@ class NativeASDAGAssociativeMixer(nn.Module):
                 return self.out_proj(y * g), None
         else:
             cum_log_gam = None
-            try:
-                from affine_ai.kernels.triton_gla import triton_gla_decay
-                decay_mat = triton_gla_decay(gamma)
-            except Exception:
-                log_gam = torch.log(gamma.clamp(min=1e-5, max=1.0))              # [B, H, T]
-                cum_log_gam = torch.cumsum(log_gam, dim=-1)                      # [B, H, T]
-                decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=-30.0, max=0.0) # [B, H, T, T]
-                causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-                decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+            decay_mat = None
+            if x.is_cuda and getattr(kernels, "TRITON_AVAILABLE", False) and getattr(kernels, "triton_gla_decay", None) is not None:
+                try:
+                    decay_mat = kernels.triton_gla_decay(gamma)
+                except Exception as e:
+                    warnings.warn(f"triton_gla_decay failed: {e}; using PyTorch fallback", stacklevel=2)
+                    decay_mat = None
+            if decay_mat is None:
+                # Try direct import fallback before PyTorch
+                try:
+                    from affine_ai.kernels.triton_gla import triton_gla_decay as _triton_decay
+                    decay_mat = _triton_decay(gamma)
+                except Exception as e:
+                    if getattr(kernels, "TRITON_AVAILABLE", False):
+                        warnings.warn(f"triton_gla_decay fallback failed: {e}", stacklevel=2)
+                if decay_mat is None:
+                    log_gam = torch.log(gamma.clamp(min=1e-5, max=1.0))              # [B, H, T]
+                    cum_log_gam = torch.cumsum(log_gam, dim=-1)                      # [B, H, T]
+                    decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=clamp_min, max=0.0) # [B, H, T, T]
+                    causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+                    decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
             scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat    # [B, H, T, T]
 
         num = torch.matmul(scores, v)                                        # [B, H, T, D]
@@ -739,10 +934,24 @@ class NativeASDAGAssociativeMixer(nn.Module):
         if return_state:
             if cum_log_gam is None:
                 cum_log_gam = torch.cumsum(torch.log(gamma.clamp(min=1e-5)), dim=-1)
-            t_weights = torch.exp((cum_log_gam[:, :, -1:] - cum_log_gam).unsqueeze(-1).unsqueeze(-1))
-            kv_terms = torch.matmul(phi_k.unsqueeze(-1), v.unsqueeze(-2))
-            next_S = (kv_terms * t_weights).sum(dim=2)
-            next_z = (phi_k * t_weights.squeeze(-1)).sum(dim=2)
+            # Chunked scan to avoid [B,H,T,D,D] alloc (~ B*H*T*D*D floats)
+            chunk = 64
+            next_S = torch.zeros(B, H, D, D, device=phi_q.device, dtype=phi_q.dtype)
+            next_z = torch.zeros(B, H, D, device=phi_q.device, dtype=phi_q.dtype)
+            # cum_last for weight computation
+            cum_last = cum_log_gam[:, :, -1:]  # [B,H,1]
+            for s in range(0, T, chunk):
+                e = min(s + chunk, T)
+                k_c = phi_k[:, :, s:e]  # [B,H,C,D]
+                v_c = v[:, :, s:e]
+                cum_c = cum_log_gam[:, :, s:e]  # [B,H,C]
+                w_c = torch.exp((cum_last - cum_c).unsqueeze(-1).unsqueeze(-1))  # [B,H,C,1,1]
+                # Also need w for z: [B,H,C,1]
+                w_z = torch.exp((cum_last - cum_c).unsqueeze(-1))  # [B,H,C,D? wait]
+                # Compute kv per chunk without full T alloc: [B,H,C,D,D]
+                kv_c = torch.matmul(k_c.unsqueeze(-1), v_c.unsqueeze(-2))  # [B,H,C,D,D]
+                next_S = next_S + (kv_c * w_c).sum(dim=2)
+                next_z = next_z + (k_c * w_z).sum(dim=2)
             next_state = (next_S, next_z)
 
         return self.out_proj(y * g), next_state

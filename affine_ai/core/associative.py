@@ -718,6 +718,7 @@ class NativeASDAGAssociativeMixer(nn.Module):
                 y = y_pad[:, :, :T, :].transpose(1, 2).reshape(B, T, C)
                 return self.out_proj(y * g), None
         else:
+            cum_log_gam = None
             try:
                 from affine_ai.kernels.triton_gla import triton_gla_decay
                 decay_mat = triton_gla_decay(gamma)

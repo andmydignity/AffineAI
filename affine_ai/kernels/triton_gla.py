@@ -35,7 +35,7 @@ def _gla_decay_kernel(
     BLOCK_J: tl.constexpr = 32,
 ):
     if BLOCK <= 64:
-        # Native 3D grid: (cdiv(T, BLOCK), cdiv(T, BLOCK_J), B * H) (Issue 21)
+        # 3D grid is (cdiv(T, BLOCK), cdiv(T, BLOCK_J), B*H); 1D fallback below uses flattened B*H*T*T
         tile_i = tl.program_id(0)
         tile_j = tl.program_id(1)
         bh = tl.program_id(2)
@@ -103,9 +103,15 @@ def _gla_decay_kernel(
 
 
 def triton_gla_decay_fwd(cum_log_gam: torch.Tensor) -> torch.Tensor:
+    """
+    Materializes dense decay matrix [B, H, T, T] (O(T^2) memory).
+    Use only at short T (e.g. T <= 512); for long T use the chunked
+    linear-attention path (triton_gla_linear_attention).
+    Default BLOCK 32.
+    """
     B, H, T = cum_log_gam.shape
     out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=torch.float32)
-    BLOCK = 64
+    BLOCK = 32
     grid = ((T + BLOCK - 1) // BLOCK, (T + BLOCK - 1) // BLOCK, B * H)
     _gla_decay_kernel[grid](
         cum_log_gam, out,

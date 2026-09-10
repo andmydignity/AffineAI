@@ -38,6 +38,32 @@ def _pack_sign_bits_kernel(
 
 
 @triton.jit
+def _popcount32(v):
+    # Portable SWAR popcount (no PTX inline asm); uint32 input so all
+    # shifts are logical (int32 >> would sign-extend and corrupt bit31).
+    v = v - ((v >> 1) & 0x55555555)
+    v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
+    v = (v + (v >> 4)) & 0x0F0F0F0F
+    v = v + (v >> 8)
+    v = v + (v >> 16)
+    v = v & 0x3F
+    return v
+
+
+def _get_popc_dot_configs():
+    return [
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+    ]
+
+
+@triton.autotune(configs=_get_popc_dot_configs(), key=['M', 'N', 'K_WORDS'])
+@triton.jit
 def _popc_dot_kernel(
     X_bits_ptr, W_bits_ptr, Out_ptr,
     stride_xm, stride_xk,
@@ -65,28 +91,13 @@ def _popc_dot_kernel(
         x = tl.load(X_bits_ptr + offs_m[:, None] * stride_xm + k * stride_xk, mask=mask_m[:, None], other=0)
         w = tl.load(W_bits_ptr + offs_n[None, :] * stride_wn + k * stride_wk, mask=mask_n[None, :], other=0)
         diff = x ^ w
-        if (k == K_WORDS - 1) and (rem != 0):
+        # tail masked to keep exact sign-packing layout (bit_i=(x_i>=0))
+        tail = (k == K_WORDS - 1) and (rem != 0)
+        if tail:
             mask = (1 << rem) - 1
             diff = diff & mask
-            pop = tl.inline_asm_elementwise(
-                "popc.b32 $0, $1;",
-                "=r,r",
-                [diff],
-                dtype=tl.int32,
-                is_pure=True,
-                pack=1
-            )
-            sim = rem - 2 * pop
-        else:
-            pop = tl.inline_asm_elementwise(
-                "popc.b32 $0, $1;",
-                "=r,r",
-                [diff],
-                dtype=tl.int32,
-                is_pure=True,
-                pack=1
-            )
-            sim = 32 - 2 * pop
+        pop = _popcount32(diff.to(tl.uint32)).to(tl.int32)
+        sim = tl.where(tail, rem - 2 * pop, 32 - 2 * pop)
         acc += sim
 
     tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, acc, mask=mask_m[:, None] & mask_n[None, :])
@@ -104,14 +115,15 @@ def triton_pack_sign_bits(x: torch.Tensor) -> torch.Tensor:
     K_words = triton.cdiv(D, 32)
 
     out_bits = torch.empty((M, K_words), dtype=torch.int32, device=x.device)
-    grid = (triton.cdiv(M, 64), K_words)
+    BM = 128 if M > 2048 else 64
+    grid = (triton.cdiv(M, BM), K_words)
 
     _pack_sign_bits_kernel[grid](
         x_flat, out_bits,
         x_flat.stride(0), x_flat.stride(1),
         out_bits.stride(0), out_bits.stride(1),
         M, D, K_words,
-        BLOCK_M=64
+        BLOCK_M=BM
     )
     return out_bits.reshape(*orig_shape[:-1], K_words)
 
@@ -145,8 +157,7 @@ def triton_popc_sign_similarity(
     N = w_flat.shape[0]
 
     out = torch.empty((M, N), dtype=torch.int32, device=x_bits.device)
-    BM, BN = 32, 32
-    grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
     _popc_dot_kernel[grid](
         x_flat, w_flat, out,
@@ -156,7 +167,6 @@ def triton_popc_sign_similarity(
         M, N,
         K_WORDS=K_words,
         D=actual_D,
-        BLOCK_M=BM, BLOCK_N=BN
     )
 
     out_reshaped = out.reshape(*orig_shape[:-1], N)

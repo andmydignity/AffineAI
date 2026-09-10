@@ -72,13 +72,15 @@ def test_triton_pot5_fused_swiglu():
     assert out.shape == (B, T, D)
     assert not torch.isnan(out).any()
 
-    # Parity check against fallback
+    # Parity check against fallback (unified alpha-relative thresholds)
     g, u = gate_up.chunk(2, dim=-1)
+    alpha_d = (w_down.float().abs().mean() * 1.4)
+    t_low = alpha_d * 0.25
+    t_high = alpha_d * 0.75
     w_abs = w_down.abs()
     w_sign = w_down.sign()
-    w_full = torch.where(w_abs > 0.75, w_sign, torch.zeros_like(w_down))
-    w_half = torch.where((w_abs > 0.25) & (w_abs <= 0.75), w_sign, torch.zeros_like(w_down))
-    alpha_d = (w_down.float().abs().mean() * 1.4)
+    w_full = torch.where(w_abs > t_high, w_sign, torch.zeros_like(w_down))
+    w_half = torch.where((w_abs > t_low) & (w_abs <= t_high), w_sign, torch.zeros_like(w_down))
     ref_out = (F.silu(g) * u) @ ((w_full + w_half * 0.5) * alpha_d.item()).T
     diff = (out - ref_out).abs().max().item()
     assert diff < 1e-4, f"Fused SwiGLU deviates from reference: {diff}"

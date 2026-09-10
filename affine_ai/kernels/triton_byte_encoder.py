@@ -175,30 +175,31 @@ def _patch_mean_pool_fwd_kernel(
     X_ptr, Out_ptr,
     stride_xb, stride_xt, stride_xd,
     stride_ob, stride_om, stride_od,
-    B, M, T, P: tl.constexpr, D: tl.constexpr,
+    B, M, T, P: tl.constexpr, D_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-
     mask_m = offs_m < M
-    mask_d = offs_d < D
 
-    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     inv_p = 1.0 / P
-    for p in range(P):
-        t = offs_m * P + p
-        mask_t = mask_m & (t < T)
-        x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
-        val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
-        acc += val
+    for d_start in range(0, D_DIM, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D_DIM
 
-    out = acc * inv_p
-    out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        for p in range(P):
+            t = offs_m * P + p
+            mask_t = mask_m & (t < T)
+            x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
+            val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+            acc += val
+
+        out = acc * inv_p
+        out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 @triton.jit
@@ -206,27 +207,28 @@ def _patch_mean_pool_bwd_kernel(
     dOut_ptr, dX_ptr,
     stride_ob, stride_om, stride_od,
     stride_xb, stride_xt, stride_xd,
-    B, M, T, P: tl.constexpr, D: tl.constexpr,
+    B, M, T, P: tl.constexpr, D_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-
     mask_m = offs_m < M
-    mask_d = offs_d < D
 
-    out_ptrs = dOut_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    dout = tl.load(out_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-    scaled_dout = (dout * (1.0 / P)).to(dX_ptr.dtype.element_ty)
+    for d_start in range(0, D_DIM, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D_DIM
 
-    for p in range(P):
-        t = offs_m * P + p
-        mask_t = mask_m & (t < T)
-        x_ptrs = dX_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
-        tl.store(x_ptrs, scaled_dout, mask=mask_t[:, None] & mask_d[None, :])
+        out_ptrs = dOut_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        dout = tl.load(out_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+        scaled_dout = (dout * (1.0 / P)).to(dX_ptr.dtype.element_ty)
+
+        for p in range(P):
+            t = offs_m * P + p
+            mask_t = mask_m & (t < T)
+            x_ptrs = dX_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
+            tl.store(x_ptrs, scaled_dout, mask=mask_t[:, None] & mask_d[None, :])
 
 
 class _TritonPatchMeanPoolFunc(torch.autograd.Function):
@@ -234,16 +236,20 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, P: int) -> torch.Tensor:
         x = x.contiguous()
         B, T, D = x.shape
+        if T % P != 0:
+            raise ValueError(
+                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped"
+            )
         M = T // P
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         BLOCK_M = 16
-        BLOCK_D = triton.next_power_of_2(D)
+        BLOCK_D = min(triton.next_power_of_2(D), 1024)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_fwd_kernel[grid](
             x, out,
             x.stride(0), x.stride(1), x.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
-            B, M, T, P=P, D=D,
+            B, M, T, P=P, D_DIM=D,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
         ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
@@ -256,13 +262,13 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         B, T, D, M, P = ctx.B, ctx.T, ctx.D, ctx.M, ctx.P
         dx = torch.empty((B, T, D), device=dout.device, dtype=ctx.dtype)
         BLOCK_M = 16
-        BLOCK_D = triton.next_power_of_2(D)
+        BLOCK_D = min(triton.next_power_of_2(D), 1024)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_bwd_kernel[grid](
             dout, dx,
             dout.stride(0), dout.stride(1), dout.stride(2),
             dx.stride(0), dx.stride(1), dx.stride(2),
-            B, M, T, P=P, D=D,
+            B, M, T, P=P, D_DIM=D,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
         return dx, None
@@ -283,16 +289,14 @@ def _patch_weighted_pool_fwd_kernel(
     stride_lb, stride_lt,
     stride_ob, stride_om, stride_od,
     stride_wb, stride_wm, stride_wp,
-    B, M, T, P: tl.constexpr, P_POW2: tl.constexpr, D: tl.constexpr,
+    B, M, T, P: tl.constexpr, P_POW2: tl.constexpr, D_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
     mask_m = offs_m < M
-    mask_d = offs_d < D
 
     offs_p = tl.arange(0, P_POW2)
     mask_p = offs_p < P
@@ -312,18 +316,22 @@ def _patch_weighted_pool_fwd_kernel(
     w_ptrs = Weights_ptr + pid_b * stride_wb + offs_m[:, None] * stride_wm + offs_p[None, :] * stride_wp
     tl.store(w_ptrs, w.to(Weights_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_p[None, :])
 
-    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
-    for p in range(P):
-        mask_p_single = offs_p == p
-        w_p = tl.sum(tl.where(mask_p_single[None, :], w, 0.0), axis=1)
-        t = offs_m * P + p
-        mask_t = mask_m & (t < T)
-        x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
-        val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
-        acc += val.to(tl.float32) * w_p[:, None]
+    for d_start in range(0, D_DIM, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D_DIM
 
-    out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    tl.store(out_ptrs, acc.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        for p in range(P):
+            mask_p_single = offs_p == p
+            w_p = tl.sum(tl.where(mask_p_single[None, :], w, 0.0), axis=1)
+            t = offs_m * P + p
+            mask_t = mask_m & (t < T)
+            x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
+            val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+            acc += val.to(tl.float32) * w_p[:, None]
+
+        out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        tl.store(out_ptrs, acc.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
@@ -332,13 +340,17 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         x = x.contiguous()
         logits = logits.contiguous()
         B, T, D = x.shape
+        if T % P != 0:
+            raise ValueError(
+                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped"
+            )
         M = T // P
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         P_POW2 = triton.next_power_of_2(P)
         weights = torch.empty((B, M, P_POW2), device=x.device, dtype=x.dtype)
 
         BLOCK_M = 16
-        BLOCK_D = triton.next_power_of_2(D)
+        BLOCK_D = min(triton.next_power_of_2(D), 1024)
         grid = (triton.cdiv(M, BLOCK_M), B)
 
         _patch_weighted_pool_fwd_kernel[grid](
@@ -347,7 +359,7 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
             logits.stride(0), logits.stride(1),
             out.stride(0), out.stride(1), out.stride(2),
             weights.stride(0), weights.stride(1), weights.stride(2),
-            B, M, T, P=P, P_POW2=P_POW2, D=D,
+            B, M, T, P=P, P_POW2=P_POW2, D_DIM=D,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
 

@@ -23,6 +23,9 @@ def _router_cascade_topk_kernel(
     NLEAF: tl.constexpr, DEPTH: tl.constexpr, TOPK: tl.constexpr,
     MAXW: tl.constexpr, BLOCK_M: tl.constexpr,
 ):
+    # constexpr depth guard to prevent register blowup
+    if DEPTH > 6:
+        return
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < B
@@ -72,7 +75,7 @@ def _router_cascade_topk_kernel(
     wsum = tl.maximum(wsum, 1e-8)
     sel_val = sel_val / wsum[:, None]
     tl.store(TopIdx + offs_m[:, None] * TOPK + tl.arange(0, TOPK)[None, :],
-             sel_idx, mask=mask_m[:, None])
+             sel_idx.to(tl.int64), mask=mask_m[:, None])
     tl.store(TopW + offs_m[:, None] * TOPK + tl.arange(0, TOPK)[None, :],
              sel_val, mask=mask_m[:, None])
 
@@ -85,6 +88,11 @@ def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):
     B, I = node_logits.shape
     if num_leaves is None:
         num_leaves = 1 << tree_depth
+    # depth guard for register blowup (MAXW=1<<DEPTH lives in registers)
+    if tree_depth > 6:
+        raise ValueError(f"tree_depth {tree_depth} exceeds Triton kernel guard (MAXW=1<<DEPTH would blow registers); use torch fallback")
+    if (1 << tree_depth) > 64:
+        raise ValueError("MAXW exceeds 64 register limit")
     top_k = min(top_k, num_leaves)
     top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int64)
     top_w = torch.empty((B, top_k), device=node_logits.device, dtype=torch.float32)

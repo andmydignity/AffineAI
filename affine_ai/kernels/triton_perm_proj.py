@@ -24,38 +24,116 @@ def _fused_perm_proj_fwd_kernel(
     stride_pp, stride_pd,
     stride_bm, stride_bd,
     stride_om, stride_on, stride_od,
-    N, D, P, M,
+    N, D, P,
+    M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_d = tl.program_id(1)
-    pid_m = tl.program_id(2)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_n = offs_n < N
     mask_d = offs_d < D
 
-    acc = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+    # X tile loaded once per P and reused across M; M tiled in chunks of 8
+    # so arbitrary branch counts work (M<=8 fast path, loop for more).
+    for m_base in range(0, M, 8):
+        acc0 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc4 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc5 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc6 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc7 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
 
-    if HAS_BIAS:
-        bias_val = tl.load(Biases + pid_m * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0)
-    else:
-        bias_val = 0.0
+        for p in range(P):
+            p_idx = tl.load(Perms + p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
+            x_ptrs = X + offs_n[:, None] * stride_xn + p_idx[None, :] * stride_xd
+            x_val = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            if M > m_base + 0:
+                w0 = tl.load(W + (m_base + 0) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc0 = acc0 + x_val * w0[None, :]
+            if M > m_base + 1:
+                w1 = tl.load(W + (m_base + 1) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc1 = acc1 + x_val * w1[None, :]
+            if M > m_base + 2:
+                w2 = tl.load(W + (m_base + 2) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc2 = acc2 + x_val * w2[None, :]
+            if M > m_base + 3:
+                w3 = tl.load(W + (m_base + 3) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc3 = acc3 + x_val * w3[None, :]
+            if M > m_base + 4:
+                w4 = tl.load(W + (m_base + 4) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc4 = acc4 + x_val * w4[None, :]
+            if M > m_base + 5:
+                w5 = tl.load(W + (m_base + 5) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc5 = acc5 + x_val * w5[None, :]
+            if M > m_base + 6:
+                w6 = tl.load(W + (m_base + 6) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc6 = acc6 + x_val * w6[None, :]
+            if M > m_base + 7:
+                w7 = tl.load(W + (m_base + 7) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+                acc7 = acc7 + x_val * w7[None, :]
 
-    for p in range(P):
-        p_idx = tl.load(Perms + p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
-        x_ptrs = X + offs_n[:, None] * stride_xn + p_idx[None, :] * stride_xd
-        w_ptrs = W + pid_m * stride_wm + p * stride_wp + offs_d[None, :] * stride_wd
-
-        x_val = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-        w_val = tl.load(w_ptrs, mask=mask_d[None, :], other=0.0)
-        acc += x_val.to(tl.float32) * w_val.to(tl.float32)
-
-    acc += bias_val.to(tl.float32) if HAS_BIAS else 0.0
-    out_ptrs = Out + pid_m * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
-    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 0:
+            acc = acc0
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 0) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 0) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 1:
+            acc = acc1
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 1) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 1) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 2:
+            acc = acc2
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 2) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 2) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 3:
+            acc = acc3
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 3) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 3) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 4:
+            acc = acc4
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 4) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 4) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 5:
+            acc = acc5
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 5) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 5) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 6:
+            acc = acc6
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 6) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 6) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        if M > m_base + 7:
+            acc = acc7
+            if HAS_BIAS:
+                bias_val = tl.load(Biases + (m_base + 7) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+                acc = acc + bias_val[None, :]
+            out_ptrs = Out + (m_base + 7) * stride_om + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
 
 @triton.jit
@@ -141,15 +219,22 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
         assert D == Dw, f"Dimension mismatch: x has dim {D}, w has dim {Dw}"
 
         w_c = w.contiguous()
-        perms_c = perms.to(dtype=torch.long).contiguous()
-        inv_perms_c = inv_perms.to(dtype=torch.long).contiguous()
+        # avoid per-forward .long() copies: require/cache
+        if perms.dtype == torch.long and perms.is_contiguous():
+            perms_c = perms
+        else:
+            perms_c = perms.to(dtype=torch.long).contiguous()
+        if inv_perms.dtype == torch.long and inv_perms.is_contiguous():
+            inv_perms_c = inv_perms
+        else:
+            inv_perms_c = inv_perms.to(dtype=torch.long).contiguous()
         has_bias = biases is not None
         biases_c = biases.contiguous() if has_bias else torch.empty(0, device=x.device, dtype=x.dtype)
 
         out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
 
         BN, BD = min(64, triton.next_power_of_2(N)), min(64, triton.next_power_of_2(D))
-        grid = (triton.cdiv(N, BN), triton.cdiv(D, BD), M)
+        grid = (triton.cdiv(N, BN), triton.cdiv(D, BD))
 
         _fused_perm_proj_fwd_kernel[grid](
             x_flat, w_c, perms_c, biases_c, out,

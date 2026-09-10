@@ -58,13 +58,16 @@ def _monarch_chain_fwd_kernel(
     mask_m = offs_m < N
     mask_d = offs_d < D
 
-    p = tl.load(P + offs_d, mask=mask_d, other=0)
-    w = tl.load(W + offs_d, mask=mask_d, other=0.0)
-    b = tl.load(Bias + offs_d, mask=mask_d, other=0.0)
+    # P/W/B reused across N tiles -> cache-friendly; gather X via permuted index is streaming.
+    # Use eviction_policy to keep P/W in cache while evicting streaming gather loads.
+    p = tl.load(P + offs_d, mask=mask_d, other=0, eviction_policy="evict_first")
+    w = tl.load(W + offs_d, mask=mask_d, other=0.0, eviction_policy="evict_first")
+    b = tl.load(Bias + offs_d, mask=mask_d, other=0.0, eviction_policy="evict_first")
 
     xv = tl.load(
         X + offs_m[:, None] * stride_xm + p[None, :] * stride_xd,
         mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+        eviction_policy="evict_last",
     )
     y = b[None, :] + w[None, :] * xv
     tl.store(
@@ -92,13 +95,14 @@ def _fused_monarch_chain_fwd_kernel(
     mask_m = offs_m < N
     mask_d = offs_d < D
 
-    p = tl.load(P + offs_d, mask=mask_d, other=0)
-    w = tl.load(W + br * stride_wm + offs_d * stride_wd, mask=mask_d, other=0.0)
-    b = tl.load(Bias + br * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0)
+    p = tl.load(P + offs_d, mask=mask_d, other=0, eviction_policy="evict_first")
+    w = tl.load(W + br * stride_wm + offs_d * stride_wd, mask=mask_d, other=0.0, eviction_policy="evict_first")
+    b = tl.load(Bias + br * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0, eviction_policy="evict_first")
 
     xv = tl.load(
         X + offs_m[:, None] * stride_xm + p[None, :] * stride_xd,
         mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+        eviction_policy="evict_last",
     )
     y = b[None, :] + w[None, :] * xv
     tl.store(
@@ -117,7 +121,7 @@ def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: to
 
     W, P = precompute_monarch_composed_single(diagonals, perms)
     out = torch.empty((N, D), device=x.device, dtype=x.dtype)
-    BLOCK_M, BLOCK_D = 32, 32
+    BLOCK_M, BLOCK_D = 64, 64
     grid = ((N + BLOCK_M - 1) // BLOCK_M, (D + BLOCK_D - 1) // BLOCK_D)
     _monarch_chain_fwd_kernel[grid](
         x, W, P, bias, out,
@@ -140,7 +144,7 @@ def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, per
 
     W, P = precompute_monarch_composed_fused(diagonals, perms)
     out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
-    BLOCK_M, BLOCK_D = 32, 32
+    BLOCK_M, BLOCK_D = 64, 64
     grid = ((N + BLOCK_M - 1) // BLOCK_M, (D + BLOCK_D - 1) // BLOCK_D, M)
     _fused_monarch_chain_fwd_kernel[grid](
         x, W, P, bias, out,
@@ -167,16 +171,10 @@ class TritonMonarchChainFunction(torch.autograd.Function):
         orig_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
         num_stages = diagonals.shape[0]
-        
+
         out = triton_monarch_chain_fwd(x_flat, diagonals, perms, bias)
-        
-        # Save intermediate activations for transposed analytical backward pass
-        h_list = [x_flat * diagonals[0]]
-        for s in range(num_stages - 2):
-            h_next = h_list[-1][:, perms[s]] * diagonals[s + 1]
-            h_list.append(h_next)
-            
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, *h_list)
+
+        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
         ctx.num_stages = num_stages
         ctx.orig_shape = orig_shape
         ctx.orig_dtype = x.dtype
@@ -184,24 +182,26 @@ class TritonMonarchChainFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        saved = ctx.saved_tensors
-        x_flat = saved[0]
-        diagonals = saved[1]
-        perms = saved[2]
-        inv_perms = saved[3]
+        x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
         num_stages = ctx.num_stages
-        h_list = saved[4:]
-        
+
+        h_list = []
+        if num_stages > 1:
+            h_list.append(x_flat * diagonals[0])
+            for s in range(num_stages - 2):
+                h_next = h_list[-1][:, perms[s]] * diagonals[s + 1]
+                h_list.append(h_next)
+
         go_flat = grad_out.reshape(-1, grad_out.shape[-1]).to(diagonals.dtype)
         g_bias = go_flat.sum(0)
         g_diagonals = torch.empty_like(diagonals)
         gh = go_flat
-        
+
         for s in range(num_stages - 1, 0, -1):
             h_perm = h_list[s - 1][:, perms[s - 1]]
             g_diagonals[s] = (gh * h_perm).sum(0)
             gh = (gh * diagonals[s])[:, inv_perms[s - 1]]
-            
+
         g_diagonals[0] = (gh * x_flat).sum(0)
         gx = (gh * diagonals[0]).to(ctx.orig_dtype)
         return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
@@ -221,15 +221,10 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
         x_flat = x.reshape(-1, x.shape[-1]).to(diagonals.dtype)
         num_branches = diagonals.shape[0]
         num_stages = diagonals.shape[1]
-        
+
         out = triton_fused_monarch_chain_fwd(x_flat, diagonals, perms, bias) # [M, N, dim]
-        
-        h_list = [x_flat.unsqueeze(0) * diagonals[:, 0].unsqueeze(1)]
-        for s in range(num_stages - 2):
-            h_next = h_list[-1][:, :, perms[s]] * diagonals[:, s + 1].unsqueeze(1)
-            h_list.append(h_next)
-            
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, *h_list)
+
+        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
         ctx.num_branches = num_branches
         ctx.num_stages = num_stages
         ctx.orig_shape = orig_shape
@@ -238,24 +233,26 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outs):
-        saved = ctx.saved_tensors
-        x_flat = saved[0]
-        diagonals = saved[1]
-        perms = saved[2]
-        inv_perms = saved[3]
+        x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
         num_stages = ctx.num_stages
-        h_list = saved[4:]
-        
+
+        h_list = []
+        if num_stages > 1:
+            h_list.append(x_flat.unsqueeze(0) * diagonals[:, 0].unsqueeze(1))
+            for s in range(num_stages - 2):
+                h_next = h_list[-1][:, :, perms[s]] * diagonals[:, s + 1].unsqueeze(1)
+                h_list.append(h_next)
+
         g_stack = torch.stack([g.reshape(-1, g.shape[-1]).to(diagonals.dtype) for g in grad_outs], dim=0) # [M, N, dim]
         g_bias = g_stack.sum(1)
-        g_diagonals = torch.empty_like(diagonals)
+        g_diagonals = torch.zeros_like(diagonals)
         gh = g_stack
-        
+
         for s in range(num_stages - 1, 0, -1):
             h_perm = h_list[s - 1][:, :, perms[s - 1]]
             g_diagonals[:, s] = (gh * h_perm).sum(1)
             gh = (gh * diagonals[:, s].unsqueeze(1))[:, :, inv_perms[s - 1]]
-            
+
         g_diagonals[:, 0] = (gh * x_flat.unsqueeze(0)).sum(1)
         gx = (gh * diagonals[:, 0].unsqueeze(1)).sum(0).to(ctx.orig_dtype)
         return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias

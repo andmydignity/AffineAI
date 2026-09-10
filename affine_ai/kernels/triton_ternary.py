@@ -219,51 +219,18 @@ def _ternary_gw_kernel_fast(
     )
 
 
-@triton.jit
-def _ternary_gw_kernel(
-    GO, X, AMAX, GW,
-    stride_gm, stride_gn,
-    stride_xm, stride_xk,
-    stride_wm, stride_wk,
-    M, N, K,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    # GW [N, K] = GO^T [N, M] @ X_q [M, K]; pid over (n, k), loop over m.
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_m = tl.arange(0, BLOCK_M)
-    mask_n = offs_n < N
-    mask_k = offs_k < K
-    acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
-    for m in range(0, M, BLOCK_M):
-        mm = m + offs_m
-        mask_m = mm < M
-        go = tl.load(
-            GO + mm[:, None] * stride_gm + offs_n[None, :] * stride_gn,
-            mask=mask_m[:, None] & mask_n[None, :], other=0.0,
-        )
-        amax = tl.load(AMAX + mm, mask=mask_m, other=1e-5)
-        amax = tl.maximum(amax, 1e-5)
-        sc = 127.0 / amax
-        x = tl.load(
-            X + mm[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=mask_m[:, None] & mask_k[None, :], other=0.0,
-        )
-        v = x * sc[:, None]
-        av = tl.abs(v)
-        f = tl.floor(av)
-        frac = av - f
-        odd = f - 2.0 * tl.floor(f * 0.5)
-        up = (frac > 0.5) | ((frac == 0.5) & (odd == 1.0))
-        mag = f + up.to(tl.float32)
-        xq = tl.where(v < 0.0, -mag, mag) / sc[:, None]
-        acc += tl.dot(tl.trans(go), xq, input_precision="ieee")
-    tl.store(
-        GW + offs_n[:, None] * stride_wm + offs_k[None, :] * stride_wk,
-        acc, mask=mask_n[:, None] & mask_k[None, :],
-    )
+class _TernaryGwStub:
+    def __getitem__(self, grid):
+        def _launcher(GO, X, AMAX, GW, stride_gm, stride_gn, stride_xm, stride_xk, stride_wm, stride_wk, M, N, K, BLOCK_M=64, BLOCK_N=32, BLOCK_K=64, num_warps=4, num_stages=2):
+            x_q = triton_quantize_x(X, AMAX)
+            _ternary_gw_kernel_fast[grid](
+                GO, x_q, GW,
+                stride_gm, stride_gn, x_q.stride(0), x_q.stride(1), stride_wm, stride_wk,
+                M, N, K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=num_warps, num_stages=num_stages,
+            )
+        return _launcher
+
+_ternary_gw_kernel = _TernaryGwStub()
 
 
 @triton.jit
@@ -306,17 +273,11 @@ def _ternary_twin_fwd_kernel(
         up = (frac > 0.5) | ((frac == 0.5) & (odd == 1.0))
         mag = f + up.to(tl.float32)
         xq = tl.where(v < 0.0, -mag, mag)
-        mask_w1 = mask_n[:, None] & mask_k[None, :] & first[:, None]
-        mask_w2 = mask_n[:, None] & mask_k[None, :] & (~first[:, None])
-        w1 = tl.load(
-            W1 + (offs_n % O)[:, None] * stride_wm + kk[None, :] * stride_wk,
-            mask=mask_w1, other=0.0,
-        )
-        w2 = tl.load(
-            W2 + (offs_n % O)[:, None] * stride_wm + kk[None, :] * stride_wk,
-            mask=mask_w2, other=0.0,
-        )
-        w = tl.where(first[:, None], w1, w2)
+        offs_n_mod = offs_n % O
+        ptr1 = W1 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk
+        ptr2 = W2 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk
+        ptr = tl.where(first[:, None], ptr1, ptr2)
+        w = tl.load(ptr, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
         if USE_TC:
             acc += tl.dot(xq.to(tl.bfloat16), tl.trans(w.to(tl.bfloat16))) * gam[None, :]
         else:
@@ -381,6 +342,24 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
     out = torch.empty((M, N), device=x.device, dtype=torch.float32)
     has_bias = bias is not None
     tc = _resolve_tc(use_tc, x) and _tc_ok(x2d)
+    BLOCK_M_T = 64
+    BLOCK_N_T = 64
+    BLOCK_K_T = 32
+    n_tiles = (N + BLOCK_N_T - 1) // BLOCK_N_T
+    if n_tiles > 2 and x2d.is_cuda:
+        try:
+            x_q = triton_quantize_x(x2d, amax)
+            w_scaled = (w_tern * float(gamma)).contiguous()
+            _fp32_dot_kernel[_grid(M, N, BLOCK_M_T, BLOCK_N_T)](
+                x_q, w_scaled, out, bias if has_bias else x2d,
+                x_q.stride(0), x_q.stride(1), w_scaled.stride(0), w_scaled.stride(1),
+                out.stride(0), out.stride(1),
+                M, N, K,
+                BLOCK_M=BLOCK_M_T, BLOCK_N=BLOCK_N_T, BLOCK_K=BLOCK_K_T,
+                HAS_BIAS=has_bias, num_warps=4, num_stages=3)
+            return out.reshape(*x.shape[:-1], N)
+        except Exception:
+            pass
     try:
         _ternary_fwd_kernel[_grid(M, N)](
             x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),
@@ -590,20 +569,67 @@ def triton_unpack_ternary_2bit(
     return unpacked
 
 
+@triton.jit
+def _pack_2bit_kernel(
+    W_ptr, Packed_ptr,
+    stride_wm, stride_wk,
+    stride_pm, stride_pk,
+    Rows, Cols,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_p = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < Rows
+    mask_p = offs_p < (Cols // 16)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for i in range(16):
+        cols = offs_p * 16 + i
+        w = tl.load(
+            W_ptr + offs_m[:, None] * stride_wm + cols[None, :] * stride_wk,
+            mask=mask_m[:, None] & mask_p[None, :], other=0.0,
+        )
+        code = tl.where(w == 1.0, 1, tl.where(w == -1.0, 2, 0)).to(tl.int32)
+        shift = (i // 4) * 8 + (3 - (i % 4)) * 2
+        acc = acc | (code << shift)
+    tl.store(
+        Packed_ptr + offs_m[:, None] * stride_pm + offs_p[None, :] * stride_pk,
+        acc, mask=mask_m[:, None] & mask_p[None, :],
+    )
+
+
 def triton_pack_ternary_2bit(w_ternary: torch.Tensor) -> torch.Tensor:
-    """
-    Packs a 2D ternary tensor {-1, 0, 1} into 2-bit packed int32 tensor.
-    w_ternary: [Rows, Cols] tensor with Cols % 16 == 0.
-    Returns: [Rows, Cols // 16] int32 tensor.
-    """
     Rows, Cols = w_ternary.shape
     assert Cols % 16 == 0, f"Cols must be divisible by 16, got {Cols}"
-    w_int8 = w_ternary.to(torch.int8)
-    # Map 0 -> 0, 1 -> 1, -1 -> 2
-    mapped = torch.where(w_int8 == 1, 1, torch.where(w_int8 == -1, 2, 0)).to(torch.int32)
-    packed = torch.zeros((Rows, Cols // 16), dtype=torch.int32, device=w_ternary.device)
-    for i in range(16):
-        shift = (i // 4) * 8 + (3 - (i % 4)) * 2
-        packed |= (mapped[:, i::16] << shift)
-    return packed
+    if not w_ternary.is_cuda:
+        w_int8 = w_ternary.to(torch.int8)
+        mapped = torch.where(w_int8 == 1, 1, torch.where(w_int8 == -1, 2, 0)).to(torch.int32)
+        packed = torch.zeros((Rows, Cols // 16), dtype=torch.int32, device=w_ternary.device)
+        for i in range(16):
+            shift = (i // 4) * 8 + (3 - (i % 4)) * 2
+            packed |= (mapped[:, i::16] << shift)
+        return packed
+    try:
+        packed = torch.empty((Rows, Cols // 16), dtype=torch.int32, device=w_ternary.device)
+        BLOCK_M = 32
+        BLOCK_N = 32
+        grid = ((Rows + BLOCK_M - 1) // BLOCK_M, (Cols // 16 + BLOCK_N - 1) // BLOCK_N)
+        _pack_2bit_kernel[grid](
+            w_ternary, packed,
+            w_ternary.stride(0), w_ternary.stride(1),
+            packed.stride(0), packed.stride(1),
+            Rows, Cols,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            num_warps=4,
+        )
+        return packed
+    except Exception:
+        w_int8 = w_ternary.to(torch.int8)
+        mapped = torch.where(w_int8 == 1, 1, torch.where(w_int8 == -1, 2, 0)).to(torch.int32)
+        packed = torch.zeros((Rows, Cols // 16), dtype=torch.int32, device=w_ternary.device)
+        for i in range(16):
+            shift = (i // 4) * 8 + (3 - (i % 4)) * 2
+            packed |= (mapped[:, i::16] << shift)
+        return packed
 

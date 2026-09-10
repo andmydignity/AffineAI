@@ -59,17 +59,17 @@ def _swiglu_down_fwd_kernel(
         sig = tl.sigmoid(gate_f)
         h_act = (gate_f * sig) * val_f
 
-        # Save h_act to DRAM once across k-tiles for backward pass
+        # Save h_act to DRAM in fp32 for numerical stability (or recompute in bwd)
         if pid_k == 0:
             h_ptrs = H_ACT + offs_m[:, None] * stride_hm + offs_n[None, :] * stride_hn
-            tl.store(h_ptrs, h_act.to(H_ACT.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+            tl.store(h_ptrs, h_act.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :])
 
         # Load W_down tile [K, N] transposed to [N, K]
         wd_ptrs = W_D + offs_k[None, :] * stride_wdk + offs_n[:, None] * stride_wdn
         wd = tl.load(wd_ptrs, mask=mask_k[None, :] & mask_n[:, None], other=0.0)
 
-        # Tensor Core dot-product accumulation in SRAM
-        acc += tl.dot(h_act.to(W_D.dtype.element_ty), wd, out_dtype=tl.float32)
+        # Tensor Core dot-product accumulation in SRAM (ieee for fp32)
+        acc += tl.dot(h_act.to(W_D.dtype.element_ty), wd, out_dtype=tl.float32, input_precision="ieee")
 
     acc = acc * gamma_d
     out_ptrs = OUT + offs_m[:, None] * stride_outm + offs_k[None, :] * stride_outk
@@ -117,7 +117,7 @@ def _swiglu_bwd_kernel(
         wd_ptrs = W_D + offs_k[:, None] * stride_wdk + offs_n[None, :] * stride_wdn
         wd = tl.load(wd_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
 
-        g_hact += tl.dot(go, wd, out_dtype=tl.float32)
+        g_hact += tl.dot(go, wd, out_dtype=tl.float32, input_precision="ieee")
 
     g_hact = g_hact * gamma_d
 
@@ -181,9 +181,9 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
 
         # Step 2 & 3: Fused in-SRAM SiLU(gate) * val + Down projection via Triton
         out = torch.empty((M, K), device=x_flat.device, dtype=x_flat.dtype)
-        h_act = torch.empty((M, N), device=x_flat.device, dtype=x_flat.dtype)
+        h_act = torch.empty((M, N), device=x_flat.device, dtype=torch.float32)
 
-        BM, BN, BK = 64, 64, 64
+        BM, BN, BK = 32, 32, 32
         grid_fwd = (triton.cdiv(M, BM), triton.cdiv(K, BK))
         _swiglu_down_fwd_kernel[grid_fwd](
             gv, w_d_q, out, h_act,
@@ -194,6 +194,7 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             gamma_d_tensor,
             M, N, K,
             BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+            num_warps=4, num_stages=1,
         )
 
         ctx.save_for_backward(x_flat, w_gv_q, w_d_q, gv, h_act, gamma_gv, gamma_d_tensor)
@@ -209,11 +210,12 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         N = h_act.shape[1]
 
         # 1. Gradients for W_down (STE: grad flows through quantized weights scaled by gamma)
-        g_w_down = torch.matmul(go_flat.t(), h_act) * gamma_d.to(go_flat.dtype) if ctx.needs_input_grad[2] else None
+        # h_act is stored fp32 for precision; cast to go dtype for the cuBLAS matmul.
+        g_w_down = torch.matmul(go_flat.t(), h_act.to(go_flat.dtype)) * gamma_d.to(go_flat.dtype) if ctx.needs_input_grad[2] else None
 
         # 2. Gradients through SwiGLU non-linearity directly fused in SRAM
         g_gv = torch.empty((M, 2 * N), dtype=x_flat.dtype, device=x_flat.device)
-        BM, BN, BK = 64, 64, 64
+        BM, BN, BK = 32, 32, 32
         grid_bwd = (triton.cdiv(M, BM), triton.cdiv(N, BN))
         _swiglu_bwd_kernel[grid_bwd](
             go_flat, w_d_q, gv, g_gv,
@@ -224,6 +226,7 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             gamma_d,
             M, N, K,
             BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+            num_warps=4, num_stages=1,
         )
 
         # 3. Gradients for W_gate_val & X (STE)

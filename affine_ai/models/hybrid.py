@@ -630,8 +630,8 @@ class TorosHybridLanguageModel(nn.Module):
         elif h_byte_det.is_cuda and torch.is_grad_enabled() and not return_sample_loss:
             try:
                 from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
-                _, h_decoded = self.byte_decoder(
-                    h_byte_det, causal, patch_assignments, return_hidden=True, return_logits=False
+                logits, h_decoded = self.byte_decoder(
+                    h_byte_det, causal, patch_assignments, return_hidden=True, return_logits=True
                 )
                 lm_head = self.byte_decoder.lm_head
                 if hasattr(lm_head, "quantize_input_and_weight"):
@@ -639,9 +639,11 @@ class TorosHybridLanguageModel(nn.Module):
                     loss_final = triton_fused_linear_cross_entropy(h_in, w_in, targets, ignore_index=ignore_index)
                 else:
                     loss_final = triton_fused_linear_cross_entropy(h_decoded, lm_head.weight, targets, ignore_index=ignore_index)
-                # NaN guard: Triton kernel can overflow on wide BF16 models; fall through to fp32
-                if loss_final.isnan().any():
-                    raise RuntimeError("triton CE returned NaN")
+                # Branchless NaN fallback (capture-safe): fp32 CE over the same
+                # logits. A .isnan().any() bool check here would host-sync and
+                # invalidate CUDA graph capture.
+                fb_loss = F.cross_entropy(logits.float().view(-1, 256), targets.view(-1), ignore_index=ignore_index).to(loss_final.dtype)
+                loss_final = torch.where(loss_final.isnan(), fb_loss, loss_final)
             except Exception:
                 logits = self.byte_decoder(h_byte_det, causal, patch_assignments)
                 loss_final = F.cross_entropy(logits.float().view(-1, 256), targets.view(-1), ignore_index=ignore_index)

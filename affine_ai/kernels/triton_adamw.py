@@ -36,6 +36,8 @@ def _adamw_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
+    # compiler hints for better pipelining
+    offs = tl.max_contiguous(tl.multiple_of(offs, 8), BLOCK_SIZE)
 
     # 1. Load parameter, gradient, and moment states into registers
     if HAS_MASTER:
@@ -153,7 +155,13 @@ class TritonAdamW(Optimizer):
 
                 if p.is_cuda:
                     N = p_data.numel()
-                    BLOCK_SIZE = 1024
+                    # larger BLOCK for big tensors to reduce launch overhead (capped at 1024 threads)
+                    if N > 1 << 18:
+                        BLOCK_SIZE = 1024
+                    elif N > 1 << 14:
+                        BLOCK_SIZE = 512
+                    else:
+                        BLOCK_SIZE = 256
                     grid = (triton.cdiv(N, BLOCK_SIZE),)
                     _adamw_kernel[grid](
                         p_data,

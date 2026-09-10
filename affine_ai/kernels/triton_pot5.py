@@ -34,6 +34,62 @@ except ImportError:
     HAS_TRITON = False
 
 
+# ---------------------------------------------------------------------------
+# Single documented 5-state POT quantization rule (shared everywhere)
+# ---------------------------------------------------------------------------
+# Central rule: given per-tensor scale alpha (default 1.4 * mean(|w|)),
+# thresholds are t_low = 0.25 * alpha, t_high = 0.75 * alpha.
+#   |w| <= t_low          -> 0
+#   t_low < |w| <= t_high -> 0.5 * sign(w)
+#   |w| >  t_high         -> 1.0 * sign(w)
+# Effective weight w_q = q * alpha where q in {-1, -0.5, 0, 0.5, 1.0}.
+# Triton kernels inline the same rule device-side:
+#   w_eff = where(abs>0.75*alpha, sign, where(abs>0.25*alpha, sign*0.5, 0))
+# Python fallbacks use _pot5_thresholds / _pot5_quantize_weight without
+# host sync (no alpha.item() on CUDA paths).
+# Pack path (pack_pot5_gpu_3bitplane) intentionally uses std-relative
+# thresholds t0=0.35*std, t1=0.9*std to stay bit-exact with training-time
+# pot5_quantize (affine_ai.core.ast_dag) and .toros format. Bitpacked
+# inference reproduces training numerics because decompression is a LUT
+# (unpack_pot5_gpu_3bitplane) that scales by the stored alpha and never
+# recomputes thresholds at matmul time (see conversion helper
+# _pot5_alpha_levels_for_comparison). For online master-weight matmuls
+# the same alpha-relative rule is used everywhere else.
+
+def _pot5_thresholds(alpha: torch.Tensor):
+    t_low = alpha * 0.25
+    t_high = alpha * 0.75
+    return t_low, t_high
+
+
+def _pot5_quantize_weight(w: torch.Tensor, alpha: torch.Tensor):
+    w_f = w.float()
+    alpha_f = alpha.to(w_f.device).float()
+    t_low = alpha_f * 0.25
+    t_high = alpha_f * 0.75
+    w_abs = w_f.abs()
+    w_sign = w_f.sign()
+    w_full = torch.where(w_abs > t_high, w_sign, torch.zeros_like(w_f))
+    w_half = torch.where((w_abs > t_low) & (w_abs <= t_high), w_sign, torch.zeros_like(w_f))
+    return (w_full + w_half * 0.5) * alpha_f
+
+
+def _pot5_quantize_int8_levels(w: torch.Tensor, alpha: torch.Tensor):
+    w_f = w.float()
+    alpha_f = alpha.to(w_f.device).float()
+    t_low = alpha_f * 0.25
+    t_high = alpha_f * 0.75
+    w_abs = w_f.abs()
+    w_sign = w_f.sign()
+    w_full = torch.where(w_abs > t_high, w_sign * 2.0, torch.zeros_like(w_f))
+    w_half = torch.where((w_abs > t_low) & (w_abs <= t_high), w_sign, torch.zeros_like(w_f))
+    return (w_full + w_half).to(torch.int8)
+
+
+def _pot5_alpha_levels_for_comparison(w: torch.Tensor, alpha: torch.Tensor):
+    return _pot5_quantize_weight(w, alpha)
+
+
 if HAS_TRITON:
     @triton.autotune(
         configs=[
@@ -280,14 +336,8 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
             )
             return y.reshape(*orig_shape[:-1], N)
         else:
-            # Vectorized PyTorch reference fallback
-            w_f = w.float()
-            w_abs = w_f.abs()
-            w_sign = w_f.sign()
-            alpha_val = alpha.item()
-            w_full = torch.where(w_abs > (alpha_val * 0.75), w_sign, torch.zeros_like(w_f))
-            w_half = torch.where((w_abs > (alpha_val * 0.25)) & (w_abs <= (alpha_val * 0.75)), w_sign, torch.zeros_like(w_f))
-            w_eff = (w_full + w_half * 0.5) * alpha_val
+            # Vectorized PyTorch reference fallback (unified thresholds, no host sync)
+            w_eff = _pot5_quantize_weight(w, alpha)
             out = F.linear(x_2d, w_eff.to(x.dtype))
             return out.reshape(*orig_shape[:-1], N)
 
@@ -302,12 +352,14 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
         galpha = None
 
         w_f = w.float()
+        alpha_f = alpha.to(w_f.device).float()
+        t_low = alpha_f * 0.25
+        t_high = alpha_f * 0.75
         w_abs = w_f.abs()
         w_sign = w_f.sign()
-        alpha_val = alpha.item()
-        w_full = torch.where(w_abs > (alpha_val * 0.75), w_sign, torch.zeros_like(w_f))
-        w_half = torch.where((w_abs > (alpha_val * 0.25)) & (w_abs <= (alpha_val * 0.75)), w_sign, torch.zeros_like(w_f))
-        w_eff = (w_full + w_half * 0.5) * alpha_val
+        w_full = torch.where(w_abs > t_high, w_sign, torch.zeros_like(w_f))
+        w_half = torch.where((w_abs > t_low) & (w_abs <= t_high), w_sign, torch.zeros_like(w_f))
+        w_eff = (w_full + w_half * 0.5) * alpha_f
 
         if ctx.needs_input_grad[0]:
             gx = (go_2d @ w_eff.to(go_2d.dtype)).reshape(orig_shape)
@@ -350,14 +402,8 @@ def triton_pot5_int8_linear(
     sx = (amax_x / 127.0).to(torch.float32)
     x_int8 = (x_2d / sx).round().clamp(-128, 127).to(torch.int8)
 
-    # Quantize weights to {-2, -1, 0, 1, 2}
-    w_f = w.float()
-    w_abs = w_f.abs()
-    w_sign = w_f.sign()
-    alpha_val = alpha.item()
-    w_full = torch.where(w_abs > (alpha_val * 0.75), w_sign * 2.0, torch.zeros_like(w_f))
-    w_half = torch.where((w_abs > (alpha_val * 0.25)) & (w_abs <= (alpha_val * 0.75)), w_sign, torch.zeros_like(w_f))
-    w_int8 = (w_full + w_half).to(torch.int8)
+    # Quantize weights to {-2, -1, 0, 1, 2} (device-side, no alpha.item() sync)
+    w_int8 = _pot5_quantize_int8_levels(w, alpha)
 
     if x.is_cuda and HAS_TRITON:
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
@@ -375,8 +421,9 @@ def triton_pot5_int8_linear(
         )
         return y.reshape(*orig_shape[:-1], N)
     else:
-        # Fallback: exact scaled integer math
-        w_eff = (w_int8.float() * 0.5) * alpha.item()
+        # Fallback: exact scaled integer math (device-side scale, no sync)
+        alpha_f = alpha.to(w_int8.device).float()
+        w_eff = (w_int8.float() * 0.5) * alpha_f
         out = F.linear(x_2d, w_eff.to(x.dtype))
         return out.reshape(*orig_shape[:-1], N)
 
@@ -397,7 +444,6 @@ def triton_pot5_fused_swiglu(
     N = total_dim // 2
     K = w_down.shape[0]
 
-    alpha_d_passed = alpha_d is not None
     if alpha_d is None:
         alpha_d = (w_down.float().abs().mean() * 1.4).to(gate_up.dtype)
     if alpha_d.ndim == 0:
@@ -418,17 +464,10 @@ def triton_pot5_fused_swiglu(
         )
         return out.reshape(*orig_shape[:-1], K)
     else:
-        # PyTorch fallback
+        # PyTorch fallback (unified thresholds, no thresh_scale hybrid, no sync)
         g, u = gv_2d.chunk(2, dim=-1)
         act = F.silu(g) * u
-        w_f = w_down.float()
-        w_abs = w_f.abs()
-        w_sign = w_f.sign()
-        alpha_val = alpha_d.item()
-        thresh_scale = alpha_val if (alpha_d_passed or w_abs.max() < 0.5) else 1.0
-        w_full = torch.where(w_abs > (thresh_scale * 0.75), w_sign, torch.zeros_like(w_f))
-        w_half = torch.where((w_abs > (thresh_scale * 0.25)) & (w_abs <= (thresh_scale * 0.75)), w_sign, torch.zeros_like(w_f))
-        wd_eff = (w_full + w_half * 0.5) * alpha_val
+        wd_eff = _pot5_quantize_weight(w_down, alpha_d)
         out = F.linear(act, wd_eff.to(act.dtype))
         return out.reshape(*orig_shape[:-1], K)
 
@@ -457,6 +496,15 @@ def pack_pot5_gpu_3bitplane(
       Magnitude bitplane: 1 bit per weight (1.0 vs 0.5)
       Sign bitplane: 1 bit per weight (- vs +)
     Storage: Exactly 3 bits/weight (5.33x reduction vs BF16, 2.67x vs INT8).
+    Quantization rule for this pack path is intentionally std-relative
+    (t0=0.35*std, t1=0.9*std, q in {0,0.5,1}*sign, alpha = <w,q>/<q,q>)
+    to stay bit-exact with training-time pot5_quantize (ast_dag) and
+    .toros format. Online kernels use the unified alpha-relative rule
+    (t_low=0.25*alpha, t_high=0.75*alpha) via _pot5_thresholds; bitpacked
+    inference reproduces training numerics because unpack is a LUT
+    (nz*(0.5+0.5*mag)*(1-2*sign)*alpha) with no threshold recompute at
+    matmul time. Use _pot5_quantize_weight / _pot5_alpha_levels_for_comparison
+    to cross-check alpha-relative vs std packing for the same w.
     Returns: (w_nz_bits, w_mag_bits, w_sign_bits, alpha, K_orig)
     """
     N, K_orig = w.shape

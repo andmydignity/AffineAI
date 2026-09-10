@@ -10,9 +10,14 @@ for in-place, forward-only local error learning:
 """
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Tuple, Optional
+
+
+def _use_torch_path(V: int) -> bool:
+    return V <= 1024
 
 
 # ==============================================================================
@@ -46,7 +51,7 @@ lpc_bwd_dw_configs = [
 
 @triton.autotune(
     configs=lpc_fwd_configs,
-    key=['N', 'D', 'V'],
+    key=['D', 'V'],
 )
 @triton.jit
 def _triton_lpc_fwd_kernel(
@@ -88,7 +93,7 @@ def _triton_lpc_fwd_kernel(
             h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
             w_tile = tl.load(w_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
 
-            acc += tl.dot(h_tile, tl.trans(w_tile))
+            acc += tl.dot(h_tile, tl.trans(w_tile), input_precision="ieee")
 
         acc_masked = tl.where(mask_m[:, None] & mask_v[None, :], acc, -1e30)
         chunk_max = tl.max(acc_masked, axis=1)
@@ -114,7 +119,7 @@ def _triton_lpc_fwd_kernel(
 
 @triton.autotune(
     configs=lpc_bwd_dh_configs,
-    key=['N', 'D', 'V'],
+    key=['D', 'V'],
 )
 @triton.jit
 def _triton_lpc_bwd_dh_kernel(
@@ -153,7 +158,7 @@ def _triton_lpc_bwd_dh_kernel(
             mask_dk = offs_dk < D
             h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
             w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(h_k, tl.trans(w_k))
+            logits += tl.dot(h_k, tl.trans(w_k), input_precision="ieee")
 
         diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
         p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
@@ -162,7 +167,7 @@ def _triton_lpc_bwd_dh_kernel(
         scaled_dlogits = (dlogits * grad_scale).to(H_ptr.dtype.element_ty)
 
         w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-        dh_acc += tl.dot(scaled_dlogits, w_d)
+        dh_acc += tl.dot(scaled_dlogits, w_d, input_precision="ieee")
 
     dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
     tl.store(dh_ptrs, dh_acc.to(H_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
@@ -170,7 +175,7 @@ def _triton_lpc_bwd_dh_kernel(
 
 @triton.autotune(
     configs=lpc_bwd_dw_configs,
-    key=['N', 'D', 'V'],
+    key=['D', 'V'],
 )
 @triton.jit
 def _triton_lpc_bwd_dw_kernel(
@@ -210,7 +215,7 @@ def _triton_lpc_bwd_dw_kernel(
             mask_dk = offs_dk < D
             w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
             h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(w_k, tl.trans(h_k))
+            logits += tl.dot(w_k, tl.trans(h_k), input_precision="ieee")
 
         diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
         p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
@@ -219,7 +224,7 @@ def _triton_lpc_bwd_dw_kernel(
         scaled_dlogits = (dlogits * grad_scale).to(W_ptr.dtype.element_ty)
 
         h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-        dw_acc += tl.dot(scaled_dlogits, h_d)
+        dw_acc += tl.dot(scaled_dlogits, h_d, input_precision="ieee")
 
     dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
     tl.store(dw_ptrs, dw_acc.to(W_ptr.dtype.element_ty), mask=mask_v[:, None] & mask_d[None, :])
@@ -248,6 +253,26 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         V = weight.shape[0]
 
         calc_dtype = torch.float64 if h.dtype == torch.float64 else torch.float32
+        if _use_torch_path(V):
+            # Capture-safe branchless small-V path (no .item()/sync, no nested
+            # autograd), mirroring triton_cross_entropy semantics.
+            acc_dtype = h.dtype
+            valid = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)).to(acc_dtype)
+            n_valid = valid.sum().clamp(min=1)
+            lse = torch.empty(0, dtype=calc_dtype, device=h.device)
+            ctx.save_for_backward(h_flat, weight, targets_flat, lse, n_valid)
+            ctx.orig_shape = orig_shape
+            ctx.N = N
+            ctx.D = D
+            ctx.V = V
+            ctx.ignore_index = ignore_index
+            ctx.use_torch = True
+            safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
+            logits = torch.matmul(h_flat.to(acc_dtype), weight.to(acc_dtype).t())
+            nll = -logits.log_softmax(dim=-1).gather(1, safe_idx).squeeze(1)
+            total_loss = (nll * valid).sum() / n_valid
+            return total_loss.to(h.dtype)
+
         losses = torch.empty(N, dtype=calc_dtype, device=h.device)
         lse = torch.empty(N, dtype=calc_dtype, device=h.device)
 
@@ -274,6 +299,7 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         ctx.D = D
         ctx.V = V
         ctx.ignore_index = ignore_index
+        ctx.use_torch = False
         return total_loss.to(h.dtype)
 
     @staticmethod
@@ -283,6 +309,26 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         D = ctx.D
         V = ctx.V
         ignore_index = ctx.ignore_index
+
+        if getattr(ctx, 'use_torch', False) or _use_torch_path(V):
+            # Explicit softmax backward, capture-safe (plain tensor ops only).
+            need_dx = ctx.needs_input_grad[0]
+            need_dw = ctx.needs_input_grad[1]
+            if not need_dx and not need_dw:
+                return None, None, None, None
+            valid = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V))
+            safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
+            acc_dtype = h_flat.dtype
+            valid = valid.to(acc_dtype)
+            logits = torch.matmul(h_flat.to(acc_dtype), weight.to(acc_dtype).t())
+            probs = logits.log_softmax(dim=-1).exp()
+            one_hot = torch.zeros_like(probs)
+            one_hot.scatter_(1, safe_idx, valid.unsqueeze(1))
+            dlogits = (probs - one_hot) * valid.unsqueeze(1)
+            dlogits = dlogits * (grad_output / n_valid).to(dlogits.dtype)
+            dh_flat = torch.matmul(dlogits, weight.to(acc_dtype)).to(h_flat.dtype).view(ctx.orig_shape) if need_dx else None
+            dw = torch.matmul(dlogits.t(), h_flat.to(acc_dtype)).to(weight.dtype) if need_dw else None
+            return dh_flat, dw, None, None
 
         scale_dtype = torch.float64 if h_flat.dtype == torch.float64 else torch.float32
         grad_scale_tensor = (grad_output / n_valid).to(scale_dtype)
@@ -344,12 +390,14 @@ def triton_fused_lpc_head(
         Scalar local cross-entropy loss.
     """
     if not h.is_cuda:
-        # Native C++ AVX2/AVX-512 SIMD LPC Head with OpenMP & Zero Logits RAM
+        if _use_torch_path(weight.shape[0]):
+            # Capture-safe branchless torch path via the Function (single code
+            # path; also faster than the AVX C++ head for small V on CPU).
+            return _TritonFusedLPCHeadFunc.apply(h, weight, targets, ignore_index)
         try:
             from affine_ai.core.cpp_ops import asdag_cpu_lpc_head
             return asdag_cpu_lpc_head(h, weight, targets, ignore_index).to(h.dtype)
         except Exception:
-            # PyTorch fallback
             orig_shape = h.shape
             h_flat = h.view(-1, orig_shape[-1]).float()
             w_flat = weight.float()
@@ -357,4 +405,6 @@ def triton_fused_lpc_head(
             logits = torch.matmul(h_flat, w_flat.t())
             return torch.nn.functional.cross_entropy(logits, targets_flat, ignore_index=ignore_index).to(h.dtype)
 
+    # Single code path on CUDA: the Function dispatches internally (see note
+    # in triton_cross_entropy wrapper). Keeps the captured region sync-free.
     return _TritonFusedLPCHeadFunc.apply(h, weight, targets, ignore_index)

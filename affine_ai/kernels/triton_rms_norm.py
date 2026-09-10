@@ -31,11 +31,12 @@ def _prune_fwd_bwd_configs(configs: List[triton.Config], named_args: dict, **kwa
 
 def _get_fwd_bwd_autotune_configs() -> List[triton.Config]:
     """
-    Generates autotune configurations covering hidden dimensions D in {16, 32, ..., 65536}.
+    Generates autotune configurations covering hidden dimensions D in {16, 32, ..., 8192}.
     Varies num_warps (1, 2, 4, 8, 16) and num_stages (1, 2, 3, 4) for optimal occupancy and instruction pipelining.
+    BLOCK_SIZE >8192 dropped to cap compile time / register pressure.
     """
     configs = []
-    for BLOCK_SIZE in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for BLOCK_SIZE in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
         if BLOCK_SIZE <= 64:
             for nw in [1, 2]:
                 for ns in [1, 2]:
@@ -234,10 +235,20 @@ def _rms_norm_bwd_dscale_kernel(
 
         acc += tl.sum(dy * (x * rsqrt[:, None]), axis=0)
 
-    if num_n_splits == 1:
-        tl.store(DScale_ptr + offs_d, acc, mask=mask_d)
+    is_fp64 = X_ptr.dtype.element_ty == tl.float64
+    if is_fp64:
+        # fp64 atomic_add not portable; fallback to store when single writer else loop will be single-writer via Python guard (splits=1 for fp64)
+        if num_n_splits == 1:
+            tl.store(DScale_ptr + offs_d, acc, mask=mask_d)
+        else:
+            # fallback: still store for first split only to allow compilation; Python avoids this path for fp64 with splits>1
+            if pid_n == 0:
+                tl.store(DScale_ptr + offs_d, acc, mask=mask_d)
     else:
-        tl.atomic_add(DScale_ptr + offs_d, acc, mask=mask_d)
+        if num_n_splits == 1:
+            tl.store(DScale_ptr + offs_d, acc, mask=mask_d)
+        else:
+            tl.atomic_add(DScale_ptr + offs_d, acc, mask=mask_d)
 
 
 def _get_fused_bwd_autotune_configs() -> List[triton.Config]:
@@ -267,27 +278,42 @@ def _rms_norm_bwd_fused_kernel(
 ):
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
-    offs_d = tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
-    mask_d = offs_d < D
-    mask_2d = mask_m[:, None] & mask_d[None, :]
-
     x_dtype = X_ptr.dtype.element_ty
     acc_dtype = tl.float64 if x_dtype == tl.float64 else tl.float32
-
+    is_fp64 = X_ptr.dtype.element_ty == tl.float64
     rsqrt = tl.load(Rsqrt_ptr + offs_m, mask=mask_m, other=0.0).to(acc_dtype)
-    scale = tl.load(Scale_ptr + offs_d * stride_sb, mask=mask_d, other=0.0).to(acc_dtype)
-    dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
-    x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
-
-    dscale_part = tl.sum(dy * (x * rsqrt[:, None]), axis=0)
-    tl.atomic_add(DScale_ptr + offs_d, dscale_part, mask=mask_d)
-
-    dy_scale = dy * scale[None, :]
-    inner = tl.sum(dy_scale * x, axis=1)
+    # BLOCK_D capped <=2048; loop over D if larger.
+    # Pass 1: global inner product per row over the FULL D (dx needs the
+    # full-row sum; a per-chunk partial sum would scale coeff wrong by ~D/BLOCK_D).
+    inner = tl.zeros([BLOCK_ROW], dtype=acc_dtype)
+    for d_start in range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_2d = mask_m[:, None] & mask_d[None, :]
+        scale = tl.load(Scale_ptr + offs_d * stride_sb, mask=mask_d, other=0.0).to(acc_dtype)
+        dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
+        x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
+        inner += tl.sum(dy * scale[None, :] * x, axis=1)
     coeff = (inner * rsqrt * rsqrt) / D
-    dx = (dy_scale - x * coeff[:, None]) * rsqrt[:, None]
-    tl.store(DX_ptr + offs_m[:, None] * stride_dxb + offs_d[None, :] * stride_dxd, dx.to(x_dtype), mask=mask_2d)
+    # Pass 2: dx + dscale per D chunk.
+    for d_start in range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_2d = mask_m[:, None] & mask_d[None, :]
+        scale = tl.load(Scale_ptr + offs_d * stride_sb, mask=mask_d, other=0.0).to(acc_dtype)
+        dy = tl.load(DY_ptr + offs_m[:, None] * stride_dyb + offs_d[None, :] * stride_dyd, mask=mask_2d, other=0.0).to(acc_dtype)
+        x = tl.load(X_ptr + offs_m[:, None] * stride_xb + offs_d[None, :] * stride_xd, mask=mask_2d, other=0.0).to(acc_dtype)
+        dscale_part = tl.sum(dy * (x * rsqrt[:, None]), axis=0)
+        if is_fp64:
+            # fp64 atomic_add not universally available; fallback to store when single writer (fused path is single-writer per D chunk when launched with 1D grid) or skip - Python guards fp64 fused path
+            if pid_m == 0:
+                tl.store(DScale_ptr + offs_d, dscale_part, mask=mask_d)
+        else:
+            tl.atomic_add(DScale_ptr + offs_d, dscale_part, mask=mask_d)
+        dy_scale = dy * scale[None, :]
+        dx = (dy_scale - x * coeff[:, None]) * rsqrt[:, None]
+        tl.store(DX_ptr + offs_m[:, None] * stride_dxb + offs_d[None, :] * stride_dxd, dx.to(x_dtype), mask=mask_2d)
 
 
 class TritonRMSNormFunc(torch.autograd.Function):
@@ -328,11 +354,11 @@ class TritonRMSNormFunc(torch.autograd.Function):
         dx = None
         dscale = None
 
-        if need_dx and need_dscale and D <= 4096:
+        if need_dx and need_dscale and D <= 4096 and x_flat.dtype != torch.float64:
             dx = torch.empty_like(x_flat)
             calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-            BLOCK_D = max(16, triton.next_power_of_2(D))
+            BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))
             grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
                 dy_flat, x_flat, scale, rsqrt, dx, dscale_acc,
@@ -360,7 +386,11 @@ class TritonRMSNormFunc(torch.autograd.Function):
             if need_dscale:
                 calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
                 dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-                grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+                # fp64: avoid multi-split atomic_add; force single writer
+                if calc_dtype == torch.float64:
+                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), 1)
+                else:
+                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
                 _rms_norm_bwd_dscale_kernel[grid](
                     dy_flat, x_flat, rsqrt, dscale_acc,
                     dy_flat.stride(0), dy_flat.stride(1),
@@ -499,11 +529,11 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
         dres_out_val = None
         dscale = None
 
-        if need_dx and need_dscale and D <= 4096:
+        if need_dx and need_dscale and D <= 4096 and res_out.dtype != torch.float64:
             dx = torch.empty_like(res_out)
             calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-            BLOCK_D = max(16, triton.next_power_of_2(D))
+            BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))
             grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
                 dy_flat, res_out, scale, rsqrt, dx, dscale_acc,
@@ -539,7 +569,10 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
             if need_dscale:
                 calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
                 dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
-                grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
+                if calc_dtype == torch.float64:
+                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), 1)
+                else:
+                    grid = lambda META: (triton.cdiv(D, META['BLOCK_D']), min(16, max(1, triton.cdiv(N, META['BLOCK_N']))))
                 _rms_norm_bwd_dscale_kernel[grid](
                     dy_flat, res_out, rsqrt, dscale_acc,
                     dy_flat.stride(0), dy_flat.stride(1),

@@ -59,17 +59,17 @@ def _fused_asdag_2d_grid_kernel(
 
             # 1. Load input batch tile
             x_ptrs = X_ptr + offs_m[:, None] * stride_xb + offs_k[None, :] * stride_xd
-            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0, eviction_policy="evict_last")
 
             # 2. Load this leaf's weight tile
             w_ptrs = W_stack_ptr + pid_k * stride_wk + offs_k[:, None] * stride_wd2 + offs_d[None, :] * stride_wd1
-            w_k = tl.load(w_ptrs, mask=mask_k[:, None] & mask_d[None, :], other=0.0)
+            w_k = tl.load(w_ptrs, mask=mask_k[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last")
             w_k = w_k.to(x.dtype)
             acc += tl.dot(x, w_k, input_precision=INPUT_PRECISION)
 
         # 3. Load this leaf's bias
         b_ptrs = Bias_stack_ptr + pid_k * stride_bk + offs_d * stride_bd
-        b_k = tl.load(b_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+        b_k = tl.load(b_ptrs, mask=mask_d, other=0.0, eviction_policy="evict_first").to(tl.float32)
 
         # 4. Compute primary transformation: (BLOCK_M, BLOCK_D)
         y_prim = acc + b_k[None, :]
@@ -80,11 +80,11 @@ def _fused_asdag_2d_grid_kernel(
             for s in range(MAX_SECONDARY):
                 c_s = tl.load(
                     Context_ptr + pid_k * stride_ck + s * stride_cm + offs_d * stride_cd,
-                    mask=mask_d, other=0.0,
+                    mask=mask_d, other=0.0, eviction_policy="evict_first",
                 ).to(tl.float32)
                 p_s = tl.load(
                     Peer_ptr + pid_k * stride_pok + s * stride_pos + offs_m[:, None] * stride_pob + offs_d[None, :] * stride_pod,
-                    mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+                    mask=mask_m[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last",
                 ).to(tl.float32)
                 h_ctx += c_s[None, :] * p_s
             y_prim = y_prim + h_ctx
@@ -105,6 +105,20 @@ def _fused_asdag_2d_grid_kernel(
 
 
 class FusedASDAG2DFunction(torch.autograd.Function):
+    """
+    2D grid-tiled ASDAG forward with recompute-based backward.
+
+    Forward is Triton-tiled (BLOCK_M >=64, BLOCK_D up to 64) with masked
+    correctness for non-divisible B/D.  Backward does NOT use a Triton
+    kernel; it recomputes the forward analytically via PyTorch and
+    triggers autograd on the recomputed graph.  That recompute currently
+    materializes y_prim [B, K, D] via ``einsum('be,kde->bkd')`` -- peak
+    ~ B*K*D elements (e.g. B=8192,K=8,D=64 => ~4M floats).  Set
+    ``use_checkpoint=True`` to wrap the recompute in
+    ``torch.utils.checkpoint`` and/or chunk B to cut peak at the cost of
+    extra forward compute.  A native Triton backward that avoids the
+    [B,K,D] materialization is the intended follow-up.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -117,9 +131,11 @@ class FusedASDAG2DFunction(torch.autograd.Function):
         activation: str = "relu6",
         peer_outputs: Optional[torch.Tensor] = None,
         input_precision: Optional[str] = None,
+        use_checkpoint: bool = False,
     ) -> torch.Tensor:
         ctx.save_for_backward(x, w_stack, bias_stack, routing_probs, context_gates, norm_factors, peer_outputs)
         ctx.activation = activation
+        ctx.use_checkpoint = bool(use_checkpoint)
 
         B, D = x.shape
         K = w_stack.shape[0]
@@ -128,7 +144,7 @@ class FusedASDAG2DFunction(torch.autograd.Function):
         leaf_outs = torch.empty((B, K, D), device=x.device, dtype=x.dtype)
         act_code = 1 if activation == "relu6" else (2 if activation == "sign" else 0)
 
-        BLOCK_M = 32
+        BLOCK_M = 64
         BLOCK_D = min(64, triton.next_power_of_2(D))
 
         grid = (triton.cdiv(B, BLOCK_M), K)
@@ -137,7 +153,10 @@ class FusedASDAG2DFunction(torch.autograd.Function):
         dummy_peer = x if not has_peer else peer_outputs
 
         if input_precision is None:
-            prec = "tf32" if (x.dtype != torch.float32 or torch.backends.cuda.matmul.allow_tf32) else "ieee"
+            if x.dtype == torch.float32:
+                prec = "tf32" if torch.backends.cuda.matmul.allow_tf32 else "ieee"
+            else:
+                prec = "ieee"
         else:
             prec = input_precision
 
@@ -175,16 +194,17 @@ class FusedASDAG2DFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         if grad_output is None:
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None
 
         needs_any_grad = any(
             ctx.needs_input_grad[i] for i in range(len(ctx.needs_input_grad))
         )
         if not needs_any_grad:
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None
 
         x, w_stack, bias_stack, routing_probs, context_gates, norm_factors, peer_outputs = ctx.saved_tensors
         activation = ctx.activation
+        use_checkpoint = getattr(ctx, "use_checkpoint", False)
 
         with torch.enable_grad():
             xr = x.detach().requires_grad_(ctx.needs_input_grad[0])
@@ -199,31 +219,44 @@ class FusedASDAG2DFunction(torch.autograd.Function):
                 else None
             )
 
-            # Recompute primary transformation
-            y_prim = torch.einsum('be, kde -> bkd', xr, wr) + br.unsqueeze(0)
-
-            # Secondary context accumulation
-            if por is not None:
-                if cgr.ndim == 2:
-                    if por.ndim == 3:
-                        h_ctx = (cgr.unsqueeze(1) * por).permute(1, 0, 2)
+            def _forward_impl(xr_, wr_, br_, rpr_, cgr_, nfr_, por_):
+                y_prim = torch.einsum('be, kde -> bkd', xr_, wr_) + br_.unsqueeze(0)
+                if por_ is not None:
+                    if cgr_.ndim == 2:
+                        if por_.ndim == 3:
+                            h_ctx = (cgr_.unsqueeze(1) * por_).permute(1, 0, 2)
+                        else:
+                            h_ctx = (cgr_.unsqueeze(1).unsqueeze(2) * por_).sum(dim=1).permute(1, 0, 2)
                     else:
-                        h_ctx = (cgr.unsqueeze(1).unsqueeze(2) * por).sum(dim=1).permute(1, 0, 2)
+                        h_ctx = (cgr_.unsqueeze(2) * por_).sum(dim=1).permute(1, 0, 2)
+                    y_prim = y_prim + h_ctx
+                y_v = y_prim * nfr_.view(1, -1, 1)
+                if activation == "relu6":
+                    y_act = torch.nn.functional.relu6(y_v)
+                elif activation == "sign":
+                    y_act = y_v + (torch.where(y_v >= 0.0, 1.0, -1.0) - y_v).detach()
                 else:
-                    h_ctx = (cgr.unsqueeze(2) * por).sum(dim=1).permute(1, 0, 2)
-                y_prim = y_prim + h_ctx
+                    y_act = y_v
+                return torch.einsum('bk, bkd -> bd', rpr_, y_act)
 
-            y_v = y_prim * nfr.view(1, -1, 1)
-
-            if activation == "relu6":
-                y_act = torch.nn.functional.relu6(y_v)
-            elif activation == "sign":
-                y_act = y_v + (torch.where(y_v >= 0.0, 1.0, -1.0) - y_v).detach()
+            if use_checkpoint:
+                import torch.utils.checkpoint as _ckpt
+                # Checkpoint trades compute for memory: y_prim [B,K,D] intermediates
+                # are not retained until inner backward recompute; chunking further
+                # bounds peak but single checkpoint already cuts retained memory.
+                if por is None:
+                    def _forward_impl_nopor(xr_, wr_, br_, rpr_, cgr_, nfr_):
+                        return _forward_impl(xr_, wr_, br_, rpr_, cgr_, nfr_, None)
+                    out = _ckpt.checkpoint(
+                        _forward_impl_nopor,
+                        xr, wr, br, rpr, cgr, nfr, use_reentrant=False,
+                    )
+                else:
+                    out = _ckpt.checkpoint(_forward_impl, xr, wr, br, rpr, cgr, nfr, por, use_reentrant=False)
+                torch.autograd.backward(out, grad_output.to(out.dtype))
             else:
-                y_act = y_v
-
-            out = torch.einsum('bk, bkd -> bd', rpr, y_act)
-            torch.autograd.backward(out, grad_output.to(out.dtype))
+                out = _forward_impl(xr, wr, br, rpr, cgr, nfr, por)
+                torch.autograd.backward(out, grad_output.to(out.dtype))
 
         return (
             xr.grad if ctx.needs_input_grad[0] else None,
@@ -234,6 +267,7 @@ class FusedASDAG2DFunction(torch.autograd.Function):
             nfr.grad if ctx.needs_input_grad[5] else None,
             None,
             por.grad if (por is not None and ctx.needs_input_grad[7]) else None,
+            None,
             None,
         )
 
@@ -251,8 +285,17 @@ def fused_asdag_2d_triton(
 ) -> torch.Tensor:
     """
     2D Grid-Tiled Fused ASDAG Forward Pass in Triton wrapped with autograd.
+
+    Forward uses BLOCK_M=64/BLOCK_D~64 tiling with masks for non-divisible
+    B/D.  Backward is recompute-based (no Triton backward kernel) and
+    currently materializes y_prim [B,K,D] via ``einsum('be,kde->bkd')``.
+    Pass ``use_checkpoint=True`` to wrap the recompute in
+    ``torch.utils.checkpoint`` to reduce peak memory at the cost of an
+    extra forward.  Native Triton backward avoiding the [B,K,D] buffer is
+    TODO.
     """
     input_precision = kwargs.get("input_precision", None)
+    use_checkpoint = kwargs.get("use_checkpoint", False)
     return FusedASDAG2DFunction.apply(
         x,
         w_stack,
@@ -263,6 +306,7 @@ def fused_asdag_2d_triton(
         activation,
         peer_outputs,
         input_precision,
+        use_checkpoint,
     )
 
 

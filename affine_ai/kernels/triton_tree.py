@@ -146,7 +146,7 @@ def _tree_perm_bwd_dprim_kernel(
 
 @triton.jit
 def _tree_perm_bwd_dx_kernel(
-    D_PRIM, W, Perms, TopIdx, GR,
+    D_PRIM, W, InvPerms, TopIdx, GR,
     stride_dpm, stride_dptk, stride_dpd,
     stride_wk, stride_wp, stride_wd,
     stride_pk, stride_pp, stride_pd,
@@ -157,21 +157,23 @@ def _tree_perm_bwd_dx_kernel(
 ):
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
-
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_b = offs_b < B_ROWS
     mask_d = offs_d < D_DIM
     mask = mask_b[:, None] & mask_d[None, :]
-
+    acc = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
     for tk in range(TOPK):
         ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=0)
-        dp = tl.load(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd, mask=mask, other=0.0)
         for p in range(P_NUM):
-            w = tl.load(W + ki[:, None] * stride_wk + p * stride_wp + offs_d[None, :] * stride_wd, mask=mask, other=0.0)
-            pm = tl.load(Perms + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd, mask=mask, other=0)
-            grad = dp * w
-            tl.atomic_add(GR + offs_b[:, None] * stride_grm + pm * stride_grd, grad, mask=mask)
+            inv_ptrs = InvPerms + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd
+            src = tl.load(inv_ptrs, mask=mask, other=0)
+            dp_ptrs = D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + src * stride_dpd
+            dp = tl.load(dp_ptrs, mask=mask, other=0.0)
+            w_ptrs = W + ki[:, None] * stride_wk + p * stride_wp + src * stride_wd
+            w = tl.load(w_ptrs, mask=mask, other=0.0)
+            acc += dp * w
+    tl.store(GR + offs_b[:, None] * stride_grm + offs_d[None, :] * stride_grd, acc, mask=mask)
 
 
 @triton.jit
@@ -185,23 +187,28 @@ def _tree_perm_bwd_gw_kernel(
     B_ROWS, D_DIM, P_NUM, TOPK,
     BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
-    pid_d = tl.program_id(1)
-
-    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    pid_k = tl.program_id(0)
+    pid_p = tl.program_id(1)
+    pid_d = tl.program_id(2)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_b = offs_b < B_ROWS
     mask_d = offs_d < D_DIM
-    mask = mask_b[:, None] & mask_d[None, :]
-
-    for tk in range(TOPK):
-        ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=0)
-        dp = tl.load(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd, mask=mask, other=0.0)
-        for p in range(P_NUM):
-            pm = tl.load(Perms + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd, mask=mask, other=0)
-            xv = tl.load(R + offs_b[:, None] * stride_rm + pm * stride_rd, mask=mask, other=0.0)
+    p_idx = tl.load(Perms + pid_k * stride_pk + pid_p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for b_start in range(0, B_ROWS, BLOCK_B):
+        offs_b = b_start + tl.arange(0, BLOCK_B)
+        mask_b = offs_b < B_ROWS
+        xv_ptrs = R + offs_b[:, None] * stride_rm + p_idx[None, :] * stride_rd
+        xv = tl.load(xv_ptrs, mask=mask_b[:, None] & mask_d[None, :], other=0.0)
+        for tk in range(TOPK):
+            ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=0)
+            dp_ptrs = D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd
+            dp = tl.load(dp_ptrs, mask=mask_b[:, None] & mask_d[None, :], other=0.0)
+            need = ki == pid_k
+            dp = tl.where(need[:, None], dp, 0.0)
             grad = dp * xv
-            tl.atomic_add(GW + ki[:, None] * stride_gwk + p * stride_gwp + offs_d[None, :] * stride_gwd, grad, mask=mask)
+            acc += tl.sum(grad, axis=0)
+    gw_ptrs = GW + pid_k * stride_gwk + pid_p * stride_gwp + offs_d * stride_gwd
+    tl.store(gw_ptrs, acc, mask=mask_d)
 
 
 class TritonTreePermFunction(torch.autograd.Function):
@@ -243,6 +250,7 @@ class TritonTreePermFunction(torch.autograd.Function):
         bias_f = bias.detach().float().contiguous() if isinstance(bias, torch.Tensor) else torch.zeros((K, D), device=r_in.device, dtype=torch.float32)
         perms_f = perms.detach().to(torch.int32).contiguous()
 
+        # d_prim reused by gr/gw/gb; fusing would 3x leaf-prim recompute (P*D gathers) for ~B*T*D memory saved
         d_prim = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=torch.float32)
         store_act = ctx.needs_input_grad[5]
         act = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=torch.float32) if store_act else torch.empty(0, device=r_flat.device, dtype=torch.float32)
@@ -282,7 +290,10 @@ class TritonTreePermFunction(torch.autograd.Function):
         gw = None
         if ctx.needs_input_grad[1]:
             gw = torch.zeros(w_perm.shape, dtype=torch.float32, device=w_perm.device)
-            _tree_perm_bwd_gw_kernel[grid](
+            BD_GW = 32
+            BM_GW = 32
+            grid_gw = (K, P, (D + BD_GW - 1) // BD_GW)
+            _tree_perm_bwd_gw_kernel[grid_gw](
                 d_prim, r_flat, perms_f, top_idx_flat, gw,
                 d_prim.stride(0), d_prim.stride(1), d_prim.stride(2),
                 r_flat.stride(0), r_flat.stride(1),
@@ -290,18 +301,19 @@ class TritonTreePermFunction(torch.autograd.Function):
                 top_idx_flat.stride(0), top_idx_flat.stride(1),
                 gw.stride(0), gw.stride(1), gw.stride(2),
                 B_flat, D, P, Tk,
-                BLOCK_B=BM, BLOCK_D=BD, num_warps=4,
+                BLOCK_B=BM_GW, BLOCK_D=BD_GW, num_warps=4,
             )
             gw = gw.to(w_perm.dtype)
 
         gr = None
         if ctx.needs_input_grad[0]:
             gr_flat = torch.zeros((B_flat, D), dtype=torch.float32, device=r_flat.device)
+            inv_perms_f = torch.argsort(perms_f, dim=-1).to(torch.int32).contiguous()
             _tree_perm_bwd_dx_kernel[grid](
-                d_prim, w_perm_f, perms_f, top_idx_flat, gr_flat,
+                d_prim, w_perm_f, inv_perms_f, top_idx_flat, gr_flat,
                 d_prim.stride(0), d_prim.stride(1), d_prim.stride(2),
                 w_perm_f.stride(0), w_perm_f.stride(1), w_perm_f.stride(2),
-                perms_f.stride(0), perms_f.stride(1), perms_f.stride(2),
+                inv_perms_f.stride(0), inv_perms_f.stride(1), inv_perms_f.stride(2),
                 top_idx_flat.stride(0), top_idx_flat.stride(1),
                 gr_flat.stride(0), gr_flat.stride(1),
                 B_flat, D, P, Tk,

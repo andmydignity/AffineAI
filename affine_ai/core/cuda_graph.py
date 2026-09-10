@@ -30,16 +30,66 @@ class CUDAGraphRunner:
         sample_inputs: Sequence[torch.Tensor],
         warmup_iters: int = 3,
         stream: Optional[torch.cuda.Stream] = None,
+        graph_pool_handle: Optional[Any] = None,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDAGraphRunner requires CUDA to be available.")
+        if len(sample_inputs) == 0:
+            raise ValueError("sample_inputs must be non-empty")
+        for i, t in enumerate(sample_inputs):
+            if not isinstance(t, torch.Tensor):
+                raise ValueError(f"sample_inputs[{i}] must be a torch.Tensor, got {type(t)}")
+            if not t.is_cuda:
+                raise ValueError(f"sample_inputs[{i}] must be on CUDA (got device {t.device}); CUDA graphs require CUDA tensors")
+            if not t.is_contiguous():
+                raise ValueError(f"sample_inputs[{i}] must be contiguous for CUDA graph capture")
+        first_shape = tuple(sample_inputs[0].shape)
+        first_dtype = sample_inputs[0].dtype
+        first_stride = sample_inputs[0].stride()
+        first_device = sample_inputs[0].device
+        # Validate is_cuda per tensor already; also ensure all on same device
+        for i, t in enumerate(sample_inputs):
+            if t.device != first_device:
+                raise ValueError(f"sample_inputs[{i}] device {t.device} != first tensor device {first_device}")
+
+        # Capturability pre-check: Muon (Newton-Schulz) uses non-graph-capturable ops
+        # If the step_fn closes over a Muon optimizer, capture will fail opaquely.
+        # Detect via heuristic: look at step_fn closure for HybridMuonAdamW/Muon.
+        try:
+            closure_vars = getattr(step_fn, "__closure__", None) or ()
+            for cell in closure_vars:
+                try:
+                    v = cell.cell_contents
+                except Exception:
+                    continue
+                # Direct optimizer instance or list thereof
+                candidates = v if isinstance(v, (list, tuple)) else [v]
+                for c in candidates:
+                    cn = c.__class__.__name__ if hasattr(c, "__class__") else ""
+                    if cn in ("HybridMuonAdamW", "Muon"):
+                        has_muon = getattr(c, "muon_opt", None) is not None if cn == "HybridMuonAdamW" else True
+                        if has_muon:
+                            raise ValueError(
+                                "CUDAGraphRunner: Muon optimizer is not CUDA-graph capturable (Newton-Schulz "
+                                "uses CPU sync and non-capturable kernels). Use use_muon=False or "
+                                "disable CUDA graphs. Capturable Muon kernel not implemented."
+                            )
+        except ValueError:
+            raise
+        except Exception:
+            pass
 
         self.step_fn = step_fn
-        self.device = sample_inputs[0].device
+        self.device = first_device
         self.stream = stream or torch.cuda.Stream(device=self.device)
         self.warmup_iters = max(1, warmup_iters)
+        self.graph_pool_handle = graph_pool_handle
 
         # Preallocate static input buffers matching sample input shapes and dtypes
+        # Preserve shape/dtype/stride validation metadata for runtime checks
+        self._sample_shapes: List[Tuple[int, ...]] = [tuple(t.shape) for t in sample_inputs]
+        self._sample_dtypes: List[torch.dtype] = [t.dtype for t in sample_inputs]
+        self._sample_strides: List[Tuple[int, ...]] = [t.stride() for t in sample_inputs]
         self.static_inputs: List[torch.Tensor] = [
             torch.empty_like(t, memory_format=torch.contiguous_format) for t in sample_inputs
         ]
@@ -48,6 +98,7 @@ class CUDAGraphRunner:
 
         self.graph = torch.cuda.CUDAGraph()
         self.static_outputs: Any = None
+        self._is_captured = False
 
         self._capture()
 
@@ -60,30 +111,53 @@ class CUDAGraphRunner:
         current_stream = torch.cuda.current_stream(device=self.device)
         self.stream.wait_stream(current_stream)
 
+        # Bind warmup + capture to the dedicated capture stream (per CUDA graph programming model)
         with torch.cuda.stream(self.stream):
             # Warmup iterations on the capture stream
             for _ in range(self.warmup_iters):
                 _ = self.step_fn(*self.static_inputs)
 
-            # Record graph
-            with torch.cuda.graph(self.graph, stream=self.stream):
-                self.static_outputs = self.step_fn(*self.static_inputs)
+            # Record graph on the capture stream explicitly
+            if self.graph_pool_handle is not None:
+                with torch.cuda.graph(self.graph, stream=self.stream, pool=self.graph_pool_handle):
+                    self.static_outputs = self.step_fn(*self.static_inputs)
+            else:
+                with torch.cuda.graph(self.graph, stream=self.stream):
+                    self.static_outputs = self.step_fn(*self.static_inputs)
 
         current_stream.wait_stream(self.stream)
+        self._is_captured = True
 
     def step(self, *inputs: torch.Tensor) -> Any:
         """
         Execute one captured step with the provided input tensors.
 
         Copies the dynamic inputs into the static buffers and replays the graph.
+        Bind copy+replay to the capture stream per CUDA graph requirements.
         """
-        assert len(inputs) == len(self.static_inputs), (
-            f"Expected {len(self.static_inputs)} inputs, got {len(inputs)}"
-        )
-        for s_buf, inp in zip(self.static_inputs, inputs):
-            s_buf.copy_(inp)
+        if len(inputs) != len(self.static_inputs):
+            raise ValueError(f"Expected {len(self.static_inputs)} inputs, got {len(inputs)}")
+        for i, (s_buf, inp) in enumerate(zip(self.static_inputs, inputs)):
+            if not isinstance(inp, torch.Tensor):
+                raise ValueError(f"inputs[{i}] must be a torch.Tensor, got {type(inp)}")
+            if not inp.is_cuda:
+                raise ValueError(f"inputs[{i}] must be on CUDA (got {inp.device})")
+            if tuple(inp.shape) != self._sample_shapes[i]:
+                raise ValueError(f"inputs[{i}] shape {tuple(inp.shape)} != captured shape {self._sample_shapes[i]}")
+            if inp.dtype != self._sample_dtypes[i]:
+                raise ValueError(f"inputs[{i}] dtype {inp.dtype} != captured dtype {self._sample_dtypes[i]}")
+            if inp.stride() != self._sample_strides[i]:
+                raise ValueError(f"inputs[{i}] stride {inp.stride()} != captured stride {self._sample_strides[i]}")
+            if inp.device != self.device:
+                raise ValueError(f"inputs[{i}] device {inp.device} != captured device {self.device}")
 
-        self.graph.replay()
+        # Bind H2D copy and replay to the capture stream (avoids stream mismatch & ensures ordering)
+        with torch.cuda.stream(self.stream):
+            for s_buf, inp in zip(self.static_inputs, inputs):
+                s_buf.copy_(inp, non_blocking=True)
+            self.graph.replay()
+        # Ensure current stream waits for capture stream completion
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
         return self.static_outputs
 
     def __call__(self, *inputs: torch.Tensor) -> Any:
@@ -91,5 +165,23 @@ class CUDAGraphRunner:
 
     def replay(self) -> Any:
         """Replay without copying inputs (uses existing static buffer data)."""
-        self.graph.replay()
+        with torch.cuda.stream(self.stream):
+            self.graph.replay()
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
         return self.static_outputs
+
+    def reset(self):
+        """Release CUDA graph resources to avoid leak on re-capture."""
+        try:
+            self.graph.reset()
+        except Exception:
+            pass
+        self._is_captured = False
+        self.static_outputs = None
+
+    def __del__(self):
+        try:
+            if getattr(self, "_is_captured", False):
+                self.graph.reset()
+        except Exception:
+            pass

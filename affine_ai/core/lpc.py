@@ -46,6 +46,9 @@ class LocalPredictiveHead(nn.Module):
         w_quant = self.weight + (w_ternary * gamma - self.weight).detach()
         if targets is not None:
             if h.is_cuda:
+                # Single try-if-_TA path: gated by TRITON_AVAILABLE, no eager F.linear alloc.
+                # The old dual-branch where(isnan) fallback allocated full [N,V] logits redundantly
+                # and is removed for O(1) memory; eager fallback below is also gated.
                 try:
                     from affine_ai.kernels import TRITON_AVAILABLE as _TA
                 except Exception:
@@ -57,15 +60,17 @@ class LocalPredictiveHead(nn.Module):
                         return h_norm, loss_t
                     except Exception:
                         pass
-                else:
+            else:
+                # CPU V=256 drop-in: try AVX C++ fused head before torch fallback.
+                # Only for vocab 256 (byte) where the C++ kernel is optimized; other V fall through.
+                if self.vocab_size == 256:
                     try:
-                        from affine_ai.kernels.triton_lpc import triton_fused_lpc_head
-                        loss_t = triton_fused_lpc_head(h_norm, w_quant, targets, ignore_index=ignore_index)
-                        fb_logits = F.linear(h_norm, w_quant)
-                        loss_f = F.cross_entropy(fb_logits.float().view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index).to(loss_t.dtype)
-                        return h_norm, torch.where(loss_t.isnan(), loss_f, loss_t)
+                        from affine_ai.core.cpp_ops import asdag_cpu_lpc_head
+                        loss_c = asdag_cpu_lpc_head(h_norm, w_quant, targets, ignore_index=ignore_index)
+                        return h_norm, loss_c
                     except Exception:
                         pass
+            # Fallback: materialized logits. Gated eager alloc only when TRITON not available or CPU fallback missed.
             # Cast logits to float32 before cross_entropy — prevents BF16 overflow (>65504)
             # in wide models (dim >= 512) where logit magnitudes can exceed BF16 range.
             logits = F.linear(h_norm, w_quant)
@@ -129,6 +134,13 @@ class LocalPredictiveLanguageModel(nn.Module):
         tie_heads=True) live ONLY in enc_tail, stepped AFTER the per-layer
         pipeline drains — so per-layer async overlap is race-free.
         Old callers passing n_layers+1 optimizers still work (enc step skipped).
+
+        capturable inference: defaults to is_cuda of current params. Must be
+        inferred BEFORE .cuda() if you intend to capture CUDA graphs — otherwise
+        is_cuda is False and AdamW will be non-capturable. Pass capturable=True
+        explicitly when constructing optimizers for graph capture, or re-create
+        optimizers after .cuda(). Muon optimizer is NOT capturable (see
+        forward_lpc_step gate).
         """
         if capturable is None:
             try:
@@ -214,6 +226,17 @@ class LocalPredictiveLanguageModel(nn.Module):
         except Exception:
             return False
 
+    def _has_muon_optimizer(self, optimizers: List[Any]) -> bool:
+        for opt in optimizers:
+            if opt is None:
+                continue
+            if opt.__class__.__name__ == "HybridMuonAdamW":
+                if getattr(opt, "muon_opt", None) is not None:
+                    return True
+            if opt.__class__.__name__ == "Muon":
+                return True
+        return False
+
     def capture_lpc_graph(
         self,
         sample_input_ids: torch.Tensor,
@@ -225,6 +248,13 @@ class LocalPredictiveLanguageModel(nn.Module):
         stride: Optional[int] = None,
     ) -> Any:
         from affine_ai.core.cuda_graph import CUDAGraphRunner
+
+        if self._has_muon_optimizer(optimizers):
+            raise RuntimeError(
+                "Muon optimizer is not CUDA-graph capturable (Newton-Schulz uses non-capturable ops). "
+                "Disable use_cuda_graph or set use_muon=False. "
+                "A capturable Muon kernel is not implemented (too large) — see report."
+            )
 
         def step_fn(bx: torch.Tensor, by: torch.Tensor):
             return self.forward_lpc_step(
@@ -265,6 +295,13 @@ class LocalPredictiveLanguageModel(nn.Module):
         if use_compiled_blocks and is_cuda:
             self.try_compile_lpc_blocks()
         if use_cuda_graph and is_cuda and not sync_loss:
+            if self._has_muon_optimizer(optimizers):
+                raise RuntimeError(
+                    "use_cuda_graph=True with Muon optimizer is not supported: Muon (Newton-Schulz) "
+                    "is not CUDA-graph capturable. Set use_muon=False or use_cuda_graph=False. "
+                    "Capturable Muon kernel not implemented — see report."
+                )
+            # Gate eager capture behind capturability: document before .cuda
             runner = getattr(self, "_lpc_graph_runner", None)
             if (
                 runner is not None
@@ -298,12 +335,19 @@ class LocalPredictiveLanguageModel(nn.Module):
             if getattr(self, '_bwd_stream', None) is None or self._bwd_stream.device != input_ids.device:
                 self._bwd_stream = torch.cuda.Stream(device=input_ids.device)
             bwd_stream = self._bwd_stream
+            # Pooled cuda events: reuse instead of allocating per-iteration (reduces alloc + sync overhead)
+            if getattr(self, '_lpc_fwd_event', None) is None or self._lpc_fwd_event.device != input_ids.device:
+                self._lpc_fwd_event = torch.cuda.Event()
+            if getattr(self, '_lpc_bwd_event', None) is None or self._lpc_bwd_event.device != input_ids.device:
+                self._lpc_bwd_event = torch.cuda.Event()
             bwd_event = None
         else:
             bwd_stream = None
             bwd_event = None
 
         curr_h = x
+        # Unified foreach for clip: use capturable-friendly foreach on CUDA, plain on CPU
+        foreach_clip = bool(is_cuda)
 
         for idx, block in enumerate(self.base_model.blocks):
             if idx == 0 and has_enc_tail:
@@ -324,7 +368,7 @@ class LocalPredictiveLanguageModel(nn.Module):
                 if bwd_event is not None:
                     torch.cuda.current_stream().wait_event(bwd_event)
 
-                fwd_event = torch.cuda.Event()
+                fwd_event = self._lpc_fwd_event
                 fwd_event.record(torch.cuda.current_stream())
                 with torch.cuda.stream(bwd_stream):
                     bwd_stream.wait_event(fwd_event)
@@ -333,23 +377,26 @@ class LocalPredictiveLanguageModel(nn.Module):
                     loss_i.backward()
                     if grad_clip > 0:
                         params = [p for pg in opt_i.param_groups for p in pg['params']]
-                        torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=True)
+                        torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)
                     opt_i.step()
                     opt_i.zero_grad(set_to_none=True)
-                    bwd_event = torch.cuda.Event()
+                    bwd_event = self._lpc_bwd_event
                     bwd_event.record(bwd_stream)
 
-                layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
+                layer_losses.append(loss_i.detach())
+                if sync_loss:
+                    # Avoid .item() sync inside capture; defer sync to end (loss_i.detach pooled)
+                    pass
             else:
                 opt_i = optimizers[idx]
                 opt_i.zero_grad(set_to_none=is_cuda)
                 loss_i.backward()
                 if grad_clip > 0:
                     params = [p for pg in opt_i.param_groups for p in pg['params']]
-                    torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=True)
+                    torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)
                 opt_i.step()
                 opt_i.zero_grad(set_to_none=is_cuda)
-                layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
+                layer_losses.append(loss_i.detach())
 
             curr_h = next_h.detach() if (idx == 0 and has_enc_tail) else next_h
 
@@ -361,7 +408,7 @@ class LocalPredictiveLanguageModel(nn.Module):
             if grad_clip > 0:
                 enc_params = [p for pg in opt_enc.param_groups for p in pg['params'] if p.grad is not None]
                 if enc_params:
-                    torch.nn.utils.clip_grad_norm_(enc_params, grad_clip, foreach=True)
+                    torch.nn.utils.clip_grad_norm_(enc_params, grad_clip, foreach=foreach_clip)
             opt_enc.step()
             opt_enc.zero_grad(set_to_none=is_cuda)
 
@@ -370,14 +417,23 @@ class LocalPredictiveLanguageModel(nn.Module):
         final_h = self.base_model.norm_f(curr_h_in)
         if final_h.is_cuda:
             try:
-                from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
-                loss_final = triton_fused_linear_cross_entropy(
-                    final_h, self.base_model.lm_head.weight, targets, ignore_index=ignore_index
-                )
+                from affine_ai.kernels import TRITON_AVAILABLE as _TA2
             except Exception:
+                _TA2 = False
+            if _TA2:
+                try:
+                    from affine_ai.kernels.triton_cross_entropy import triton_fused_linear_cross_entropy
+                    loss_final = triton_fused_linear_cross_entropy(
+                        final_h, self.base_model.lm_head.weight, targets, ignore_index=ignore_index
+                    )
+                except Exception:
+                    final_logits = self.base_model.lm_head(final_h)
+                    loss_final = F.cross_entropy(final_logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
+            else:
                 final_logits = self.base_model.lm_head(final_h)
                 loss_final = F.cross_entropy(final_logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
         else:
+            # CPU try fused head? No Triton on CPU; use torch fallback (no triton)
             final_logits = self.base_model.lm_head(final_h)
             loss_final = F.cross_entropy(final_logits.view(-1, self.vocab_size), targets.view(-1), ignore_index=ignore_index)
 
@@ -388,22 +444,24 @@ class LocalPredictiveLanguageModel(nn.Module):
             params = []
             for pg in opt_final.param_groups:
                 params.extend(pg['params'])
-            torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)
         opt_final.step()
         opt_final.zero_grad(set_to_none=is_cuda)
 
         if sync_loss:
+            # Deferred .item() syncs: only sync when caller explicitly requests sync_loss
             return {
                 "loss": loss_final.item(),
-                "layer_losses": layer_losses,
-                "mean_local_loss": sum(layer_losses) / len(layer_losses) if layer_losses else loss_final.item()
+                "layer_losses": [l.item() if torch.is_tensor(l) else l for l in layer_losses],
+                "mean_local_loss": sum([l.item() if torch.is_tensor(l) else l for l in layer_losses]) / len(layer_losses) if layer_losses else loss_final.item()
             }
         else:
             loss_final_det = loss_final.detach()
+            stacked = torch.stack(layer_losses) if layer_losses and torch.is_tensor(layer_losses[0]) else loss_final_det.unsqueeze(0)
             return {
                 "loss": loss_final_det,
                 "layer_losses": layer_losses,
-                "mean_local_loss": torch.stack(layer_losses).mean() if layer_losses else loss_final_det
+                "mean_local_loss": stacked.mean() if layer_losses else loss_final_det
             }
 
     @torch.no_grad()

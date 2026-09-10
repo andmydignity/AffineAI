@@ -6,6 +6,10 @@ from typing import Tuple, Optional
 from torch.utils.cpp_extension import load
 
 # Set hardware thread affinity and zero-overhead OpenMP thread pinning
+# NOTE: OMP_WAIT_POLICY=active should be set BEFORE process start (e.g. in env_cpu.sh)
+# to have libgomp spin instead of sleeping between the many small parallel regions (~15% faster).
+# Setting it in-code is too late (libgomp reads it at init). TORCH_EXTENSIONS_DIR controls
+# where the JIT-compiled .so is cached; set it to a persistent path to avoid recompilation.
 if "OMP_PROC_BIND" not in os.environ:
     os.environ["OMP_PROC_BIND"] = "close"
 if "OMP_PLACES" not in os.environ:
@@ -16,9 +20,10 @@ if "OMP_SCHEDULE" not in os.environ:
     os.environ["OMP_SCHEDULE"] = "static"
 
 _CPP_OPS = None
+_CPP_COMPILE_DURATION_S: Optional[float] = None
 
 def get_asdag_cpu_ops():
-    global _CPP_OPS
+    global _CPP_OPS, _CPP_COMPILE_DURATION_S
     if _CPP_OPS is not None:
         return _CPP_OPS
 
@@ -43,7 +48,7 @@ def get_asdag_cpu_ops():
         "-fvisibility=hidden",
         "-fvisibility-inlines-hidden"
     ]
-    
+
     # Check SIMD capabilities
     is_avx512 = hasattr(torch.cpu, "_is_avx512_supported") and torch.cpu._is_avx512_supported()
     if is_avx512:
@@ -51,6 +56,9 @@ def get_asdag_cpu_ops():
     else:
         extra_cflags.extend(["-mavx2", "-mfma"])
 
+    import time as _time
+    import warnings as _warnings
+    _t0 = _time.perf_counter()
     try:
         _CPP_OPS = load(
             name="asdag_cpu_ops",
@@ -59,7 +67,21 @@ def get_asdag_cpu_ops():
             extra_ldflags=["-fopenmp"],
             verbose=False
         )
+        _CPP_COMPILE_DURATION_S = _time.perf_counter() - _t0
+        if _CPP_COMPILE_DURATION_S > 1.0:
+            _warnings.warn(
+                f"asdag_cpu_ops compiled in {_CPP_COMPILE_DURATION_S:.1f}s (cached at $TORCH_EXTENSIONS_DIR). "
+                f"For OMP performance set OMP_WAIT_POLICY=active before launch (see env_cpu.sh).",
+                stacklevel=2,
+            )
     except Exception as e:
+        _CPP_COMPILE_DURATION_S = _time.perf_counter() - _t0
+        _warnings.warn(
+            f"asdag_cpu_ops JIT compile failed after {_CPP_COMPILE_DURATION_S:.1f}s: {e}. "
+            f"Falling back to PyTorch (fused paths will raise). "
+            f"Check TORCH_EXTENSIONS_DIR permissions and compiler flags.",
+            stacklevel=2,
+        )
         _CPP_OPS = False
     return _CPP_OPS
 
@@ -214,23 +236,48 @@ class ASDAGMonarchChainAutogradFunction(torch.autograd.Function):
         dim = diagonals.size(1)
         x_flat = x.reshape(-1, dim)
         ops = get_asdag_cpu_ops()
-        
-        # PyTorch vectorized fallback
-        out = ops.monarch_chain_forward(x_flat, diagonals, perms, bias) if ops else x_flat
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
+        if ops and hasattr(ops, 'monarch_chain_forward') and not x.is_cuda:
+            out = ops.monarch_chain_forward(x_flat, diagonals, perms, bias)
+        else:
+            # Proper PyTorch composed fallback (not identity): sequential Monarch stages
+            # diagonals: [num_stages, dim], perms: [num_stages, dim], bias: [dim]
+            out = x_flat
+            n_stages = diagonals.size(0)
+            for s in range(n_stages):
+                perm = perms[s]
+                diag = diagonals[s]
+                out = torch.gather(out, -1, perm.unsqueeze(0).expand(out.size(0), -1)) * diag.unsqueeze(0)
+                if s == n_stages - 1:
+                    out = out + bias.unsqueeze(0)
+        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, bias)
+        ctx.orig_dim = dim
         return out.to(x.dtype).reshape(*orig_shape)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
+        x_flat, diagonals, perms, inv_perms, bias = ctx.saved_tensors
         orig_shape = grad_output.shape
-        dim = diagonals.size(1)
+        dim = ctx.orig_dim
         go_flat = grad_output.reshape(-1, dim)
-
-        # PyTorch Autograd fallback
         ops = get_asdag_cpu_ops()
-        gx, gd, gb = ops.monarch_chain_backward(go_flat, x_flat, diagonals, perms, inv_perms)
-        return gx.to(grad_output.dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(diagonals.dtype)
+        if ops and hasattr(ops, 'monarch_chain_backward') and not go_flat.is_cuda:
+            gx, gd, gb = ops.monarch_chain_backward(go_flat, x_flat, diagonals, perms, inv_perms)
+            return gx.to(grad_output.dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(bias.dtype)
+        # PyTorch fallback via autograd recomputation (keeps CPU-only separation, no Triton)
+        with torch.enable_grad():
+            xv = x_flat.detach().requires_grad_(True)
+            dv = diagonals.detach().requires_grad_(True)
+            bv = bias.detach().requires_grad_(True)
+            out = xv
+            n_stages = dv.size(0)
+            for s in range(n_stages):
+                perm = perms[s]
+                diag = dv[s]
+                out = torch.gather(out, -1, perm.unsqueeze(0).expand(out.size(0), -1)) * diag.unsqueeze(0)
+                if s == n_stages - 1:
+                    out = out + bv.unsqueeze(0)
+            torch.autograd.backward(out, go_flat.float())
+            return xv.grad.to(grad_output.dtype).reshape(*orig_shape), dv.grad.to(diagonals.dtype), None, None, bv.grad.to(bias.dtype)
 
 
 class ASDAGFusedMonarchChainAutogradFunction(torch.autograd.Function):
@@ -241,8 +288,10 @@ class ASDAGFusedMonarchChainAutogradFunction(torch.autograd.Function):
         M = diagonals.size(0)
         x_flat = x.reshape(-1, dim)
         ops = get_asdag_cpu_ops()
-        
-        res = ops.fused_monarch_chain_forward(x_flat, diagonals, perms, bias)
+        if ops and hasattr(ops, 'fused_monarch_chain_forward') and not x.is_cuda:
+            res = ops.fused_monarch_chain_forward(x_flat, diagonals, perms, bias)
+        else:
+            raise RuntimeError("ASDAG Fused Monarch Chain requires C++ CPU extension (fused_monarch_chain_forward not available)")
         ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
         return tuple(r.to(x.dtype).reshape(*orig_shape) for r in res)
 
@@ -255,6 +304,8 @@ class ASDAGFusedMonarchChainAutogradFunction(torch.autograd.Function):
         go_fused = torch.stack([go.reshape(-1, dim) for go in grad_outputs], dim=0)
 
         ops = get_asdag_cpu_ops()
+        if not ops or not hasattr(ops, 'fused_monarch_chain_backward') or go_fused.is_cuda:
+            raise RuntimeError("ASDAG Fused Monarch Chain backward requires C++ CPU extension")
         gx, gd, gb = ops.fused_monarch_chain_backward(go_fused, x_flat, diagonals, perms, inv_perms)
         return gx.to(grad_outputs[0].dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(diagonals.dtype)
 

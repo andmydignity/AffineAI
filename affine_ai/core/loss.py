@@ -59,6 +59,7 @@ class ChunkedCrossEntropyLoss(nn.Module):
                     try:
                         total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
                         total_valid = 0
+                        # VECTORIZED (chunked): per-patch P<=16, avoids [B,N,P*256] alloc
                         for p_idx in range(P):
                             w_slice = lm_head_weight[p_idx*256:(p_idx+1)*256]  # [256, D]
                             targets_p = targets.view(B, N, P)[:, :, p_idx]  # [B, N]
@@ -85,6 +86,7 @@ class ChunkedCrossEntropyLoss(nn.Module):
                 batch_dim = B_
                 chunk_step = max(chunk_n * batch_dim // P if P else chunk_n, 1)
                 # Simpler: loop over hidden chunks, compute logits per patch chunk-wise
+                # VECTORIZED (chunked): micro-batching to avoid O(T*V) logits OOM
                 for start in range(0, total_positions, max(self.chunk_size * batch_dim, 1)):
                     end = min(start + max(self.chunk_size * batch_dim, 1), total_positions)
                     h_chunk = flat_hidden[start:end]  # [C, D]
@@ -130,6 +132,7 @@ class ChunkedCrossEntropyLoss(nn.Module):
             batch_dim = hidden_states.shape[0] if hidden_states.ndim > 2 else 1
             chunk_step = max(self.chunk_size * batch_dim, 1)
             total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
+            # VECTORIZED (chunked): micro-batching to avoid O(T*V) logits OOM
             for start_idx in range(0, total_tokens, chunk_step):
                 end_idx = min(start_idx + chunk_step, total_tokens)
                 h_chunk = flat_hidden[start_idx:end_idx]
@@ -156,6 +159,7 @@ class ChunkedCrossEntropyLoss(nn.Module):
         chunk_step = max(self.chunk_size * batch_dim, 1)
 
         total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        # VECTORIZED (chunked): micro-batching to avoid O(T*V) logits OOM
         for start_idx in range(0, total_tokens, chunk_step):
             end_idx = min(start_idx + chunk_step, total_tokens)
             h_chunk = flat_hidden[start_idx:end_idx]

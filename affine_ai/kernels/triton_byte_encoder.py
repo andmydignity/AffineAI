@@ -170,7 +170,7 @@ class TritonByteEncoderFunction(torch.autograd.Function):
             g_embed_w = torch.zeros_like(embed_w)
             vocab = embed_w.shape[0]
             assert torch.all(byte_ids < vocab) and torch.all(byte_ids >= 0), "byte_ids OOB"
-            idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte).clamp_(0, vocab - 1)
+            idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte).clamp(0, vocab - 1)
             g_embed_w.scatter_add_(0, idx, g_x.reshape(-1, d_byte))
         else:
             g_embed_w = None

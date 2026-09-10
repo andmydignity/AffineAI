@@ -62,7 +62,11 @@ TritonBitLinearSwiGLUFunction = _optional_import("affine_ai.kernels.triton_bitli
 
 # Fused AdamW Step
 TritonAdamW = _optional_import("affine_ai.kernels.triton_adamw", "TritonAdamW")
-triton_adamw_step = _optional_import("affine_ai.kernels.triton_adamw", "triton_adamw_step")
+try:
+    from affine_ai.kernels.triton_adamw import triton_adamw_step as _tmp_step
+    triton_adamw_step = _tmp_step
+except Exception:
+    triton_adamw_step = None
 
 # Fused Permutation Projection
 triton_fused_perm_proj = _optional_import("affine_ai.kernels.triton_perm_proj", "triton_fused_perm_proj")

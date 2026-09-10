@@ -26,6 +26,40 @@ import numpy as np
 from affine_ai.models.language_model import ASDAGLanguageModel
 from affine_ai.core.loss import ChunkedCrossEntropyLoss
 
+# Distributed helpers (safe on single-GPU; no-ops when not in DDP)
+try:
+    from affine_ai.training.distributed import (
+        setup_distributed,
+        cleanup_distributed,
+        is_distributed,
+        get_rank,
+        get_world_size,
+        is_main_process,
+        get_local_device,
+        barrier,
+        all_reduce_sum,
+    )
+except Exception:  # pragma: no cover
+    # Fallback stubs if distributed module missing
+    def setup_distributed(backend="nccl"):  # type: ignore
+        return None
+    def cleanup_distributed():  # type: ignore
+        return None
+    def is_distributed():  # type: ignore
+        return False
+    def get_rank():  # type: ignore
+        return 0
+    def get_world_size():  # type: ignore
+        return 1
+    def is_main_process():  # type: ignore
+        return True
+    def get_local_device():  # type: ignore
+        return "cpu"
+    def barrier():  # type: ignore
+        return None
+    def all_reduce_sum(tensor):  # type: ignore
+        return tensor
+
 
 def _is_turing() -> bool:
     try:
@@ -136,10 +170,58 @@ class ASDAGTrainer:
         mtp_lambda: Optional[float] = None,
         channel_mixer: Optional[str] = None,
         time_mixer: Optional[str] = None,
+        distributed: Optional[bool] = None,
     ):
         self.pad_id = pad_id
         self.ignore_index = ignore_index
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        _ws_env = os.environ.get("WORLD_SIZE", "")
+        _rank_env = os.environ.get("RANK", "")
+        _auto_ws = 1
+        if _ws_env:
+            try:
+                _auto_ws = int(_ws_env)
+            except Exception:
+                _auto_ws = 1
+        if distributed is None:
+            if _auto_ws > 1 or _rank_env != "":
+                distributed = True
+            elif is_distributed():
+                distributed = True
+            else:
+                distributed = False
+        self.distributed = bool(distributed)
+        self.is_distributed = self.distributed
+        if self.distributed:
+            try:
+                setup_distributed(backend="nccl" if torch.cuda.is_available() else "gloo")
+            except Exception:
+                pass
+            self.rank = get_rank()
+            self.world_size = get_world_size()
+            self.is_main = is_main_process()
+            try:
+                _lr_env = os.environ.get("LOCAL_RANK", "")
+                self.local_rank = int(_lr_env) if _lr_env != "" else (self.rank % max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1))
+            except Exception:
+                self.local_rank = self.rank
+            _has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+            if _has_cuda:
+                _eff = self.local_rank % torch.cuda.device_count()
+                try:
+                    torch.cuda.set_device(_eff)
+                except Exception:
+                    pass
+                self.device = f"cuda:{_eff}"
+            else:
+                self.device = device or "cpu"
+        else:
+            self.rank = 0
+            self.world_size = 1
+            self.is_main = True
+            self.local_rank = 0
+            _has_cuda_fallback = torch.cuda.is_available() and torch.cuda.device_count() > 0
+            self.device = device or ("cuda" if _has_cuda_fallback else "cpu")
+        self.train_sampler = None
         self.use_cuda_graph = ("cuda" in str(self.device)) if use_cuda_graph is None else bool(use_cuda_graph)
         self.use_backpressure = use_backpressure
         self.use_lpc = use_lpc
@@ -177,6 +259,23 @@ class ASDAGTrainer:
                 pass
 
         self.model = model.to(self.device)
+        if getattr(self, "is_distributed", False) and self.world_size > 1:
+            try:
+                if torch.cuda.is_available() and torch.cuda.device_count() > 0 and "cuda" in str(self.device):
+                    _eff_ddp = self.local_rank % torch.cuda.device_count()
+                    self.model = torch.nn.parallel.DistributedDataParallel(
+                        self.model,
+                        device_ids=[_eff_ddp],
+                        output_device=_eff_ddp,
+                        find_unused_parameters=False,
+                    )
+                else:
+                    self.model = torch.nn.parallel.DistributedDataParallel(
+                        self.model,
+                        find_unused_parameters=False,
+                    )
+            except Exception:
+                pass
 
         # Context window / max sequence length configuration
         if context_window is not None:
@@ -207,8 +306,11 @@ class ASDAGTrainer:
 
         # Configure Multi-Token Prediction (MTP) if requested
         from affine_ai.models.hybrid import TorosHybridLanguageModel
-        if isinstance(self.model, TorosHybridLanguageModel):
-            self.hybrid = self.model
+        _unwrap = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        if isinstance(_unwrap, TorosHybridLanguageModel):
+            self.hybrid = _unwrap
+        elif getattr(_unwrap, "hybrid", None) is not None:
+            self.hybrid = _unwrap.hybrid
         elif getattr(self.model, "hybrid", None) is not None:
             self.hybrid = self.model.hybrid
         else:
@@ -237,7 +339,7 @@ class ASDAGTrainer:
                     interleave_model_weights(self.model)
             except Exception:
                 pass
-        if compile_model and hasattr(torch, "compile"):
+        if compile_model and hasattr(torch, "compile") and not getattr(self, "is_distributed", False):
             try:
                 self.model = torch.compile(self.model)
             except Exception:
@@ -317,6 +419,54 @@ class ASDAGTrainer:
             self.val_loader = None
             self.val_data = None
 
+        if getattr(self, "is_distributed", False) and self.world_size > 1:
+            try:
+                _rank = self.rank
+                _ws = self.world_size
+                if self.train_data is not None:
+                    if isinstance(self.train_data, torch.Tensor):
+                        self.train_data = self.train_data[_rank::_ws].contiguous()
+                    elif isinstance(self.train_data, np.ndarray):
+                        self.train_data = self.train_data[_rank::_ws].copy()
+                    elif hasattr(self.train_data, "__getitem__"):
+                        try:
+                            self.train_data = self.train_data[_rank::_ws]
+                        except Exception:
+                            pass
+                elif self.train_loader is not None:
+                    try:
+                        from torch.utils.data.distributed import DistributedSampler
+                        if hasattr(self.train_loader, "data"):
+                            _d = self.train_loader.data
+                            if isinstance(_d, np.ndarray):
+                                if _d.ndim == 1:
+                                    _sharded = _d[_rank::_ws].copy()
+                                    self.train_loader.data = _sharded
+                                    if hasattr(self.train_loader, "stream_len"):
+                                        self.train_loader.stream_len = len(_sharded)
+                            elif isinstance(_d, torch.Tensor):
+                                _sharded = _d[_rank::_ws].contiguous()
+                                self.train_loader.data = _sharded
+                                if hasattr(self.train_loader, "stream_len"):
+                                    self.train_loader.stream_len = len(_sharded)
+                            elif isinstance(_d, list):
+                                self.train_loader.data = _d[_rank::_ws]
+                        if hasattr(self.train_loader, "data") and isinstance(self.train_loader.data, list) and not getattr(self.train_loader, "is_stream", False):
+                            try:
+                                _ds_len = len(self.train_loader.data)
+                                class _IdxDataset(torch.utils.data.Dataset):
+                                    def __len__(self_inner):
+                                        return _ds_len
+                                    def __getitem__(self_inner, idx):
+                                        return idx
+                                self.train_sampler = DistributedSampler(_IdxDataset(), num_replicas=_ws, rank=_rank, shuffle=getattr(self.train_loader, "shuffle", True))
+                            except Exception:
+                                self.train_sampler = None
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
 
         # Allocate pinned staging buffers on CPU for zero-copy DMA to CUDA
         if "cuda" in str(self.device):
@@ -333,8 +483,11 @@ class ASDAGTrainer:
         # Fused / standard AdamW
         fused = (self.device == "cuda" and hasattr(optim.AdamW, "_fused"))
         from affine_ai.models.hybrid import TorosHybridLanguageModel
-        if isinstance(self.model, TorosHybridLanguageModel):
-            self.hybrid = self.model
+        _unwrap2 = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        if isinstance(_unwrap2, TorosHybridLanguageModel):
+            self.hybrid = _unwrap2
+        elif getattr(_unwrap2, "hybrid", None) is not None:
+            self.hybrid = _unwrap2.hybrid
         elif getattr(self.model, "hybrid", None) is not None:
             self.hybrid = self.model.hybrid
         else:
@@ -692,6 +845,14 @@ class ASDAGTrainer:
         return loss.item() if sync_loss else loss.detach()
 
     def train(self, save_path: Optional[str] = None) -> Dict[str, Any]:
+        if getattr(self, "is_distributed", False):
+            try:
+                if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                    torch.cuda.set_device(self.local_rank % torch.cuda.device_count())
+                else:
+                    torch.cuda.set_device(self.local_rank)
+            except Exception:
+                pass
         self.model.train()
         best_val_loss = float("inf")
         start_time = time.time()
@@ -701,25 +862,60 @@ class ASDAGTrainer:
             gc.disable()
         try:
             for step in range(self.max_steps):
+                if getattr(self, "train_sampler", None) is not None:
+                    try:
+                        self.train_sampler.set_epoch(step)
+                    except Exception:
+                        pass
                 loss_val = self.train_step(step, sync_loss=False)
                 if step % 500 == 499:
                     gc.collect()
 
                 if step % self.eval_interval == 0 or step == self.max_steps - 1:
+                    if getattr(self, "is_distributed", False) and not getattr(self, "is_main", True):
+                        continue
                     eval_metrics = self.evaluate()
+                    if getattr(self, "is_distributed", False) and self.world_size > 1:
+                        try:
+                            _t = torch.tensor(eval_metrics["val_loss"], device=self.device if isinstance(self.device, torch.device) else torch.device(self.device) if "cuda" in str(self.device) and torch.cuda.is_available() else torch.device("cpu"))
+                            all_reduce_sum(_t)
+                            _t = _t / float(self.world_size)
+                            eval_metrics["val_loss"] = float(_t.item())
+                            eval_metrics["val_bpc"] = eval_metrics["val_loss"] / math.log(2)
+                            eval_metrics["val_ppl"] = math.exp(min(eval_metrics["val_loss"], 20.0))
+                        except Exception:
+                            pass
                     if eval_metrics["val_loss"] < best_val_loss:
                         best_val_loss = eval_metrics["val_loss"]
-                        if save_path:
+                        if save_path and getattr(self, "is_main", True):
                             import os as _os
                             _dir = _os.path.dirname(save_path)
                             if _dir:
                                 _os.makedirs(_dir, exist_ok=True)
-                            torch.save(self.model.state_dict(), save_path)
+                            try:
+                                _state = self.model.module.state_dict() if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model.state_dict()
+                            except Exception:
+                                _state = self.model.state_dict()
+                            torch.save(_state, save_path)
         finally:
             if gc_was_enabled:
                 gc.enable()
+            if getattr(self, "is_distributed", False):
+                try:
+                    barrier()
+                except Exception:
+                    pass
 
         total_time = time.time() - start_time
+        if getattr(self, "is_distributed", False) and self.world_size > 1:
+            try:
+                _dev = self.device if isinstance(self.device, torch.device) else torch.device(self.device) if "cuda" in str(self.device) and torch.cuda.is_available() else torch.device("cpu")
+                _b = torch.tensor(best_val_loss, device=_dev)
+                all_reduce_sum(_b)
+                _b = _b / float(self.world_size)
+                best_val_loss = float(_b.item())
+            except Exception:
+                pass
         return {
             "best_val_loss": best_val_loss,
             "best_val_bpc": best_val_loss / math.log(2),
@@ -765,6 +961,7 @@ def train(
     replay_ratio: float = 0.25,
     replay_buffer_capacity: int = 4000,
     replay_max_replays: int = 3,
+    distributed: Optional[bool] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -846,6 +1043,7 @@ def train(
         replay_ratio=replay_ratio,
         replay_buffer_capacity=replay_buffer_capacity,
         replay_max_replays=replay_max_replays,
+        distributed=distributed,
         **kwargs,
     )
     return trainer.train(save_path=save_path)

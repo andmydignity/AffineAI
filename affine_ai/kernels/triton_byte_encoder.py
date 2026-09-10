@@ -17,6 +17,28 @@ import triton
 import triton.language as tl
 
 
+def _is_turing() -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16.
+
+    Prefer canonical ``affine_ai.kernels._IS_TURING`` when available to avoid
+    redundant ``get_device_capability`` calls; fall back to direct
+    capability probe ``(7,5) <= cap < (8,0)``.
+    """
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
 class TritonByteEncoderFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -252,7 +274,8 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         M = T // P
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         BLOCK_M = 16
-        BLOCK_D = min(triton.next_power_of_2(D), 128)
+        # Turing sm_75: 64KB SMEM => clamp BLOCK_D <=64 (Ampere 128)
+        BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_fwd_kernel[grid](
             x, out,
@@ -271,7 +294,8 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         B, T, D, M, P = ctx.B, ctx.T, ctx.D, ctx.M, ctx.P
         dx = torch.empty((B, T, D), device=dout.device, dtype=ctx.dtype)
         BLOCK_M = 16
-        BLOCK_D = min(triton.next_power_of_2(D), 128)
+        # Turing sm_75: clamp BLOCK_D <=64
+        BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
         _patch_mean_pool_bwd_kernel[grid](
             dout, dx,
@@ -360,7 +384,7 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         weights = torch.empty((B, M, P_POW2), device=x.device, dtype=torch.float32)
 
         BLOCK_M = 16
-        BLOCK_D = min(triton.next_power_of_2(D), 128)
+        BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
         grid = (triton.cdiv(M, BLOCK_M), B)
 
         _patch_weighted_pool_fwd_kernel[grid](

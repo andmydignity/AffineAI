@@ -5,20 +5,54 @@ Eliminates memory bus contention and guarantees numerical stability (zero FP16/B
 via float32 row-reduction and fused autograd backward passes with hardware autotuning.
 """
 
+import warnings
+
 import torch
 import triton
 import triton.language as tl
 from typing import List, Optional, Tuple
 
 
+def _is_turing() -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16.
+
+    Prefer canonical ``affine_ai.kernels._IS_TURING`` when available to avoid
+    redundant ``get_device_capability`` calls; fall back to direct
+    capability probe ``(7,5) <= cap < (8,0)``.
+    """
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
 def _prune_fwd_bwd_configs(configs: List[triton.Config], named_args: dict, **kwargs) -> List[triton.Config]:
     """
     Prunes autotune configs to only evaluate powers of 2 that match the target dimension D.
     Ensures 128-bit aligned vectorization with zero extraneous configuration compile overhead.
+    On Turing (sm_75, 64KB SMEM) additionally prunes to BLOCK_SIZE <=64.
     """
+    # Turing SMEM cap: 64KB => clamp BLOCK_SIZE to <=64 to avoid SMEM overflow.
+    if _is_turing():
+        turing_pruned = [c for c in configs if c.kwargs.get('BLOCK_SIZE', 0) <= 64]
+        # Keep only turing-safe configs if any; otherwise fall through to dimension prune
+        if turing_pruned:
+            configs = turing_pruned
     D = kwargs.get('D', named_args.get('D', None))
     if D is not None:
         target_block = triton.next_power_of_2(D)
+        # Clamp target to 64 on Turing (64KB SMEM)
+        if _is_turing():
+            target_block = min(target_block, 64)
         valid_blocks = [c.kwargs['BLOCK_SIZE'] for c in configs]
         if target_block not in valid_blocks:
             ge_blocks = [b for b in valid_blocks if b >= D]
@@ -57,9 +91,15 @@ def _get_fwd_bwd_autotune_configs() -> List[triton.Config]:
 
 
 def _prune_dscale_configs(configs: List[triton.Config], named_args: dict, **kwargs) -> List[triton.Config]:
+    if _is_turing():
+        turing_pruned = [c for c in configs if c.kwargs.get('BLOCK_D', 0) <= 64]
+        if turing_pruned:
+            configs = turing_pruned
     D = kwargs.get('D', named_args.get('D', None))
     if D is not None:
         target = min(128, max(16, triton.next_power_of_2(D)))
+        if _is_turing():
+            target = min(target, 64)
         pruned = [c for c in configs if c.kwargs.get('BLOCK_D') == target]
         if pruned:
             return pruned
@@ -347,12 +387,33 @@ def _rms_norm_bwd_fused_kernel(
         tl.store(DX_ptr + offs_m[:, None] * stride_dxb + offs_d[None, :] * stride_dxd, dx.to(x_dtype), mask=mask_2d)
 
 
+def _maybe_warn_turing_bf16(dtype: torch.dtype, where: str) -> torch.dtype:
+    if _is_turing() and dtype == torch.bfloat16:
+        warnings.warn(
+            f"Turing sm_75 {where}: bf16 unsupported, forcing fp16→fp32 accum (bf16→fp16 fallback).",
+            stacklevel=3,
+        )
+        return torch.float16
+    return dtype
+
+
 class TritonRMSNormFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6):
+        # Turing: bf16 -> fp16 fallback, fp32 accum regardless
+        if _is_turing() and x.dtype == torch.bfloat16:
+            warnings.warn(
+                "Turing sm_75 RMSNorm: bf16 input unsupported, casting to fp16 with fp32 accum.",
+                stacklevel=3,
+            )
+            x = x.to(torch.float16)
+        if _is_turing() and scale.dtype == torch.bfloat16:
+            warnings.warn(
+                "Turing sm_75 RMSNorm scale: bf16 unsupported, casting to fp16.",
+                stacklevel=3,
+            )
+            scale = scale.to(torch.float16)
         orig_shape = x.shape
-        # R-13: BLOCK_SIZE=16 waste for D=1: tail mask ensures correctness, but 15/16 threads idle.
-        # Stride handling: non-contiguous x supported via contiguous copy below (R-12, stride correctness).
         if not x.is_contiguous():  # R-12: avoid redundant .contiguous()
             x = x.contiguous()
         x_flat = x.reshape(-1, orig_shape[-1])
@@ -409,6 +470,8 @@ class TritonRMSNormFunc(torch.autograd.Function):
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
             assert (dscale_acc == 0).all()  # R-08
             BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))  # R-05 heuristic
+            if _is_turing():
+                BLOCK_D = min(BLOCK_D, 64)
             grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
                 dy_flat, x_flat, scale, rsqrt, dx, dscale_acc,
@@ -583,9 +646,26 @@ def _fused_add_rms_norm_fwd_kernel(
 class TritonFusedAddRMSNormFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, residual: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6):
+        if _is_turing() and x.dtype == torch.bfloat16:
+            warnings.warn(
+                "Turing sm_75 fused RMSNorm: bf16 input unsupported, casting to fp16 with fp32 accum.",
+                stacklevel=3,
+            )
+            x = x.to(torch.float16)
+        if _is_turing() and residual.dtype == torch.bfloat16:
+            warnings.warn(
+                "Turing sm_75 fused RMSNorm residual: bf16 unsupported, casting to fp16.",
+                stacklevel=3,
+            )
+            residual = residual.to(torch.float16)
+        if _is_turing() and scale.dtype == torch.bfloat16:
+            warnings.warn(
+                "Turing sm_75 fused RMSNorm scale: bf16 unsupported, casting to fp16.",
+                stacklevel=3,
+            )
+            scale = scale.to(torch.float16)
         orig_shape = x.shape
         assert residual.shape == orig_shape, f"residual shape mismatch: residual.shape={residual.shape} != x.shape={orig_shape}"
-        # R-12: avoid redundant .contiguous(); R-09: N==0 early return; stride correctness for non-contiguous
         if not x.is_contiguous():
             x = x.contiguous()
         if not residual.is_contiguous():
@@ -653,6 +733,8 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
             assert (dscale_acc == 0).all()  # R-08: assert DScale_ptr is zeroed; reset_to_zero only for autotune
             BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))  # R-05 heuristic
+            if _is_turing():
+                BLOCK_D = min(BLOCK_D, 64)
             grid = lambda META: (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
                 dy_flat, res_out, scale, rsqrt, dx, dscale_acc,

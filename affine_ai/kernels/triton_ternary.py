@@ -17,6 +17,33 @@ import triton
 import triton.language as tl
 
 
+def _is_turing() -> bool:
+    """Return True on Turing sm_75 (7.5 <= cap < 8.0)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cap = torch.cuda.get_device_capability()
+        return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        return False
+
+
+def _maybe_cast_fp16_for_turing(t: torch.Tensor) -> torch.Tensor:
+    """Turing: bf16 unsupported — cast to fp16 with warning, keep acc fp32."""
+    if _is_turing() and t.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 unsupported, casting to fp16 (acc fp32)", stacklevel=3)
+        return t.to(torch.float16)
+    return t
+
+
+def _prune_turing_block(block: int) -> int:
+    """Clamp BLOCK to <=64 on Turing (64KB SMEM vs 164KB Ampere+)."""
+    if _is_turing() and block > 64:
+        warnings.warn(f"Turing sm_75: clamping BLOCK {block} -> 64 (64KB SMEM)", stacklevel=3)
+        return 64
+    return block
+
+
 @triton.jit
 def _row_amax_kernel(
     X, AMAX,
@@ -338,6 +365,20 @@ def _resolve_tc(use_tc: Optional[bool], x: torch.Tensor) -> bool:
 
 
 def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=None):
+    # Turing sm_75 FP16 AMP: force fp16 path, keep acc fp32
+    if _is_turing():
+        if x.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (ternary fwd, acc fp32)", stacklevel=2)
+            x = x.to(torch.float16)
+        if w_tern.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (ternary w, acc fp32)", stacklevel=2)
+            w_tern = w_tern.to(torch.float16)
+        if bias is not None and bias.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (bias, acc fp32)", stacklevel=2)
+            bias = bias.to(torch.float16)
+        # Disable bf16 TC on Turing; fp16 TC is ok but keep fp32 acc path
+        if use_tc is None and x.dtype == torch.bfloat16:
+            use_tc = False
     K = x.shape[-1]
     x2d = x.reshape(-1, K)
     M = x2d.shape[0]
@@ -349,9 +390,10 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
     out = torch.empty((M, N), device=x.device, dtype=torch.float32)
     has_bias = bias is not None
     tc = _resolve_tc(use_tc, x) and _tc_ok(x2d)
-    BLOCK_M_T = 64
-    BLOCK_N_T = 64
-    BLOCK_K_T = 32
+    # Turing BLOCK clamp to <=64 already autotuned; prune explicitly
+    BLOCK_M_T = _prune_turing_block(64)
+    BLOCK_N_T = _prune_turing_block(64)
+    BLOCK_K_T = _prune_turing_block(32)
     n_tiles = (N + BLOCK_N_T - 1) // BLOCK_N_T
     if n_tiles > 2 and x2d.is_cuda:
         try:
@@ -373,18 +415,17 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
             x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
             out.stride(0), out.stride(1),
             M, N, K,
-            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, HAS_BIAS=has_bias, USE_TC=tc,
+            BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32), HAS_BIAS=has_bias, USE_TC=tc,
             num_warps=4, num_stages=3)
     except Exception as e:
         warnings.warn(f"ternary fallback failed (USE_TC={tc}): {e}")
         if tc:
-            # Retry without TC to preserve input_precision="ieee" fallback; both paths use same rounding/clamp numerics.
             _ternary_fwd_kernel[_grid(M, N)](
                 x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),  # HAS_BIAS guard eliminates load even though pointer is dummy x2d
                 x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
                 out.stride(0), out.stride(1),
                 M, N, K,
-                BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, HAS_BIAS=has_bias, USE_TC=False,
+                BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32), HAS_BIAS=has_bias, USE_TC=False,
                 num_warps=4, num_stages=3)
         else:
             raise
@@ -392,6 +433,16 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
 
 
 def triton_fp32_linear(a, b, bias=None):
+    if _is_turing():
+        if a.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (fp32_linear a, acc fp32)", stacklevel=2)
+            a = a.to(torch.float16)
+        if b.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (fp32_linear b, acc fp32)", stacklevel=2)
+            b = b.to(torch.float16)
+        if bias is not None and bias.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (fp32_linear bias, acc fp32)", stacklevel=2)
+            bias = bias.to(torch.float16)
     a = a.contiguous()
     b = b.contiguous()
     K = a.shape[-1]
@@ -404,7 +455,7 @@ def triton_fp32_linear(a, b, bias=None):
         x2d, b, out, bias if has_bias else x2d,  # HAS_BIAS guard eliminates load even though pointer is dummy x2d
         x2d.stride(0), x2d.stride(1), b.stride(0), b.stride(1),
         out.stride(0), out.stride(1),
-        M, N, K, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32),
         HAS_BIAS=has_bias, num_warps=4, num_stages=3)
     return out.reshape(*a.shape[:-1], N)
 
@@ -451,6 +502,9 @@ def triton_ternary_linear(x, w_latent, bias=None, use_tc=None):
 class TritonTernaryTwinFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1_latent, b1, w2_latent, b2, use_tc=None):
+        if _is_turing() and x.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (twin fwd, acc fp32)", stacklevel=3)
+            x = x.to(torch.float16)
         orig_shape = x.shape
         in_dim = w1_latent.size(1)
         O = w1_latent.size(0)
@@ -470,11 +524,14 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
         M = x_flat.shape[0]
         out = torch.empty((M, 2 * O), device=x.device, dtype=torch.float32)
         tc = _resolve_tc(use_tc, x_flat) and _tc_ok(x_flat)
+        if _is_turing() and tc:
+            warnings.warn("Turing sm_75: disabling bf16 TC (acc fp32)", stacklevel=2)
+            tc = False
         _ternary_twin_fwd_kernel[_grid(M, 2 * O)](
             x_flat, w1t, w2t, b, out, amax, float(g1), float(g2),
             x_flat.stride(0), x_flat.stride(1), w1t.stride(0), w1t.stride(1),
             out.stride(0), out.stride(1),
-            M, O, in_dim, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+            M, O, in_dim, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block(32),
             HAS_BIAS=has_bias, USE_TC=tc, num_warps=4, num_stages=3)
         ctx.save_for_backward(x_flat, w1t, w2t, amax)
         ctx.g1, ctx.g2, ctx.has_bias = g1, g2, has_bias
@@ -512,6 +569,9 @@ def triton_ternary_twin(x, w1, b1, w2, b2, use_tc=None):
 
 
 def triton_ternary_linear_gw(go, x, amax, N, K, x_q=None):
+    if _is_turing() and go.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 -> fp16 (ternary gw, acc fp32)", stacklevel=2)
+        go = go.to(torch.float16)
     M = go.shape[0]
     if x_q is None:
         if x is not None and amax is not None:
@@ -523,7 +583,7 @@ def triton_ternary_linear_gw(go, x, amax, N, K, x_q=None):
         go, x_q, gw,
         go.stride(0), go.stride(1), x_q.stride(0), x_q.stride(1),
         gw.stride(0), gw.stride(1),
-        M, N, K, BLOCK_M=64, BLOCK_N=32, BLOCK_K=64,
+        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(32), BLOCK_K=_prune_turing_block(64),
         num_warps=4, num_stages=2)
     return gw
 

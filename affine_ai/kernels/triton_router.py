@@ -17,6 +17,22 @@ import triton
 import triton.language as tl
 
 
+def _is_turing() -> bool:
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
 @triton.jit
 def _router_cascade_topk_kernel(
     Logits, TopIdx, TopW,
@@ -103,6 +119,8 @@ def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):
     top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int64)
     top_w = torch.empty((B, top_k), device=node_logits.device, dtype=torch.float32)
     BLOCK_M = 32 if B < 64 else 64
+    if _is_turing():
+        BLOCK_M = min(BLOCK_M, 64)
     _router_cascade_topk_kernel[_grid(B, BLOCK_M)](
         node_logits, top_idx, top_w,
         node_logits.stride(0), node_logits.stride(1),

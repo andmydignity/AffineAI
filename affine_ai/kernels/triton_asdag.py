@@ -8,10 +8,28 @@ early-exit for sparse secondary context.
 """
 
 import math
+import warnings
 from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
+
+def _is_turing() -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
 
 
 # Autotune configs for BLOCK_M / BLOCK_D reuse across varying D
@@ -25,6 +43,13 @@ _ASDAG_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_M": 128, "BLOCK_D": 32}, num_warps=8),
     triton.Config({"BLOCK_M": 128, "BLOCK_D": 64}, num_warps=8),
 ]
+
+# Turing sm_75: prune autotune configs to BLOCK 32/64 only, remove 128 variants, num_warps 2/4 max, BLOCK <=64 (64KB SMEM).
+if _is_turing():
+    _ASDAG_AUTOTUNE_CONFIGS = [
+        c for c in _ASDAG_AUTOTUNE_CONFIGS
+        if c.kwargs.get("BLOCK_M", 32) <= 64 and c.kwargs.get("BLOCK_D", 32) <= 64 and c.num_warps <= 4
+    ]
 
 
 @triton.autotune(configs=_ASDAG_AUTOTUNE_CONFIGS, key=["B_SZ", "DIM"])
@@ -199,6 +224,7 @@ def _fused_asdag_2d_grid_kernel(
             # Mask handling: if d_out_start >= DIM, this block is phantom; dot will be masked out via store mask later
             # Accumulate only when both masks valid; extra blocks are no-ops (masked)
             # Use tl.where to zero contribution for out-of-range d_out
+            # Turing sm_75: tl.dot with fp16 uses m16n8k8 shape; BLOCK 32 aligns to 8, ok.
             contrib = tl.dot(x, w_k, input_precision=INPUT_PRECISION)
             # Only accumulate if this d_out_idx is within num_d_blocks
             # Triton if cannot be dynamic per loop iteration easily, so we guard with where-like:
@@ -342,11 +368,17 @@ class FusedASDAG2DFunction(torch.autograd.Function):
 
         # BLOCK_D heuristic: D=32 not multiple of 16 falls back to SIMT; suggest BLOCK_D=32 for D<=32
         # Autotune will refine BLOCK_M/D (32/64/128) but we still provide heuristic default for CPU fallback
+        # Turing sm_75: clamp BLOCK to <=64 (64KB SMEM), handle bf16 -> fp16 fallback.
+        if _is_turing() and x.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in fused_asdag_2d_triton", stacklevel=3)
         if D <= 32:
             BLOCK_D = 32
         else:
             BLOCK_D = min(64, triton.next_power_of_2(D))
         BLOCK_M = 64
+        if _is_turing():
+            BLOCK_D = min(BLOCK_D, 64)
+            BLOCK_M = min(BLOCK_M, 64)
 
         grid = (triton.cdiv(B, BLOCK_M), K)
 

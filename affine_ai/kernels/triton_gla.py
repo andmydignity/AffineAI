@@ -5,11 +5,34 @@ re-exporting Monarch permutation chain kernels from triton_monarch.
 """
 
 import math
+import warnings
 from typing import Tuple, Optional
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+
+def _is_turing() -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16.
+
+    Prefer canonical ``affine_ai.kernels._IS_TURING`` when available to avoid
+    redundant ``get_device_capability`` calls; fall back to direct
+    capability probe ``(7,5) <= cap < (8,0)``.
+    """
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
 
 # Re-export Monarch permutation chain functions and kernels (Issue 17)
 # NOTE: Circular-import risk — triton_monarch must not import from triton_gla.
@@ -35,6 +58,14 @@ _GLA_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8),
     triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=4),
 ]
+
+# Turing sm_75: 64KB SMEM cap, BLOCK <=64, num_warps 2/4 max, avoid BLOCK 128.
+# Filter autotune configs on Turing to keep only BLOCK 32/64 (and 16) with warps <=4.
+if _is_turing():
+    _GLA_AUTOTUNE_CONFIGS = [
+        c for c in _GLA_AUTOTUNE_CONFIGS
+        if c.kwargs.get("BLOCK", 32) <= 64 and c.kwargs.get("BLOCK_J", 32) <= 64 and c.num_warps <= 4
+    ]
 
 
 @triton.autotune(configs=_GLA_AUTOTUNE_CONFIGS, key=["T"])
@@ -185,7 +216,11 @@ def triton_gla_decay_fwd(cum_log_gam: torch.Tensor) -> torch.Tensor:
     out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=torch.float32)
     # Heuristic BLOCK selection: 32 if T<512 else 64 — balances occupancy vs coalescing
     # Autotune will refine choice via Triton configs keyed on T
+    # Turing sm_75: keep BLOCK 32 (64KB SMEM). Ensure T<512 heuristic stays 32 on Turing, not 64.
     BLOCK = 32 if T < 512 else 64
+    if _is_turing():
+        # Clamp to 32 on Turing to stay within 64KB SMEM; large T keeps 32 for occupancy.
+        BLOCK = 32
     grid = ((T + BLOCK - 1) // BLOCK, (T + BLOCK - 1) // BLOCK, B * H)
     _gla_decay_kernel[grid](
         cum_log_gam, out,
@@ -201,10 +236,17 @@ class TritonGLADecayFunction(torch.autograd.Function):
         # Clamp max=1.0 on gamma to prevent positive log growth in BF16 (Issue 15)
         # Clamp min=1e-5 to prevent log underflow (Issue 16)
         # Accumulation precision: cum computed in float32, final out downcast to gamma.dtype (bf16/fp16) — fp32 compute then to(dtype)
+        # Turing sm_75: bf16 fallback to fp16 (acc fp32), warn once.
+        if _is_turing() and gamma.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in TritonGLADecayFunction", stacklevel=3)
         log_gam = torch.log(gamma.float().clamp(min=1e-5, max=1.0))
         cum = torch.cumsum(log_gam, dim=-1)  # float32 cumsum; bf16/fp16 would lose precision
         # dtype-dependent underflow clamp: fp16 subnormal floor ~ -11, fp32/bf16 ~ -30
-        clamp_min = -11.0 if gamma.dtype == torch.float16 else -30.0
+        # Turing bf16 is treated as fp16 (clamp -11, fp32 acc).
+        if _is_turing() and gamma.dtype == torch.bfloat16:
+            clamp_min = -11.0
+        else:
+            clamp_min = -11.0 if gamma.dtype == torch.float16 else -30.0
         if gamma.is_cuda and torch.cuda.is_available():
             # TODO: pass clamp_min as tl.constexpr to _gla_decay_kernel instead of hard-coded -30
             out = triton_gla_decay_fwd(cum.contiguous())
@@ -266,9 +308,16 @@ def triton_gla_linear_attention(
     """
     B, H, T, D = q.shape
     dtype = q.dtype
-    eps = 1e-4 if dtype == torch.float16 else 1e-5
-    # dtype-dependent clamp: fp16 subnormal threshold ~ -11, fp32/bf16 ~ -30
-    clamp_min = -11.0 if dtype == torch.float16 else -30.0
+    # Turing sm_75: bf16 -> fp16 fallback, warn
+    if _is_turing() and dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_gla_linear_attention", stacklevel=2)
+        eps = 1e-4
+        clamp_min = -11.0
+    else:
+        eps = 1e-4 if dtype == torch.float16 else 1e-5
+        # dtype-dependent clamp: fp16 subnormal threshold ~ -11, fp32/bf16 ~ -30
+        # Turing bf16 treated as fp16 above.
+        clamp_min = -11.0 if dtype == torch.float16 else -30.0
 
     if T <= chunk_size:
         log_gam = torch.log(gamma.float().clamp(min=1e-5, max=1.0))

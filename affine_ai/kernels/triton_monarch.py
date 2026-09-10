@@ -7,10 +7,33 @@ Eliminates intermediate VRAM writes across all Monarch projection stages.
 """
 
 import math
+import warnings
 from typing import Tuple, Optional
 import torch
 import triton
 import triton.language as tl
+
+
+def _is_turing() -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
+def _maybe_warn_bf16_turing(dtype: torch.dtype, where: str) -> None:
+    if _is_turing() and dtype == torch.bfloat16:
+        warnings.warn(f"Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in {where}", stacklevel=3)
 
 
 def precompute_monarch_composed_single(diagonals: torch.Tensor, perms: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -55,6 +78,13 @@ _MONARCH_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_M": 64, "BLOCK_D": 64}, num_warps=4),
     triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=4),
 ]
+
+# Turing sm_75: prune to BLOCK 32/64 only, remove 128 variants, num_warps 2/4 max, BLOCK <=64.
+if _is_turing():
+    _MONARCH_AUTOTUNE_CONFIGS = [
+        c for c in _MONARCH_AUTOTUNE_CONFIGS
+        if c.kwargs.get("BLOCK_M", 32) <= 64 and c.kwargs.get("BLOCK_D", 32) <= 64 and c.num_warps <= 4
+    ]
 
 
 @triton.autotune(configs=_MONARCH_AUTOTUNE_CONFIGS, key=["N", "D"])
@@ -215,6 +245,9 @@ def _fused_monarch_chain_fwd_kernel(
 
 def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     N, D = x.shape
+    # Turing sm_75: bf16 fallback to fp16 (acc fp32) with warning.
+    _maybe_warn_bf16_turing(x.dtype, "triton_monarch_chain_fwd")
+    _maybe_warn_bf16_turing(diagonals.dtype, "triton_monarch_chain_fwd")
     if not x.is_cuda or not torch.cuda.is_available():
         # CPU fallback: cache perms long+contiguous outside loop to avoid per-iteration alloc
         perms_long = [p.long().contiguous() for p in perms]
@@ -238,6 +271,8 @@ def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: to
 def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     N, D = x.shape
     M = diagonals.shape[0]
+    _maybe_warn_bf16_turing(x.dtype, "triton_fused_monarch_chain_fwd")
+    _maybe_warn_bf16_turing(diagonals.dtype, "triton_fused_monarch_chain_fwd")
     if not x.is_cuda or not torch.cuda.is_available():
         perms_long = [p.long().contiguous() for p in perms]
         h = x.unsqueeze(0) * diagonals[:, 0].unsqueeze(1)

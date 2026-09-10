@@ -11,11 +11,44 @@ for in-place, forward-only local error learning:
 Coalesced access via tl.make_block_ptr with boundary_check for tails.
 """
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Tuple, Optional
+
+
+def _is_turing() -> bool:
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
+def _prune_turing_lpc_configs(configs, named_args, **kwargs):
+    if _is_turing():
+        pruned = [
+            c
+            for c in configs
+            if c.kwargs.get("BLOCK_M", 64) <= 64
+            and c.kwargs.get("BLOCK_V", 64) <= 64
+            and c.kwargs.get("BLOCK_D", 64) <= 64
+            and c.kwargs.get("BLOCK_N", 64) <= 64
+        ]
+        if pruned:
+            return pruned
+    return configs
 
 
 def _use_torch_path(V: int) -> bool:
@@ -54,6 +87,7 @@ lpc_bwd_dw_configs = [
 @triton.autotune(
     configs=lpc_fwd_configs,
     key=['D', 'V', 'BLOCK_M'],
+    prune_configs_by={'early_config_prune': _prune_turing_lpc_configs},
 )
 @triton.jit
 def _triton_lpc_fwd_kernel(
@@ -120,6 +154,7 @@ def _triton_lpc_fwd_kernel(
 @triton.autotune(
     configs=lpc_bwd_dh_configs,
     key=['D', 'V', 'BLOCK_M'],
+    prune_configs_by={'early_config_prune': _prune_turing_lpc_configs},
 )
 @triton.jit
 def _triton_lpc_bwd_dh_kernel(
@@ -176,6 +211,7 @@ def _triton_lpc_bwd_dh_kernel(
 @triton.autotune(
     configs=lpc_bwd_dw_configs,
     key=['D', 'V', 'BLOCK_M'],
+    prune_configs_by={'early_config_prune': _prune_turing_lpc_configs},
 )
 @triton.jit
 def _triton_lpc_bwd_dw_kernel(
@@ -239,6 +275,20 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         targets: torch.Tensor,
         ignore_index: int = -100
     ) -> torch.Tensor:
+        # Turing sm_75: 64KB SMEM => BLOCK<=64 already pruned; force fp16→fp32 accum even if bf16; bf16→fp16 fallback
+        if _is_turing():
+            if h.dtype == torch.bfloat16:
+                warnings.warn(
+                    "Turing sm_75 LPC: bf16 unsupported, forcing fp16→fp32 accum (bf16→fp16 fallback).",
+                    stacklevel=3,
+                )
+                h = h.to(torch.float16)
+            if weight.dtype == torch.bfloat16:
+                warnings.warn(
+                    "Turing sm_75 LPC weight: bf16 unsupported, forcing fp16.",
+                    stacklevel=3,
+                )
+                weight = weight.to(torch.float16)
         # Keep original weight untouched; compute matmuls in promoted dtype without mutating param
         calc_dtype = torch.float32 if h.dtype in (torch.bfloat16, torch.float16) else (torch.float64 if h.dtype == torch.float64 else h.dtype)
         weight_compute = weight.to(calc_dtype) if weight.dtype != calc_dtype else weight

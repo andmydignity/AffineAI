@@ -15,6 +15,24 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import warnings
+
+
+def _is_turing() -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
 
 
 @triton.jit
@@ -101,9 +119,18 @@ def triton_tree_perm_fwd(r_in, w_perm, bias, perms, top_idx, top_w):
     K, P, Dp = w_perm.shape
     Tk = top_idx.shape[1]
     assert Dp == D
+    # Turing sm_75: bf16 -> fp16 fallback (acc fp32), warn. BLOCK <=64 (64KB SMEM), num_warps 2/4 max.
+    if _is_turing() and r_in.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_tree_perm_fwd", stacklevel=2)
+    if _is_turing() and w_perm.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_tree_perm_fwd (w_perm)", stacklevel=2)
     out = torch.empty((B, D), device=r_in.device, dtype=torch.float32)
     # BLOCK_B=16 BLOCK_D=32 handles non-divisible B/D via masking in kernel (mask_b/mask_d)
+    # Turing: clamp to <=64, avoid 128.
     BM, BD = 16, 32
+    if _is_turing():
+        BM = min(BM, 64)
+        BD = min(BD, 64)
     grid = ((B + BM - 1) // BM, (D + BD - 1) // BD)
     _tree_perm_fwd_kernel[grid](
         r_in, w_perm, bias, perms, top_idx, top_w, out,
@@ -312,6 +339,10 @@ class TritonTreePermFunction(torch.autograd.Function):
         act = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=torch.float32) if store_act else torch.empty(0, device=r_flat.device, dtype=torch.float32)
 
         BM, BD = 16, 32
+        # Turing: ensure BLOCK <=64 (64KB SMEM)
+        if _is_turing():
+            BM = min(BM, 64)
+            BD = min(BD, 64)
         grid = ((B_flat + BM - 1) // BM, (D + BD - 1) // BD)
 
         _tree_perm_bwd_dprim_kernel[grid](
@@ -352,6 +383,9 @@ class TritonTreePermFunction(torch.autograd.Function):
             gw = torch.zeros(w_perm.shape, dtype=torch.float32, device=w_perm.device)
             BD_GW = 32
             BM_GW = 32
+            if _is_turing():
+                BD_GW = min(BD_GW, 64)
+                BM_GW = min(BM_GW, 64)
             grid_gw = (K, P, (D + BD_GW - 1) // BD_GW)
             _tree_perm_bwd_gw_kernel[grid_gw](
                 d_prim, r_flat, perms_f, top_idx_flat, gw,

@@ -9,11 +9,44 @@ Supports arbitrary hidden dimensions D (chunked accumulation), arbitrary vocabul
 and autotuned block layouts for optimal warp reduction throughput.
 """
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Tuple, Optional
+
+
+def _is_turing() -> bool:
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
+def _prune_turing_ce_configs(configs, named_args, **kwargs):
+    if _is_turing():
+        pruned = [
+            c
+            for c in configs
+            if c.kwargs.get("BLOCK_M", 64) <= 64
+            and c.kwargs.get("BLOCK_V", 64) <= 64
+            and c.kwargs.get("BLOCK_D", 64) <= 64
+            and c.kwargs.get("BLOCK_N", 64) <= 64
+        ]
+        if pruned:
+            return pruned
+    return configs
 
 
 def _use_torch_path(V: int) -> bool:
@@ -39,6 +72,7 @@ fwd_configs = [
 @triton.autotune(
     configs=fwd_configs,
     key=['D', 'V'],
+    prune_configs_by={'early_config_prune': _prune_turing_ce_configs},
 )
 @triton.jit
 def _fused_linear_cross_entropy_fwd_kernel(
@@ -125,6 +159,7 @@ bwd_dh_configs = [
 @triton.autotune(
     configs=bwd_dh_configs,
     key=['D', 'V'],
+    prune_configs_by={'early_config_prune': _prune_turing_ce_configs},
 )
 @triton.jit
 def _fused_linear_cross_entropy_bwd_dh_kernel(
@@ -208,6 +243,7 @@ bwd_dw_configs = [
 @triton.autotune(
     configs=bwd_dw_configs,
     key=['D', 'V'],
+    prune_configs_by={'early_config_prune': _prune_turing_ce_configs},
 )
 @triton.jit
 def _fused_linear_cross_entropy_bwd_dw_kernel(
@@ -272,16 +308,30 @@ class _TritonFusedLinearCrossEntropyFunc(torch.autograd.Function):
         targets: torch.Tensor,
         ignore_index: int = -100
     ) -> torch.Tensor:
+        # Turing sm_75: 64KB SMEM cap => BLOCK<=64 already pruned; clamp dtype bf16→fp16 with fp32 accum
+        if _is_turing():
+            if h.dtype == torch.bfloat16:
+                warnings.warn(
+                    "Turing sm_75 CE: bf16 unsupported, forcing fp16→fp32 accum (bf16→fp16 fallback).",
+                    stacklevel=3,
+                )
+                h = h.to(torch.float16)
+            if weight.dtype == torch.bfloat16:
+                warnings.warn(
+                    "Turing sm_75 CE weight: bf16 unsupported, forcing fp16.",
+                    stacklevel=3,
+                )
+                weight = weight.to(torch.float16)
         if weight.dtype != h.dtype:
             weight = weight.to(h.dtype)
         h = h.contiguous()
         weight = weight.contiguous()
         targets = targets.contiguous()
-        assert targets.stride(0) == 1 or targets.numel() <= 1, "Targets stride assumes 1-D contiguous (C-08)"
 
         orig_shape = h.shape
         h_flat = h.view(-1, orig_shape[-1])
         targets_flat = targets.view(-1)
+        assert targets_flat.stride(0) == 1 or targets_flat.numel() <= 1, "Targets stride assumes 1-D contiguous (C-08)"
 
         N, D = h_flat.shape
         V = weight.shape[0]

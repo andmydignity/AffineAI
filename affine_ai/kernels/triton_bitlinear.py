@@ -8,16 +8,58 @@ Note: No 2:4 structured sparsity mask is applied; earlier header overstated
 """
 
 import math
+import warnings
 from typing import Optional, Tuple, Any
 import torch
 import triton
 import triton.language as tl
+
+
+def _is_turing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cap = torch.cuda.get_device_capability()
+        return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        return False
+
+
+def _maybe_cast_fp16_for_turing(t: torch.Tensor) -> torch.Tensor:
+    if _is_turing() and t.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 unsupported, casting to fp16 (acc fp32)", stacklevel=3)
+        return t.to(torch.float16)
+    return t
+
+
+def _prune_turing_block(block: int) -> int:
+    if _is_turing() and block > 64:
+        warnings.warn(f"Turing sm_75: clamping BLOCK {block} -> 64 (64KB SMEM)", stacklevel=3)
+        return 64
+    return block
+
 
 _swiglu_autotune_configs = [
     triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
     triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
 ]
+
+def _turing_prune_configs(configs):
+    if not _is_turing():
+        return configs
+    pruned = []
+    for c in configs:
+        bm = c.kwargs.get('BLOCK_M', 32)
+        bn = c.kwargs.get('BLOCK_N', 32)
+        bk = c.kwargs.get('BLOCK_K', 32)
+        if bm <= 64 and bn <= 64 and bk <= 64:
+            pruned.append(c)
+        else:
+            warnings.warn(f"Turing sm_75: pruning BLOCK config {c.kwargs} >64", stacklevel=2)
+    return pruned if pruned else configs
+
+_swiglu_autotune_configs = _turing_prune_configs(_swiglu_autotune_configs)
 
 
 @triton.autotune(configs=_swiglu_autotune_configs, key=['M', 'N', 'K'])
@@ -164,6 +206,16 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         gamma_gv: Any = None,
         gamma_d: Any = None
     ) -> torch.Tensor:
+        if _is_turing():
+            if x.dtype == torch.bfloat16:
+                warnings.warn("Turing sm_75: bf16 -> fp16 (bitlinear fwd, acc fp32)", stacklevel=2)
+                x = x.to(torch.float16)
+            if w_gate_val.dtype == torch.bfloat16:
+                warnings.warn("Turing sm_75: bf16 -> fp16 (bitlinear w_gv, acc fp32)", stacklevel=2)
+                w_gate_val = w_gate_val.to(torch.float16)
+            if w_down.dtype == torch.bfloat16:
+                warnings.warn("Turing sm_75: bf16 -> fp16 (bitlinear w_down, acc fp32)", stacklevel=2)
+                w_down = w_down.to(torch.float16)
         orig_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1]).contiguous()
         M, K = x_flat.shape
@@ -254,5 +306,14 @@ def triton_bitlinear_swiglu(
 ) -> torch.Tensor:
     """
     High-Performance Fused BitLinear SwiGLU on CUDA with Intra-Kernel SRAM Fusion.
+    Turing sm_75: fp16 AMP, acc fp32.
     """
+    if _is_turing():
+        if x.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (bitlinear api, acc fp32)", stacklevel=2)
+            x = x.to(torch.float16)
+        if w_gate_val.dtype == torch.bfloat16:
+            w_gate_val = w_gate_val.to(torch.float16)
+        if w_down.dtype == torch.bfloat16:
+            w_down = w_down.to(torch.float16)
     return TritonBitLinearSwiGLUFunction.apply(x, w_gate_val, w_down, gamma_gv, gamma_d)

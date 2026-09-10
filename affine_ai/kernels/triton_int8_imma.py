@@ -6,10 +6,44 @@ Executes quantized matrix multiplications using Ampere's hardware INT8 Tensor Co
 than FP16/BF16 Tensor Cores with zero loss in discrete accuracy.
 """
 
+import warnings
 import torch
 import triton
 import triton.language as tl
 from typing import Optional, Tuple
+
+
+def _is_turing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cap = torch.cuda.get_device_capability()
+        return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        return False
+
+
+def _maybe_cast_fp16_for_turing(t: torch.Tensor) -> torch.Tensor:
+    if _is_turing() and t.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 -> fp16 (int8_imma, acc fp32)", stacklevel=3)
+        return t.to(torch.float16)
+    return t
+
+
+def _prune_turing_block(block: int) -> int:
+    if _is_turing() and block > 64:
+        warnings.warn(f"Turing sm_75: clamping BLOCK {block} -> 64 (64KB SMEM)", stacklevel=3)
+        return 64
+    return block
+
+
+def _turing_fp16_matmul_fallback(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
+    x_f = _maybe_cast_fp16_for_turing(x).float()
+    w_f = _maybe_cast_fp16_for_turing(weight).float()
+    out = torch.matmul(x_f.reshape(-1, x_f.shape[-1]), w_f.t())
+    if bias is not None:
+        out = out + bias.float().reshape(-1)
+    return out.reshape(*x.shape[:-1], weight.shape[0]).to(x.dtype if not _is_turing() or x.dtype != torch.bfloat16 else torch.float16)
 
 
 @triton.autotune(
@@ -81,8 +115,37 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if _is_turing():
+            warnings.warn("Turing sm_75: INT8 m16n8k32 inefficient, fallback to fp16 matmul (acc fp32)", stacklevel=2)
+            x_f = _maybe_cast_fp16_for_turing(x)
+            w_f = _maybe_cast_fp16_for_turing(weight)
+            b_f = _maybe_cast_fp16_for_turing(bias) if bias is not None else None
+            K = x_f.shape[-1]
+            if K > 16384:
+                warnings.warn(f"Turing sm_75: clamping K {K} -> 16384 (int32 acc bound)", stacklevel=2)
+                K = 16384
+                x_f = x_f[..., :K]
+                w_f = w_f[..., :K]
+            orig_shape = x_f.shape
+            x_flat = x_f.reshape(-1, x_f.shape[-1]).contiguous().float()
+            w_flat = w_f.contiguous().float()
+            M = x_flat.shape[0]
+            N = w_flat.shape[0]
+            out = torch.matmul(x_flat, w_flat.t())
+            if b_f is not None:
+                out = out + b_f.float().reshape(-1)
+            out = out.to(x_f.dtype).reshape(*orig_shape[:-1], N)
+            ctx.save_for_backward(x_flat, weight, bias)
+            ctx.orig_shape = orig_shape
+            return out
         orig_shape = x.shape
         K = x.shape[-1]
+        if K > 16384:
+            warnings.warn(f"INT8 IMMA overflow: clamping K {K} -> 16384 (int32 acc bound)", stacklevel=2)
+            K = 16384
+            x = x[..., :K]
+            weight = weight[..., :K]
+        assert K <= 16384, f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384"
         x_flat = x.reshape(-1, K).contiguous()
         M = x_flat.shape[0]
         N = weight.shape[0]
@@ -107,8 +170,6 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             bias_tensor = x_flat
             stride_b = 0
 
-        # INT8 int32 acc overflow at K>16384; assert for safety
-        assert K <= 16384, f"INT8 IMMA overflow: K={K} exceeds int32 acc bound 16384"
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
         _int8_imma_gemm_kernel[grid](
@@ -150,5 +211,23 @@ def triton_int8_imma_linear(
 ) -> torch.Tensor:
     """
     Executes Linear projection (x @ weight^T + bias) via hardware INT8 Tensor Cores.
+    Turing sm_75: INT8 m16n8k32 inefficient — fallback to fp16 matmul (acc fp32), clamp K.
     """
+    if _is_turing():
+        warnings.warn("Turing sm_75: INT8 m16n8k32 inefficient on Turing, fallback to torch.matmul fp16 (acc fp32)", stacklevel=2)
+        K = x.shape[-1]
+        if K > 16384:
+            warnings.warn(f"Turing sm_75: clamping K {K} -> 16384", stacklevel=2)
+            x = x[..., :16384]
+            weight = weight[..., :16384]
+        x_f = _maybe_cast_fp16_for_turing(x).float()
+        w_f = _maybe_cast_fp16_for_turing(weight).float()
+        out = torch.matmul(x_f.reshape(-1, x_f.shape[-1]), w_f.t())
+        if bias is not None:
+            b_f = _maybe_cast_fp16_for_turing(bias).float()
+            out = out + b_f.reshape(-1)
+        return out.reshape(*x.shape[:-1], weight.shape[0]).to(x.dtype if x.dtype != torch.bfloat16 else torch.float16)
+    K = x.shape[-1]
+    if K > 16384:
+        warnings.warn(f"Clamping K {K} -> 16384 for int32 acc safety", stacklevel=2)
     return TritonINT8IMMAFunction.apply(x, weight, bias)

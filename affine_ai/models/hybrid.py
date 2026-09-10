@@ -28,6 +28,36 @@ from affine_ai.models.blt import ByteLocalEncoder, EntropyPatcher, ByteLocalDeco
 from affine_ai.models.jepa import TorosEncoder, TorosJEPAConfig
 
 
+def _is_turing() -> bool:
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
+def get_turing_dtype(dtype=None):
+    """Returns torch.float16 on Turing / pre-Ampere (cap < 8.0), else passed dtype."""
+    try:
+        if torch.cuda.is_available():
+            cap = tuple(torch.cuda.get_device_capability())
+            if cap < (8, 0):
+                return torch.float16
+    except Exception:
+        pass
+    if dtype is not None:
+        return dtype
+    return torch.bfloat16
+
+
 @dataclass
 class TorosHybridConfig:
     dim: int = 136
@@ -176,8 +206,19 @@ class TorosHybridLanguageModel(nn.Module):
             config = TorosHybridConfig(**{k: v for k, v in config.items() if k in allowed})
         self.config = config or TorosHybridConfig()
         if self.config.dtype == torch.bfloat16 and torch.cuda.is_available():
-            if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+            # Turing sm_75 FP16 fallback: bf16→fp16 when cap<8 (Turing) or bf16 unsupported
+            if get_turing_dtype(self.config.dtype) == torch.float16:
                 self.config.dtype = torch.float16
+            elif hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+                self.config.dtype = torch.float16
+        # Ensure Turing also forces fp16 even if config was explicitly bf16 before jepa_cfg
+        if torch.cuda.is_available():
+            try:
+                _cap = tuple(torch.cuda.get_device_capability())
+                if _cap < (8, 0) and self.config.dtype == torch.bfloat16:
+                    self.config.dtype = torch.float16
+            except Exception:
+                pass
         
         jepa_cfg = TorosJEPAConfig(
             dim=self.config.dim,

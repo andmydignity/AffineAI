@@ -18,6 +18,22 @@ import triton
 import triton.language as tl
 
 
+def _is_turing() -> bool:
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
 @triton.jit
 def _fused_perm_proj_fwd_kernel(
     X, W, Perms, Biases, Out,
@@ -241,7 +257,9 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
 
         out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
 
-        BN, BD = max(16, min(64, triton.next_power_of_2(N))), max(16, min(64, triton.next_power_of_2(D)))
+        _bd_cap = 64 if _is_turing() else 64
+        _bn_cap = 64 if _is_turing() else 64
+        BN, BD = max(16, min(_bn_cap, triton.next_power_of_2(N))), max(16, min(_bd_cap, triton.next_power_of_2(D)))
         grid = (triton.cdiv(N, BN), triton.cdiv(D, BD))
 
         _fused_perm_proj_fwd_kernel[grid](
@@ -272,7 +290,9 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
         P = perms_c.shape[0]
 
         gx = torch.empty_like(x_flat)
-        BN, BD = max(16, min(64, triton.next_power_of_2(N))), max(16, min(64, triton.next_power_of_2(D)))
+        _bd_cap2 = 64 if _is_turing() else 64
+        _bn_cap2 = 64 if _is_turing() else 64
+        BN, BD = max(16, min(_bn_cap2, triton.next_power_of_2(N))), max(16, min(_bd_cap2, triton.next_power_of_2(D)))
         grid_gx = (triton.cdiv(N, BN), triton.cdiv(D, BD))
 
         _fused_perm_proj_bwd_gx_kernel[grid_gx](

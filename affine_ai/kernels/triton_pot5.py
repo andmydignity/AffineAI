@@ -24,6 +24,7 @@ Key Algorithmic Innovations:
 """
 
 import math
+import warnings
 from typing import Optional, Tuple, Any
 import numpy as np
 import torch
@@ -38,6 +39,54 @@ except ImportError:
     triton = None
     tl = None
     HAS_TRITON = False
+
+
+def _is_turing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cap = torch.cuda.get_device_capability()
+        return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        return False
+
+
+def _maybe_cast_fp16_for_turing(t: torch.Tensor) -> torch.Tensor:
+    if _is_turing() and t.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 -> fp16 (pot5, acc fp32)", stacklevel=3)
+        return t.to(torch.float16)
+    return t
+
+
+def _prune_turing_block(block: int) -> int:
+    if _is_turing() and block > 64:
+        warnings.warn(f"Turing sm_75: clamping BLOCK {block} -> 64 (64KB SMEM)", stacklevel=3)
+        return 64
+    return block
+
+
+def _turing_fp16_fallback_linear(x: torch.Tensor, w_eff: torch.Tensor) -> torch.Tensor:
+    x_f = _maybe_cast_fp16_for_turing(x).float()
+    w_f = w_eff.float()
+    orig_shape = x_f.shape
+    x2d = x_f.reshape(-1, orig_shape[-1])
+    out = torch.matmul(x2d, w_f.t())
+    return out.reshape(*orig_shape[:-1], w_f.shape[0]).to(x.dtype if not _is_turing() or x.dtype != torch.bfloat16 else torch.float16)
+
+
+def _turing_prune_configs(configs):
+    if not _is_turing():
+        return configs
+    pruned = []
+    for c in configs:
+        bm = c.kwargs.get('BLOCK_M', 32)
+        bn = c.kwargs.get('BLOCK_N', 32)
+        bk = c.kwargs.get('BLOCK_K', 32)
+        if bm <= 64 and bn <= 64 and bk <= 64:
+            pruned.append(c)
+        else:
+            warnings.warn(f"Turing sm_75: pruning BLOCK config {c.kwargs} >64", stacklevel=2)
+    return pruned if pruned else configs
 
 
 # ---------------------------------------------------------------------------
@@ -307,16 +356,25 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
     """
     PyTorch Autograd Wrapper for 5-State POT Linear layer.
     Uses custom Triton kernels on CUDA, with pure PyTorch fallback on CPU.
+    Turing sm_75: 5-state relies on int8-like path — fallback to fp16 linear (acc fp32), BLOCK<=64.
     """
     @staticmethod
     def forward(ctx, x: torch.Tensor, w: torch.Tensor, alpha: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if _is_turing():
+            if x.dtype == torch.bfloat16 or w.dtype == torch.bfloat16:
+                warnings.warn("Turing sm_75: bf16 -> fp16 (pot5 5-state, acc fp32)", stacklevel=2)
+            x = _maybe_cast_fp16_for_turing(x)
+            w = _maybe_cast_fp16_for_turing(w)
+            if alpha is not None and alpha.dtype == torch.bfloat16:
+                alpha = alpha.to(torch.float16)
+            if x.shape[-1] > 16384:
+                warnings.warn(f"Turing sm_75: clamping K {x.shape[-1]} -> 16384", stacklevel=2)
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
         M, K = x_2d.shape
         N = w.shape[0]
 
         if alpha is None:
-            # Optimal scalar reconstruction factor
             alpha = (w.float().abs().mean() * 1.4).to(x.dtype)
         if alpha.ndim == 0:
             alpha = alpha.unsqueeze(0)
@@ -324,6 +382,11 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
         ctx.save_for_backward(x_2d, w, alpha)
         ctx.orig_shape = orig_shape
 
+        if _is_turing():
+            warnings.warn("Turing sm_75: 5-state POT fallback to fp16 matmul (acc fp32), BLOCK<=64", stacklevel=2)
+            w_eff = _pot5_quantize_weight(w, alpha)
+            out = _turing_fp16_fallback_linear(x_2d, w_eff)
+            return out.reshape(*orig_shape[:-1], N)
         if x.is_cuda and HAS_TRITON:
             y = torch.empty((M, N), device=x.device, dtype=x.dtype)
             grid = lambda META: (
@@ -339,7 +402,6 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
             )
             return y.reshape(*orig_shape[:-1], N)
         else:
-            # Vectorized PyTorch reference fallback (unified thresholds, no host sync)
             w_eff = _pot5_quantize_weight(w, alpha)
             out = F.linear(x_2d, w_eff.to(x.dtype))
             return out.reshape(*orig_shape[:-1], N)
@@ -376,7 +438,10 @@ class _Triton5StatePOTFunction(torch.autograd.Function):
 
 
 def triton_pot5_linear(x: torch.Tensor, w: torch.Tensor, alpha: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Evaluates Linear layer with 5-State POT weights via Triton GPU acceleration."""
+    """Evaluates Linear layer with 5-State POT weights via Triton GPU acceleration. Turing: fp16 fallback, acc fp32, BLOCK<=64."""
+    if _is_turing() and x.dtype == torch.bfloat16:
+        warnings.warn("Turing sm_75: bf16 -> fp16 (pot5 linear api, acc fp32)", stacklevel=2)
+        x = x.to(torch.float16)
     return _Triton5StatePOTFunction.apply(x, w, alpha)
 
 
@@ -389,7 +454,28 @@ def triton_pot5_int8_linear(
     Route A: Hardware INT8 IMMA Matrix Multiplication for 5-State POT.
     Quantizes activations to INT8 and weights to {-2, -1, 0, 1, 2},
     running via mma.sync.s8.s8 at 2x BF16 Tensor Core throughput.
+    Turing sm_75: INT8 m16n8k32 inefficient — fallback to fp16 matmul (acc fp32), BLOCK<=64, clamp K.
     """
+    if _is_turing():
+        warnings.warn("Turing sm_75: pot5_int8 INT8 inefficient, fallback to fp16 matmul (acc fp32)", stacklevel=2)
+        if x.dtype == torch.bfloat16 or w.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (pot5_int8, acc fp32)", stacklevel=2)
+        x = _maybe_cast_fp16_for_turing(x)
+        w = _maybe_cast_fp16_for_turing(w)
+        if alpha is not None and alpha.dtype == torch.bfloat16:
+            alpha = alpha.to(torch.float16)
+        K = x.shape[-1]
+        if K > 16384:
+            warnings.warn(f"Turing sm_75: clamping K {K} -> 16384", stacklevel=2)
+            x = x[..., :16384]
+            w = w[..., :16384]
+        if alpha is None:
+            alpha = (w.float().abs().mean() * 1.4).to(x.dtype)
+        if alpha.ndim == 0:
+            alpha = alpha.unsqueeze(0)
+        w_eff = _pot5_quantize_weight(w, alpha)
+        out = _turing_fp16_fallback_linear(x, w_eff)
+        return out
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1])
     M, K = x_2d.shape
@@ -399,6 +485,12 @@ def triton_pot5_int8_linear(
         alpha = (w.float().abs().mean() * 1.4).to(x.dtype)
     if alpha.ndim == 0:
         alpha = alpha.unsqueeze(0)
+
+    if K > 16384:
+        warnings.warn(f"Clamping K {K} -> 16384 for int32 acc safety", stacklevel=2)
+        K = 16384
+        x_2d = x_2d[..., :K]
+        w = w[..., :K]
 
     # Quantize activations to INT8 with per-token scale
     amax_x = x_2d.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
@@ -424,7 +516,6 @@ def triton_pot5_int8_linear(
         )
         return y.reshape(*orig_shape[:-1], N)
     else:
-        # Fallback: exact scaled integer math (device-side scale, no sync)
         alpha_f = alpha.to(w_int8.device).float()
         w_eff = (w_int8.float() * 0.5) * alpha_f
         out = F.linear(x_2d, w_eff.to(x.dtype))
@@ -439,7 +530,16 @@ def triton_pot5_fused_swiglu(
     """
     Fused 5-State POT SwiGLU:
       Computes Out = (SiLU(Gate) * Up) @ W_down_pot5.T directly in GPU SRAM registers.
+    Turing sm_75: fallback to fp16 linear (acc fp32), BLOCK<=64.
     """
+    if _is_turing():
+        if gate_up.dtype == torch.bfloat16 or w_down.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (pot5 swiglu, acc fp32)", stacklevel=2)
+        gate_up = _maybe_cast_fp16_for_turing(gate_up)
+        w_down = _maybe_cast_fp16_for_turing(w_down)
+        if alpha_d is not None and alpha_d.dtype == torch.bfloat16:
+            alpha_d = alpha_d.to(torch.float16)
+        warnings.warn("Turing sm_75: pot5 fused swiglu BLOCK<=64, fallback fp16 if needed", stacklevel=2)
     orig_shape = gate_up.shape
     gv_2d = gate_up.reshape(-1, orig_shape[-1])
     M = gv_2d.shape[0]
@@ -452,7 +552,7 @@ def triton_pot5_fused_swiglu(
     if alpha_d.ndim == 0:
         alpha_d = alpha_d.unsqueeze(0)
 
-    if gate_up.is_cuda and HAS_TRITON:
+    if gate_up.is_cuda and HAS_TRITON and not _is_turing():
         out = torch.empty((M, K), device=gate_up.device, dtype=gate_up.dtype)
         grid = lambda META: (
             triton.cdiv(M, META["BLOCK_M"]),
@@ -467,11 +567,12 @@ def triton_pot5_fused_swiglu(
         )
         return out.reshape(*orig_shape[:-1], K)
     else:
-        # PyTorch fallback (unified thresholds, no thresh_scale hybrid, no sync)
+        if _is_turing():
+            warnings.warn("Turing sm_75: pot5 swiglu fallback to fp16 matmul (acc fp32)", stacklevel=2)
         g, u = gv_2d.chunk(2, dim=-1)
         act = F.silu(g) * u
         wd_eff = _pot5_quantize_weight(w_down, alpha_d)
-        out = F.linear(act, wd_eff.to(act.dtype))
+        out = F.linear(act.float(), wd_eff.float().to(act.dtype)).to(gate_up.dtype)
         return out.reshape(*orig_shape[:-1], K)
 
 
@@ -660,7 +761,20 @@ def triton_pot5_bitpacked_linear(
     """
     Evaluates Linear layer using 3-bitplane GPU bitpacked weights.
     5.33x lower DRAM weight bandwidth than BF16 (exactly 3.0 bits/weight).
+    Turing sm_75: BLOCK<=64, fp16 fallback (acc fp32) if needed.
     """
+    if _is_turing():
+        if x.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 -> fp16 (pot5 bitpacked, acc fp32)", stacklevel=2)
+            x = x.to(torch.float16)
+        warnings.warn("Turing sm_75: pot5 bitpacked BLOCK<=64 clamp", stacklevel=2)
+        # Turing fallback to unpack + fp16 matmul to avoid 3-bitplane SMEM pressure
+        if x.is_cuda:
+            w_eff = unpack_pot5_gpu_3bitplane(w_nz_bits, w_mag_bits, w_sign_bits, alpha, K_orig)
+            w_eff = _maybe_cast_fp16_for_turing(w_eff).float()
+            x_f = x.float()
+            out = F.linear(x_f.reshape(-1, K_orig), w_eff.to(x_f.dtype))
+            return out.reshape(*x.shape[:-1], w_eff.shape[0]).to(x.dtype if x.dtype != torch.bfloat16 else torch.float16)
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1])
     M, K = x_2d.shape
@@ -670,11 +784,12 @@ def triton_pot5_bitpacked_linear(
     if pad_len > 0:
         x_2d = F.pad(x_2d, (0, pad_len), value=0.0)
     K_padded = x_2d.shape[1]
+    K_padded = _prune_turing_block(K_padded) if False else K_padded
 
     if alpha.ndim == 0:
         alpha = alpha.unsqueeze(0)
 
-    if x.is_cuda and HAS_TRITON:
+    if x.is_cuda and HAS_TRITON and not _is_turing():
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
         grid = lambda META: (
             triton.cdiv(M, META["BLOCK_M"]),
@@ -686,11 +801,10 @@ def triton_pot5_bitpacked_linear(
             w_nz_bits.stride(0), w_nz_bits.stride(1),
             y.stride(0), y.stride(1),
             M, N, K_padded,
-            BLOCK_K=32,
+            BLOCK_K=_prune_turing_block(32),
         )
         return y.reshape(*orig_shape[:-1], N)
     else:
-        # Fallback: unpack and linear
         w_eff = unpack_pot5_gpu_3bitplane(w_nz_bits, w_mag_bits, w_sign_bits, alpha, K_orig)
         out = F.linear(x.reshape(-1, K_orig), w_eff.to(x.dtype))
         return out.reshape(*orig_shape[:-1], N)

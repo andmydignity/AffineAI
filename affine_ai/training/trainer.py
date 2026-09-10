@@ -27,6 +27,33 @@ from affine_ai.models.language_model import ASDAGLanguageModel
 from affine_ai.core.loss import ChunkedCrossEntropyLoss
 
 
+def _is_turing() -> bool:
+    try:
+        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+
+        return bool(_T)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return (7, 5) <= tuple(cap) < (8, 0)
+    except Exception:
+        pass
+    return False
+
+
+def get_turing_dtype(dtype=None):
+    try:
+        if torch.cuda.is_available():
+            cap = tuple(torch.cuda.get_device_capability())
+            if cap < (8, 0):
+                return torch.float16
+    except Exception:
+        pass
+    return dtype
+
+
 def suggest_batch_size(device: Optional[str] = None) -> int:
     """Throughput-optimal batch size for training on this machine.
 
@@ -393,6 +420,34 @@ class ASDAGTrainer:
 
         self.loss_fn = nn.CrossEntropyLoss()
 
+        self.scaler = None
+        self.use_amp = False
+        try:
+            _model_dtype = getattr(getattr(self.model, 'config', None), 'dtype', None)
+            _is_fp16 = _model_dtype == torch.float16
+            if _is_turing() and get_turing_dtype(_model_dtype) == torch.float16:
+                _is_fp16 = True
+            if _is_fp16 and "cuda" in str(self.device) and torch.cuda.is_available():
+                if hasattr(torch.amp, "GradScaler"):
+                    self.scaler = torch.amp.GradScaler('cuda')
+                else:
+                    self.scaler = torch.cuda.amp.GradScaler()
+                self.use_amp = True
+                import warnings
+                warnings.warn(
+                    "Turing fp16 AMP enabled: using torch.amp.GradScaler for fp16 training on sm_75.",
+                    stacklevel=2,
+                )
+            elif _is_fp16 and "cuda" in str(self.device):
+                import warnings
+                warnings.warn(
+                    "FP16 training without CUDA GradScaler (CPU or non-CUDA device); scaler not created.",
+                    stacklevel=2,
+                )
+        except Exception:
+            self.scaler = None
+            self.use_amp = False
+
     def get_batch(self, split: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
         loader = self.train_loader if split == "train" else self.val_loader
         if loader is not None:
@@ -561,10 +616,18 @@ class ASDAGTrainer:
                 x, y = self.get_batch("train")
                 self.optimizer.zero_grad()
                 logits, loss, _ = self.hybrid(x, targets=y, return_logits=True)
-                loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
+                if getattr(self, "scaler", None) is not None:
+                    self.scaler.scale(loss).backward()
+                    if self.grad_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.optimizer.step()
                 if self.use_priority_replay and self.replay_buffer is not None:
                     n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
                     if n_fresh > 0:
@@ -606,12 +669,20 @@ class ASDAGTrainer:
         loss = self.loss_fn(logits.view(-1, self.model.vocab_size), y.view(-1))
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        if getattr(self, "scaler", None) is not None:
+            self.scaler.scale(loss).backward()
+            if self.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
 
-        if self.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
-        self.optimizer.step()
+            self.optimizer.step()
         if self.use_priority_replay and self.replay_buffer is not None:
             n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
             if n_fresh > 0:

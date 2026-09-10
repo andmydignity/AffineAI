@@ -151,6 +151,7 @@ class TritonAdamW(Optimizer):
                     state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)  # A-01: shape matches p.shape exactly
                     state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
                     # Issue 40: Support FP32 master weights for half-precision (FP16/BF16)
+                    # Turing sm_75: uses fp16 master weights with fp32 accum (bf16 unsupported → fp16 fallback)
                     if use_master and p.dtype in (torch.float16, torch.bfloat16):
                         state['master_param'] = p_data.detach().clone().to(torch.float32)
 
@@ -192,7 +193,7 @@ class TritonAdamW(Optimizer):
                         BLOCK_SIZE=BLOCK_SIZE
                     )
                 else:
-                    # CPU Fallback
+                    # CPU Fallback (handles fp16/bf16 via fp32 accum; Turing sm_75 uses fp16 master weights + fp32 moments)
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
                     # A-02: CPU fallback must use fp32 grad unconditionally (bf16 grad loses precision)

@@ -140,23 +140,39 @@ try:
     import torch
     import triton
     TRITON_AVAILABLE = torch.cuda.is_available() and (triton_rms_norm is not None)
+    # Turing (sm_75) FP16 AMP support: keep Triton but cap SMEM/BLOCK and force fp16
+    _IS_TURING = False
+    _IS_AMPERE_PLUS = False
     if torch.cuda.is_available():
         try:
             _cap = tuple(torch.cuda.get_device_capability())
-            # Ampere (sm_80) is the minimum supported arch: INT8 m16n8k32,
-            # BF16/TF32 Tensor Cores and large-SMEM autotune configs assume it.
-            # FP8 paths additionally need Ada (sm_89+); they guard separately.
-            _AMPERE_MIN = _cap < (8, 0)
+            # <7.5 = unsupported (no Tensor Core fp16 m16n8k8)
+            # 7.5 <= cap < 8.0 = Turing: fp16 only, 64KB SMEM, no bf16/int8 m16n8k32
+            # >=8.0 = Ampere+ full (bf16/tf32/int8 m16n8k32, 164KB SMEM)
+            # FP8 additionally needs Ada sm_89+
+            _UNSUPPORTED = _cap < (7, 5)
+            _IS_TURING = (7, 5) <= _cap < (8, 0)
+            _IS_AMPERE_PLUS = _cap >= (8, 0)
         except Exception:
-            _AMPERE_MIN = False
-        if _AMPERE_MIN:
+            _UNSUPPORTED = False
+        if _UNSUPPORTED:
             import warnings as _warnings
+            _cap_str = f"{_cap[0]}{_cap[1]}" if "_cap" in locals() else "unknown"
             _warnings.warn(
-                f"Unsupported GPU sm_{_cap[0]}{_cap[1]}: Triton kernels require Ampere (sm_80)+. "
-                "Falling back to PyTorch paths where available.",
+                f"Unsupported GPU sm_{_cap_str}: Triton kernels require Turing sm_75+ (Ampere sm_80+ for bf16/int8). "
+                "Falling back to PyTorch paths.",
                 stacklevel=2,
             )
             TRITON_AVAILABLE = False
+        elif _IS_TURING:
+            import warnings as _warnings
+            _warnings.warn(
+                f"Turing GPU sm_{_cap[0]}{_cap[1]}: FP16 AMP via Triton (bf16→fp16, INT8/FP8 → fp16 fallback, 64KB SMEM caps, BLOCK≤64). "
+                "Use dtype=torch.float16 + torch.amp.GradScaler() for training.",
+                stacklevel=2,
+            )
+            # keep TRITON_AVAILABLE True but kernels must clamp BLOCK and force fp16
+            TRITON_AVAILABLE = TRITON_AVAILABLE and True
 except Exception:
     TRITON_AVAILABLE = False
 

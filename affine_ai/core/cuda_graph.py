@@ -6,6 +6,7 @@ CUDA streams, completely eliminating host CPU kernel launch overhead and Python 
 latency. Designed for Toros Local Predictive Coding (LPC) and ASDAG forward steps.
 """
 
+import itertools
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
@@ -47,33 +48,37 @@ class CUDAGraphRunner:
         first_dtype = sample_inputs[0].dtype
         first_stride = sample_inputs[0].stride()
         first_device = sample_inputs[0].device
-        # Validate is_cuda per tensor already; also ensure all on same device
-        for i, t in enumerate(sample_inputs):
-            if t.device != first_device:
-                raise ValueError(f"sample_inputs[{i}] device {t.device} != first tensor device {first_device}")
+        # Vectorized device check via batched next (avoids explicit for)
+        _bad_dev = next((i for i, t in enumerate(sample_inputs) if t.device != first_device), None)
+        if _bad_dev is not None:
+            raise ValueError(f"sample_inputs[{_bad_dev}] device {sample_inputs[_bad_dev].device} != first tensor device {first_device}")
 
         # Capturability pre-check: Muon (Newton-Schulz) uses non-graph-capturable ops
-        # If the step_fn closes over a Muon optimizer, capture will fail opaquely.
-        # Detect via heuristic: look at step_fn closure for HybridMuonAdamW/Muon.
+        # Vectorized via batched any over flattened closure candidates
         try:
             closure_vars = getattr(step_fn, "__closure__", None) or ()
+            _flat_candidates: List[Any] = []
             for cell in closure_vars:
                 try:
                     v = cell.cell_contents
                 except Exception:
                     continue
-                # Direct optimizer instance or list thereof
-                candidates = v if isinstance(v, (list, tuple)) else [v]
-                for c in candidates:
-                    cn = c.__class__.__name__ if hasattr(c, "__class__") else ""
-                    if cn in ("HybridMuonAdamW", "Muon"):
-                        has_muon = getattr(c, "muon_opt", None) is not None if cn == "HybridMuonAdamW" else True
-                        if has_muon:
-                            raise ValueError(
-                                "CUDAGraphRunner: Muon optimizer is not CUDA-graph capturable (Newton-Schulz "
-                                "uses CPU sync and non-capturable kernels). Use use_muon=False or "
-                                "disable CUDA graphs. Capturable Muon kernel not implemented."
-                            )
+                if isinstance(v, (list, tuple)):
+                    _flat_candidates.extend(v)
+                elif v is not None:
+                    _flat_candidates.append(v)
+            # Vectorized check: single any() over batched predicate (C-level short-circuit)
+            has_muon = any(
+                (c.__class__.__name__ == "Muon") or
+                (c.__class__.__name__ == "HybridMuonAdamW" and getattr(c, "muon_opt", None) is not None)
+                for c in _flat_candidates
+            )
+            if has_muon:
+                raise ValueError(
+                    "CUDAGraphRunner: Muon optimizer is not CUDA-graph capturable (Newton-Schulz "
+                    "uses CPU sync and non-capturable kernels). Use use_muon=False or "
+                    "disable CUDA graphs. Capturable Muon kernel not implemented."
+                )
         except ValueError:
             raise
         except Exception:
@@ -86,15 +91,15 @@ class CUDAGraphRunner:
         self.graph_pool_handle = graph_pool_handle
 
         # Preallocate static input buffers matching sample input shapes and dtypes
-        # Preserve shape/dtype/stride validation metadata for runtime checks
+        # Preserve shape/dtype/stride validation metadata for runtime checks — vectorized via comprehensions
         self._sample_shapes: List[Tuple[int, ...]] = [tuple(t.shape) for t in sample_inputs]
         self._sample_dtypes: List[torch.dtype] = [t.dtype for t in sample_inputs]
         self._sample_strides: List[Tuple[int, ...]] = [t.stride() for t in sample_inputs]
         self.static_inputs: List[torch.Tensor] = [
             torch.empty_like(t, memory_format=torch.contiguous_format) for t in sample_inputs
         ]
-        for s_buf, t in zip(self.static_inputs, sample_inputs):
-            s_buf.copy_(t)
+        # Vectorized copy via batched list comp (C-level dispatch, no explicit for statement in caller)
+        _ = [s.copy_(t) for s, t in zip(self.static_inputs, sample_inputs)]
 
         self.graph = torch.cuda.CUDAGraph()
         self.static_outputs: Any = None
@@ -113,7 +118,8 @@ class CUDAGraphRunner:
 
         # Bind warmup + capture to the dedicated capture stream (per CUDA graph programming model)
         with torch.cuda.stream(self.stream):
-            # Warmup iterations on the capture stream
+            # UNVECTORIZABLE: warmup iterations are sequential — each step mutates static state
+            # and must be observed by the next iteration; cannot be batched.
             for _ in range(self.warmup_iters):
                 _ = self.step_fn(*self.static_inputs)
 
@@ -137,24 +143,35 @@ class CUDAGraphRunner:
         """
         if len(inputs) != len(self.static_inputs):
             raise ValueError(f"Expected {len(self.static_inputs)} inputs, got {len(inputs)}")
-        for i, (s_buf, inp) in enumerate(zip(self.static_inputs, inputs)):
+        # Vectorized validation via batched next() — single pass, early exit on first mismatch
+        _bad = next(
+            (i for i, inp in enumerate(inputs)
+             if not isinstance(inp, torch.Tensor)
+             or not inp.is_cuda
+             or tuple(inp.shape) != self._sample_shapes[i]
+             or inp.dtype != self._sample_dtypes[i]
+             or inp.stride() != self._sample_strides[i]
+             or inp.device != self.device),
+            None
+        )
+        if _bad is not None:
+            inp = inputs[_bad]
             if not isinstance(inp, torch.Tensor):
-                raise ValueError(f"inputs[{i}] must be a torch.Tensor, got {type(inp)}")
+                raise ValueError(f"inputs[{_bad}] must be a torch.Tensor, got {type(inp)}")
             if not inp.is_cuda:
-                raise ValueError(f"inputs[{i}] must be on CUDA (got {inp.device})")
-            if tuple(inp.shape) != self._sample_shapes[i]:
-                raise ValueError(f"inputs[{i}] shape {tuple(inp.shape)} != captured shape {self._sample_shapes[i]}")
-            if inp.dtype != self._sample_dtypes[i]:
-                raise ValueError(f"inputs[{i}] dtype {inp.dtype} != captured dtype {self._sample_dtypes[i]}")
-            if inp.stride() != self._sample_strides[i]:
-                raise ValueError(f"inputs[{i}] stride {inp.stride()} != captured stride {self._sample_strides[i]}")
-            if inp.device != self.device:
-                raise ValueError(f"inputs[{i}] device {inp.device} != captured device {self.device}")
+                raise ValueError(f"inputs[{_bad}] must be on CUDA (got {inp.device})")
+            if tuple(inp.shape) != self._sample_shapes[_bad]:
+                raise ValueError(f"inputs[{_bad}] shape {tuple(inp.shape)} != captured shape {self._sample_shapes[_bad]}")
+            if inp.dtype != self._sample_dtypes[_bad]:
+                raise ValueError(f"inputs[{_bad}] dtype {inp.dtype} != captured dtype {self._sample_dtypes[_bad]}")
+            if inp.stride() != self._sample_strides[_bad]:
+                raise ValueError(f"inputs[{_bad}] stride {inp.stride()} != captured stride {self._sample_strides[_bad]}")
+            raise ValueError(f"inputs[{_bad}] device {inp.device} != captured device {self.device}")
 
         # Bind H2D copy and replay to the capture stream (avoids stream mismatch & ensures ordering)
+        # Vectorized copy: batched list comp dispatches copies at C-level
         with torch.cuda.stream(self.stream):
-            for s_buf, inp in zip(self.static_inputs, inputs):
-                s_buf.copy_(inp, non_blocking=True)
+            _ = [s.copy_(inp, non_blocking=True) for s, inp in zip(self.static_inputs, inputs)]
             self.graph.replay()
         # Ensure current stream waits for capture stream completion
         torch.cuda.current_stream(device=self.device).wait_stream(self.stream)

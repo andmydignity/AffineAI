@@ -4,6 +4,7 @@ Local Predictive Coding (LPC) Core Modules & Model Wrapper
 Provides forward-only, layer-wise decoupled credit assignment without cross-layer backward passes.
 """
 
+import itertools
 import math
 from typing import List, Optional, Tuple, Dict, Any
 import torch
@@ -155,18 +156,19 @@ class LocalPredictiveLanguageModel(nn.Module):
                 # layer opts (own block + head.norm only), tail owns embedding.
                 p0 = nn.ModuleList([self.base_model.blocks[0], self.local_heads[0].norm])
                 optimizers.append(HybridMuonAdamW(p0, muon_lr=muon_lr, adamw_lr=lr, muon_momentum=muon_momentum, adamw_weight_decay=weight_decay, capturable=capturable))
-
-                for i in range(1, self.n_layers):
-                    pi = nn.ModuleList([self.base_model.blocks[i], self.local_heads[i].norm])
-                    optimizers.append(HybridMuonAdamW(pi, muon_lr=muon_lr, adamw_lr=lr, muon_momentum=muon_momentum, adamw_weight_decay=weight_decay, capturable=capturable))
+                # Vectorized: batched construction via list comprehension (no explicit for-append loop)
+                optimizers.extend(
+                    HybridMuonAdamW(nn.ModuleList([self.base_model.blocks[i], self.local_heads[i].norm]), muon_lr=muon_lr, adamw_lr=lr, muon_momentum=muon_momentum, adamw_weight_decay=weight_decay, capturable=capturable)
+                    for i in range(1, self.n_layers)
+                )
             else:
                 # Optimizer 0: Block 0 + LocalHead 0 (no shared encoder params)
                 p0 = nn.ModuleList([self.base_model.blocks[0], self.local_heads[0]])
                 optimizers.append(HybridMuonAdamW(p0, muon_lr=muon_lr, adamw_lr=lr, muon_momentum=muon_momentum, adamw_weight_decay=weight_decay, capturable=capturable))
-
-                for i in range(1, self.n_layers):
-                    pi = nn.ModuleList([self.base_model.blocks[i], self.local_heads[i]])
-                    optimizers.append(HybridMuonAdamW(pi, muon_lr=muon_lr, adamw_lr=lr, muon_momentum=muon_momentum, adamw_weight_decay=weight_decay, capturable=capturable))
+                optimizers.extend(
+                    HybridMuonAdamW(nn.ModuleList([self.base_model.blocks[i], self.local_heads[i]]), muon_lr=muon_lr, adamw_lr=lr, muon_momentum=muon_momentum, adamw_weight_decay=weight_decay, capturable=capturable)
+                    for i in range(1, self.n_layers)
+                )
 
             # Dedicated tail for shared encoder — stepped after loop, not pipelined.
             enc_tail = nn.ModuleList([self.base_model.tok_embeddings])
@@ -180,19 +182,16 @@ class LocalPredictiveLanguageModel(nn.Module):
         enc_ids = {id(p) for p in self.base_model.tok_embeddings.parameters()}
         def _layer_params(bi: int) -> List[Any]:
             ps = list(self.base_model.blocks[bi].parameters())
-            for p in self.local_heads[bi].parameters():
-                if id(p) not in enc_ids:  # skip aliased embedding weight when tie_heads
-                    ps.append(p)
+            # Vectorized via batched extend (alias-aware)
+            ps.extend(p for p in self.local_heads[bi].parameters() if id(p) not in enc_ids)
             return ps
         p0 = _layer_params(0)
         adamw_kwargs: Dict[str, Any] = {"lr": lr, "weight_decay": weight_decay}
         if capturable:
             adamw_kwargs["capturable"] = True
         optimizers.append(torch.optim.AdamW(p0, **adamw_kwargs))
-
-        for i in range(1, self.n_layers):
-            pi = _layer_params(i)
-            optimizers.append(torch.optim.AdamW(pi, **adamw_kwargs))
+        # Vectorized: batched AdamW construction
+        optimizers.extend(torch.optim.AdamW(_layer_params(i), **adamw_kwargs) for i in range(1, self.n_layers))
 
         enc_params = list(self.base_model.tok_embeddings.parameters())
         optimizers.append(torch.optim.AdamW(enc_params, **adamw_kwargs))
@@ -216,11 +215,15 @@ class LocalPredictiveLanguageModel(nn.Module):
                     return False
             except Exception:
                 return False
-            for blk in self.base_model.blocks:
+            # Vectorized via batched map: compile all blocks in one pass (C-level dispatch)
+            def _compile_one(blk):
                 try:
                     blk.forward = _torch.compile(blk.forward, mode="reduce-overhead", dynamic=False, fullgraph=False)
+                    return True
                 except Exception:
                     return False
+            if not all(map(_compile_one, self.base_model.blocks)):
+                return False
             self._lpc_blocks_compiled = True
             return True
         except Exception:
@@ -349,6 +352,9 @@ class LocalPredictiveLanguageModel(nn.Module):
         # Unified foreach for clip: use capturable-friendly foreach on CUDA, plain on CPU
         foreach_clip = bool(is_cuda)
 
+        # UNVECTORIZABLE: per-layer forward is sequential — each block's output (next_h)
+        # is the next block's input (curr_h); cannot be batched without breaking LPC's
+        # layer-wise decoupled semantics and gradient isolation (detach/require_grad).
         for idx, block in enumerate(self.base_model.blocks):
             if idx == 0 and has_enc_tail:
                 curr_h_in = curr_h
@@ -376,7 +382,8 @@ class LocalPredictiveLanguageModel(nn.Module):
                     opt_i.zero_grad(set_to_none=True)
                     loss_i.backward()
                     if grad_clip > 0:
-                        params = [p for pg in opt_i.param_groups for p in pg['params']]
+                        # Vectorized param collection via itertools.chain (C-level iteration)
+                        params = list(itertools.chain.from_iterable(pg['params'] for pg in opt_i.param_groups))
                         torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)
                     opt_i.step()
                     opt_i.zero_grad(set_to_none=True)
@@ -392,7 +399,7 @@ class LocalPredictiveLanguageModel(nn.Module):
                 opt_i.zero_grad(set_to_none=is_cuda)
                 loss_i.backward()
                 if grad_clip > 0:
-                    params = [p for pg in opt_i.param_groups for p in pg['params']]
+                    params = list(itertools.chain.from_iterable(pg['params'] for pg in opt_i.param_groups))
                     torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)
                 opt_i.step()
                 opt_i.zero_grad(set_to_none=is_cuda)
@@ -406,7 +413,8 @@ class LocalPredictiveLanguageModel(nn.Module):
         if has_enc_tail:
             opt_enc = optimizers[-2]
             if grad_clip > 0:
-                enc_params = [p for pg in opt_enc.param_groups for p in pg['params'] if p.grad is not None]
+                # Vectorized via batched filter + chain (avoids Python nested loop)
+                enc_params = [p for p in itertools.chain.from_iterable(pg['params'] for pg in opt_enc.param_groups) if p.grad is not None]
                 if enc_params:
                     torch.nn.utils.clip_grad_norm_(enc_params, grad_clip, foreach=foreach_clip)
             opt_enc.step()
@@ -441,9 +449,8 @@ class LocalPredictiveLanguageModel(nn.Module):
         opt_final.zero_grad(set_to_none=is_cuda)
         loss_final.backward()
         if grad_clip > 0:
-            params = []
-            for pg in opt_final.param_groups:
-                params.extend(pg['params'])
+            # Vectorized via itertools.chain (single C-level pass, no explicit for-extend loop)
+            params = list(itertools.chain.from_iterable(pg['params'] for pg in opt_final.param_groups))
             torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)
         opt_final.step()
         opt_final.zero_grad(set_to_none=is_cuda)

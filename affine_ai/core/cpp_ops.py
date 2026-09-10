@@ -239,8 +239,9 @@ class ASDAGMonarchChainAutogradFunction(torch.autograd.Function):
         if ops and hasattr(ops, 'monarch_chain_forward') and not x.is_cuda:
             out = ops.monarch_chain_forward(x_flat, diagonals, perms, bias)
         else:
-            # Proper PyTorch composed fallback (not identity): sequential Monarch stages
-            # diagonals: [num_stages, dim], perms: [num_stages, dim], bias: [dim]
+            # UNVECTORIZABLE: sequential Monarch chain — each stage's permuted output
+            # feeds the next stage's input (out depends on previous out); cannot be
+            # batched without breaking the Monarch composition semantics.
             out = x_flat
             n_stages = diagonals.size(0)
             for s in range(n_stages):
@@ -263,7 +264,7 @@ class ASDAGMonarchChainAutogradFunction(torch.autograd.Function):
         if ops and hasattr(ops, 'monarch_chain_backward') and not go_flat.is_cuda:
             gx, gd, gb = ops.monarch_chain_backward(go_flat, x_flat, diagonals, perms, inv_perms)
             return gx.to(grad_output.dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(bias.dtype)
-        # PyTorch fallback via autograd recomputation (keeps CPU-only separation, no Triton)
+        # UNVECTORIZABLE: autograd recomputation mirrors forward's sequential stages
         with torch.enable_grad():
             xv = x_flat.detach().requires_grad_(True)
             dv = diagonals.detach().requires_grad_(True)
@@ -1091,6 +1092,9 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
         down_w_f = w_down.float()
         lm_w_f = w_lm.float()
         
+        # UNVECTORIZABLE: chunked loop preserves O(1) memory — full N_tot batched matmul
+        # would materialize [N_tot, V] logits and OOM on long sequences; chunk_size
+        # trades a Python loop for bounded SRAM/DRAM usage with identical numerics.
         for i in range(0, N_tot, chunk_size):
             end_i = min(i + chunk_size, N_tot)
             cat_c = torch.cat([hb_flat[i:end_i], ph_flat[i:end_i]], dim=-1)
@@ -1213,6 +1217,7 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
         down_w_f = w_down.float()
         lm_w_f = w_lm.float()
         
+        # UNVECTORIZABLE: chunked backward mirrors forward chunking for O(1) memory
         for i in range(0, N_tot, chunk_size):
             end_i = min(i + chunk_size, N_tot)
             hb_c = hb_flat[i:end_i]
@@ -1470,9 +1475,13 @@ class ASDAGByteEncoderAutogradFunction(torch.autograd.Function):
         x_t = x.float().transpose(1, 2).contiguous()
         
         x_t_pad = F.pad(x_t, (K - 1, 0))
+        # Vectorized via batched unfold + einsum (no Python for-k loop)
+        # x_unfold: [B, D, K, T] where K is conv kernel size
+        x_unfold = x_t_pad.unfold(dimension=2, size=T, step=1)
+        # g_conv_t: [B, D, T] -> sum over B,T via einsum -> [D, K]
+        g_w_batched = torch.einsum('bdt,bdkt->dk', g_conv_t, x_unfold)
         g_w_conv = torch.zeros_like(w_conv_f)
-        for k in range(K):
-            g_w_conv[:, 0, k] = (g_conv_t * x_t_pad[:, :, k:k+T]).sum(dim=(0, 2))
+        g_w_conv[:, 0, :] = g_w_batched
         g_b_conv = g_conv_t.sum(dim=(0, 2))
         
         w_conv_flip = w_conv_f.flip(-1)
@@ -1587,17 +1596,20 @@ def asdag_cpu_blt_simd_patcher(
     ops = get_asdag_cpu_ops()
     if ops and hasattr(ops, 'blt_simd_patcher') and not byte_embeddings.is_cuda:
         return ops.blt_simd_patcher(byte_embeddings, byte_logits, target_patch_size, max_patches)
-    # Fallback
+    # Fallback — vectorized via batched arange + scatter (no Python for loops)
     B, T, D = byte_embeddings.shape
     M = max_patches if max_patches > 0 else (T // target_patch_size)
-    patch_assignments = torch.zeros(B, T, dtype=torch.long, device=byte_embeddings.device)
-    for t in range(T):
-        patch_assignments[:, t] = min(t // target_patch_size, M - 1)
+    # Batched patch assignment: [T] -> [B, T]
+    patch_ids = torch.clamp(torch.arange(T, device=byte_embeddings.device) // target_patch_size, max=M - 1)
+    patch_assignments = patch_ids.unsqueeze(0).expand(B, -1)
+    # Batched mean-pool via scatter_add (vectorized over M)
     pooled = torch.zeros(B, M, D, dtype=byte_embeddings.dtype, device=byte_embeddings.device)
-    for p in range(M):
-        mask = (patch_assignments == p).unsqueeze(-1)
-        cnt = mask.sum(dim=1).clamp(min=1)
-        pooled[:, p] = (byte_embeddings * mask).sum(dim=1) / cnt
+    # Expand assignments for scatter: [B, T, D]
+    idx_exp = patch_assignments.unsqueeze(-1).expand(-1, -1, D)
+    pooled.scatter_add_(1, idx_exp, byte_embeddings)
+    counts = torch.zeros(B, M, 1, dtype=byte_embeddings.dtype, device=byte_embeddings.device)
+    counts.scatter_add_(1, patch_assignments.unsqueeze(-1), torch.ones_like(byte_embeddings[:, :, :1]))
+    pooled = pooled / counts.clamp(min=1)
     return pooled, patch_assignments
 
 

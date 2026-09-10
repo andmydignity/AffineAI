@@ -140,8 +140,9 @@ class LocalPredictiveLanguageModel(nn.Module):
         inferred BEFORE .cuda() if you intend to capture CUDA graphs — otherwise
         is_cuda is False and AdamW will be non-capturable. Pass capturable=True
         explicitly when constructing optimizers for graph capture, or re-create
-        optimizers after .cuda(). Muon optimizer is NOT capturable (see
-        forward_lpc_step gate).
+        optimizers after .cuda(). Muon is capturable only when constructed
+        with capturable=True (HybridMuonAdamW forwards this flag); otherwise
+        the forward_lpc_step gate rejects graph capture.
         """
         if capturable is None:
             try:
@@ -229,15 +230,17 @@ class LocalPredictiveLanguageModel(nn.Module):
         except Exception:
             return False
 
-    def _has_muon_optimizer(self, optimizers: List[Any]) -> bool:
+    def _has_uncapturable_muon(self, optimizers: List[Any]) -> bool:
         for opt in optimizers:
             if opt is None:
                 continue
             if opt.__class__.__name__ == "HybridMuonAdamW":
-                if getattr(opt, "muon_opt", None) is not None:
+                m = getattr(opt, "muon_opt", None)
+                if m is not None and not bool(getattr(m, "capturable", False)):
                     return True
             if opt.__class__.__name__ == "Muon":
-                return True
+                if not bool(getattr(opt, "capturable", False)):
+                    return True
         return False
 
     def capture_lpc_graph(
@@ -252,11 +255,11 @@ class LocalPredictiveLanguageModel(nn.Module):
     ) -> Any:
         from affine_ai.core.cuda_graph import CUDAGraphRunner
 
-        if self._has_muon_optimizer(optimizers):
+        if self._has_uncapturable_muon(optimizers):
             raise RuntimeError(
                 "Muon optimizer is not CUDA-graph capturable (Newton-Schulz uses non-capturable ops). "
-                "Disable use_cuda_graph or set use_muon=False. "
-                "A capturable Muon kernel is not implemented (too large) — see report."
+                "Disable use_cuda_graph, set use_muon=False, or construct the optimizer "
+                "with capturable=True (HybridMuonAdamW forwards it to Muon)."
             )
 
         def step_fn(bx: torch.Tensor, by: torch.Tensor):
@@ -298,11 +301,11 @@ class LocalPredictiveLanguageModel(nn.Module):
         if use_compiled_blocks and is_cuda:
             self.try_compile_lpc_blocks()
         if use_cuda_graph and is_cuda and not sync_loss:
-            if self._has_muon_optimizer(optimizers):
+            if self._has_uncapturable_muon(optimizers):
                 raise RuntimeError(
                     "use_cuda_graph=True with Muon optimizer is not supported: Muon (Newton-Schulz) "
-                    "is not CUDA-graph capturable. Set use_muon=False or use_cuda_graph=False. "
-                    "Capturable Muon kernel not implemented — see report."
+                    "is not CUDA-graph capturable. Set use_muon=False, use_cuda_graph=False, or "
+                    "construct the optimizer with capturable=True."
                 )
             # Gate eager capture behind capturability: document before .cuda
             runner = getattr(self, "_lpc_graph_runner", None)

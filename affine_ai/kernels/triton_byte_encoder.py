@@ -181,7 +181,12 @@ class TritonByteEncoderFunction(torch.autograd.Function):
 
             g_embed_w = torch.zeros_like(embed_w)
             vocab = embed_w.shape[0]
-            if torch.any(byte_ids >= vocab) or torch.any(byte_ids < 0):
+            capturing = (
+                byte_ids.is_cuda
+                and hasattr(torch.cuda, "is_current_stream_capturing")
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if not capturing and (torch.any(byte_ids >= vocab) or torch.any(byte_ids < 0)):
                 raise ValueError(f"byte_ids OOB: vocab={vocab}, min={int(byte_ids.min())}, max={int(byte_ids.max())}")
             idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte)
             g_embed_w.scatter_add_(0, idx, g_x.reshape(-1, d_byte))

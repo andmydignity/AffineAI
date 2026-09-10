@@ -53,8 +53,10 @@ class CUDAGraphRunner:
         if _bad_dev is not None:
             raise ValueError(f"sample_inputs[{_bad_dev}] device {sample_inputs[_bad_dev].device} != first tensor device {first_device}")
 
-        # Capturability pre-check: Muon (Newton-Schulz) uses non-graph-capturable ops
-        # Vectorized via batched any over flattened closure candidates
+        # Capturability pre-check: only non-capturable Muon instances are
+        # rejected. Muon(capturable=True) uses persistent scratch buffers and
+        # a cached bf16 probe, so its step contains no host queries or
+        # data-dependent control flow and records cleanly.
         try:
             closure_vars = getattr(step_fn, "__closure__", None) or ()
             _flat_candidates: List[Any] = []
@@ -67,17 +69,24 @@ class CUDAGraphRunner:
                     _flat_candidates.extend(v)
                 elif v is not None:
                     _flat_candidates.append(v)
+            def _muon_capturable(c: Any) -> bool:
+                if c.__class__.__name__ == "Muon":
+                    return bool(getattr(c, "capturable", False))
+                if c.__class__.__name__ == "HybridMuonAdamW":
+                    m = getattr(c, "muon_opt", None)
+                    return m is None or bool(getattr(m, "capturable", False))
+                return True
             # Vectorized check: single any() over batched predicate (C-level short-circuit)
-            has_muon = any(
-                (c.__class__.__name__ == "Muon") or
-                (c.__class__.__name__ == "HybridMuonAdamW" and getattr(c, "muon_opt", None) is not None)
+            has_uncapturable_muon = any(
+                not _muon_capturable(c)
                 for c in _flat_candidates
             )
-            if has_muon:
+            if has_uncapturable_muon:
                 raise ValueError(
-                    "CUDAGraphRunner: Muon optimizer is not CUDA-graph capturable (Newton-Schulz "
-                    "uses CPU sync and non-capturable kernels). Use use_muon=False or "
-                    "disable CUDA graphs. Capturable Muon kernel not implemented."
+                    "CUDAGraphRunner: Muon optimizer is not CUDA-graph capturable "
+                    "(Newton-Schulz uses CPU sync and non-capturable kernels). Use "
+                    "use_muon=False, disable CUDA graphs, or construct the optimizer "
+                    "with capturable=True (HybridMuonAdamW forwards it to Muon)."
                 )
         except ValueError:
             raise

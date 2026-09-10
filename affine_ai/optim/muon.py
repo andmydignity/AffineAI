@@ -7,6 +7,7 @@ Vectors, embeddings, and 1D parameters are optimized via AdamW.
 """
 
 import math
+import warnings
 import torch
 import torch.nn as nn
 from typing import List, Dict, Any, Tuple, Optional
@@ -88,6 +89,13 @@ class Muon(torch.optim.Optimizer):
     """
     Muon optimizer for 2D parameter tensors.
     Applies Newton-Schulz orthogonalization to momentum-filtered gradients.
+
+    capturable: when True, the Newton-Schulz iteration reuses pre-allocated
+        scratch buffers and caches the bf16-capability probe, so that
+        ``step()`` contains no host queries or data-dependent control flow
+        and can be recorded inside a CUDA graph. Requires at least one eager
+        warmup step before capture so that momentum and scratch buffers are
+        materialized. Numerics are bit-identical to the legacy path.
     """
     def __init__(
         self,
@@ -96,10 +104,94 @@ class Muon(torch.optim.Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
-        weight_decay: float = 0.0
+        weight_decay: float = 0.0,
+        capturable: bool = False,
     ):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay, use_muon=True)
         super().__init__(params, defaults)
+        self.capturable = capturable
+        # Cache for the bf16-capability probe (a driver query, illegal inside
+        # graph capture). Keyed by (device.type, device.index); populated on
+        # eager steps (warmup) so capture hits the cache.
+        self._bf16_cache: Dict[Tuple[str, Optional[int]], bool] = {}
+        # Pre-allocated Newton-Schulz scratch buffers, keyed by
+        # (shape, work_dtype, device, count). Allocated on first eager use,
+        # reused on every step to avoid per-step torch.empty inside capture.
+        self._ns_buffers: Dict[Any, Dict[str, torch.Tensor]] = {}
+
+    def _ns_work_dtype(self, G: torch.Tensor, orig_dtype: torch.dtype) -> torch.dtype:
+        # Mirrors the legacy condition in zeropower_via_newtonschulz5 without
+        # issuing the torch.cuda.is_bf16_supported() driver query on every
+        # step (queries are illegal inside graph capture, so the result is
+        # cached per device after the first eager step / warmup).
+        if orig_dtype == torch.bfloat16:
+            return torch.bfloat16
+        if G.is_cuda:
+            key = (G.device.type, G.device.index)
+            v = self._bf16_cache.get(key)
+            if v is None:
+                v = bool(torch.cuda.is_bf16_supported())
+                self._bf16_cache[key] = v
+            if v:
+                return torch.bfloat16
+        return torch.float32
+
+    def _ns_single_static(self, g_can: torch.Tensor, steps: int, eps: float = 1e-7) -> torch.Tensor:
+        # Capturable single-matrix Newton-Schulz. g_can must already be in
+        # canonical (m <= n) orientation. Same math as the module-level
+        # zeropower_via_newtonschulz5 (same coefficients, same op order), but
+        # all scratch (X, X_buf, A, B) comes from persistent buffers.
+        orig_dtype = g_can.dtype
+        wdtype = self._ns_work_dtype(g_can, orig_dtype)
+        m, n = g_can.shape
+        key = ((m, n), str(wdtype), str(g_can.device))
+        st = self._ns_buffers.get(key)
+        if st is None:
+            st = {
+                "X": torch.empty((m, n), device=g_can.device, dtype=wdtype),
+                "Xb": torch.empty((m, n), device=g_can.device, dtype=wdtype),
+                "A": torch.empty((m, m), device=g_can.device, dtype=wdtype),
+                "B": torch.empty((m, m), device=g_can.device, dtype=wdtype),
+            }
+            self._ns_buffers[key] = st
+        X, Xb, A, B = st["X"], st["Xb"], st["A"], st["B"]
+        X.copy_(g_can.to(wdtype))
+        X.div_(X.norm() + eps)
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        for _ in range(steps):
+            torch.mm(X, X.T, out=A)
+            torch.addmm(A, A, A, beta=b, alpha=c, out=B)
+            torch.addmm(X, B, X, beta=a, alpha=1.0, out=Xb)
+            X, Xb = Xb, X
+        return X.to(orig_dtype)
+
+    def _ns_batched_static(self, G_batch: torch.Tensor, steps: int, eps: float = 1e-7) -> torch.Tensor:
+        # Capturable batched Newton-Schulz for (count, m, n) canonical input.
+        # Same math as zeropower_via_newtonschulz5_batched; scratch persists
+        # in self._ns_buffers under a count-qualified key.
+        orig_dtype = G_batch.dtype
+        wdtype = self._ns_work_dtype(G_batch, orig_dtype)
+        count, m, n = G_batch.shape
+        key = ((count, m, n), str(wdtype), str(G_batch.device))
+        st = self._ns_buffers.get(key)
+        if st is None:
+            st = {
+                "X": torch.empty((count, m, n), device=G_batch.device, dtype=wdtype),
+                "Xb": torch.empty((count, m, n), device=G_batch.device, dtype=wdtype),
+                "A": torch.empty((count, m, m), device=G_batch.device, dtype=wdtype),
+                "B": torch.empty((count, m, m), device=G_batch.device, dtype=wdtype),
+            }
+            self._ns_buffers[key] = st
+        X, Xb, A, B = st["X"], st["Xb"], st["A"], st["B"]
+        X.copy_(G_batch.to(wdtype))
+        X.div_(torch.linalg.vector_norm(X, dim=(1, 2), keepdim=True) + eps)
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        for _ in range(steps):
+            torch.bmm(X, X.transpose(1, 2), out=A)
+            torch.baddbmm(A, A, A, beta=b, alpha=c, out=B)
+            torch.baddbmm(X, B, X, beta=a, alpha=1.0, out=Xb)
+            X, Xb = Xb, X
+        return X.to(orig_dtype)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -150,13 +242,23 @@ class Muon(torch.optim.Optimizer):
 
             for key, items in shape_to_params.items():
                 if len(items) == 1:
-                    p, orig_shape, update_grad, _, _ = items[0]
-                    g_2d = update_grad.view(orig_shape[0], -1)
-                    update = zeropower_via_newtonschulz5(g_2d, steps=ns_steps).view(orig_shape)
-                    p.data.add_(update, alpha=-lr)
+                    p, orig_shape, update_grad, g_can, needs_transpose = items[0]
+                    if self.capturable:
+                        upd = self._ns_single_static(g_can, steps=ns_steps)
+                        if needs_transpose:
+                            upd = upd.t()
+                        p.data.add_(upd.view(orig_shape), alpha=-lr)
+                    else:
+                        g_2d = update_grad.view(orig_shape[0], -1)
+                        update = zeropower_via_newtonschulz5(g_2d, steps=ns_steps).view(orig_shape)
+                        p.data.add_(update, alpha=-lr)
                 else:
-                    G_batch = torch.stack([item[3] for item in items], dim=0)
-                    updates_batch = zeropower_via_newtonschulz5_batched(G_batch, steps=ns_steps)
+                    if self.capturable:
+                        G_batch = torch.stack([item[3] for item in items], dim=0)
+                        updates_batch = self._ns_batched_static(G_batch, steps=ns_steps)
+                    else:
+                        G_batch = torch.stack([item[3] for item in items], dim=0)
+                        updates_batch = zeropower_via_newtonschulz5_batched(G_batch, steps=ns_steps)
                     for i, (p, orig_shape, _, _, needs_transpose) in enumerate(items):
                         update = updates_batch[i].t() if needs_transpose else updates_batch[i]
                         p.data.add_(update.view(orig_shape), alpha=-lr)
@@ -212,11 +314,18 @@ class HybridMuonAdamW:
                 muon_params,
                 lr=muon_lr,
                 momentum=muon_momentum,
-                weight_decay=muon_weight_decay
+                weight_decay=muon_weight_decay,
+                capturable=capturable,
             )
             self.optimizers.append(self.muon_opt)
         else:
             self.muon_opt = None
+            warnings.warn(
+                "HybridMuonAdamW: no 2D matrix parameters found for Muon; "
+                "this optimizer is pure AdamW despite the Muon name. "
+                "Check parameter shapes/names if Muon was expected.",
+                stacklevel=2,
+            )
 
         adamw_groups = []
         if len(adamw_decay_params) > 0:

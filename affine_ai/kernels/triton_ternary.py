@@ -435,6 +435,10 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
     x2d = x.reshape(-1, K)
     M = x2d.shape[0]
     N = w_tern.shape[0]
+    # Device-side gamma application (capture-safe): fold the scale into the
+    # weights once instead of passing a host float into the kernel. Matches
+    # the fast path below, which already pre-scales the same way.
+    w_tern = (w_tern * gamma).contiguous()
     if amax is None:
         amax = triton_row_amax(x2d).reshape(-1)
     else:
@@ -450,7 +454,7 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
     if n_tiles > 2 and x2d.is_cuda and not tc:  # preserve bf16 TC vs fp32: skip fast path if TC requested
         try:
             x_q = triton_quantize_x(x2d, amax)
-            w_scaled = (w_tern * float(gamma)).contiguous()
+            w_scaled = w_tern.contiguous()
             _fp32_dot_kernel[_grid(M, N, BLOCK_M_T, BLOCK_N_T)](
                 x_q, w_scaled, out, bias if has_bias else x2d,
                 x_q.stride(0), x_q.stride(1), w_scaled.stride(0), w_scaled.stride(1),
@@ -463,7 +467,7 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
             warnings.warn(f"ternary fast path failed: {e}")
     try:
         _ternary_fwd_kernel[_grid(M, N)](
-            x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),
+            x2d, w_tern, bias if has_bias else x2d, out, amax, 1.0,
             x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
             out.stride(0), out.stride(1),
             M, N, K,
@@ -473,7 +477,7 @@ def triton_ternary_linear_fwd(x, w_tern, gamma, bias=None, amax=None, use_tc=Non
         warnings.warn(f"ternary fallback failed (USE_TC={tc}): {e}")
         if tc:
             _ternary_fwd_kernel[_grid(M, N)](
-                x2d, w_tern, bias if has_bias else x2d, out, amax, float(gamma),
+                x2d, w_tern, bias if has_bias else x2d, out, amax, 1.0,
                 x2d.stride(0), x2d.stride(1), w_tern.stride(0), w_tern.stride(1),
                 out.stride(0), out.stride(1),
                 M, N, K,
@@ -523,9 +527,9 @@ class TritonTernaryLinearFunction(torch.autograd.Function):
         gamma = w_f.abs().mean().clamp(min=1e-5)
         w_ternary = torch.round(w_f / gamma).clamp(-1.0, 1.0)
         amax = triton_row_amax(x_flat)
-        out = triton_ternary_linear_fwd(x_flat, w_ternary, gamma.item(), bias.float() if bias is not None else None, amax, use_tc=use_tc)
+        out = triton_ternary_linear_fwd(x_flat, w_ternary, gamma, bias.float() if bias is not None else None, amax, use_tc=use_tc)
         ctx.save_for_backward(x_flat, w_ternary, amax)
-        ctx.gamma = gamma.item()
+        ctx.gamma = gamma
         ctx.has_bias = bias is not None
         ctx.w_dtype = w_latent.dtype
         return out.to(x.dtype).reshape(*orig_shape[:-1], out_dim)
@@ -565,7 +569,7 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
         def tern(w):
             ww = w.detach().float()
             gamma = ww.abs().mean().clamp(min=1e-5)
-            return torch.round(ww / gamma).clamp(-1.0, 1.0), gamma.item()
+            return torch.round(ww / gamma).clamp(-1.0, 1.0), gamma
 
         w1t, g1 = tern(w1_latent)
         w2t, g2 = tern(w2_latent)
@@ -579,8 +583,10 @@ class TritonTernaryTwinFunction(torch.autograd.Function):
         if _is_turing() and tc:
             warnings.warn("Turing sm_75: disabling bf16 TC (acc fp32)", stacklevel=2)
             tc = False
+        w1t = (w1t * g1).contiguous()
+        w2t = (w2t * g2).contiguous()
         _ternary_twin_fwd_kernel[_grid(M, 2 * out_dim)](
-            x_flat, w1t, w2t, b, out, amax, float(g1), float(g2),
+            x_flat, w1t, w2t, b, out, amax, 1.0, 1.0,
             x_flat.stride(0), x_flat.stride(1), w1t.stride(0), w1t.stride(1),
             out.stride(0), out.stride(1),
             M, out_dim, in_dim, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(64), BLOCK_K=_prune_turing_block_k(32),

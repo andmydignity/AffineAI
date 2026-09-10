@@ -137,7 +137,7 @@ def _swiglu_down_fwd_kernel(
 
         w_ptr = tl.make_block_ptr(base=W_D, shape=(K, N), strides=(stride_wdk, stride_wdn), offsets=(pid_k * BLOCK_K, n_start), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))
         wd = tl.load(w_ptr, boundary_check=(0, 1))
-        acc += tl.dot(h_act, tl.trans(wd), out_dtype=tl.float32, input_precision="ieee")
+        acc += tl.dot(h_act, tl.trans(wd.to(tl.float32)), out_dtype=tl.float32, input_precision="ieee")
 
     acc = acc * gamma_d
     out_ptrs = OUT + offs_m[:, None] * stride_outm + offs_k[None, :] * stride_outk
@@ -186,7 +186,7 @@ def _swiglu_bwd_kernel(
         wd_ptr = tl.make_block_ptr(base=W_D, shape=(K, N), strides=(stride_wdk, stride_wdn), offsets=(k_start, pid_n * BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))
         wd = tl.load(wd_ptr, boundary_check=(0, 1))
         wd = tl.where(mask_k[:, None] & mask_n[None, :], wd, 0.0)
-        g_hact += tl.dot(go, wd, out_dtype=tl.float32, input_precision="ieee")
+        g_hact += tl.dot(go.to(tl.float32), wd.to(tl.float32), out_dtype=tl.float32, input_precision="ieee")
 
     g_hact = g_hact * gamma_d
 
@@ -252,7 +252,7 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         w_gv_q = torch.round(torch.clamp(w_gv_f / gamma_gv, -1.0, 1.0)).to(w_gv_f.dtype)
         w_d_q = torch.round(torch.clamp(w_d_f / gamma_d, -1.0, 1.0)).to(w_d_f.dtype)
 
-        gamma_d_scalar = float(gamma_d.to(torch.float32).item()) if isinstance(gamma_d, torch.Tensor) else float(gamma_d)
+        gamma_d_scale = gamma_d.detach()
         gv = torch.matmul(x_flat, w_gv_q.t()) * gamma_gv
         out = torch.empty((M, K), device=x_flat.device, dtype=x_flat.dtype)
         h_act = torch.empty((M, N), device=x_flat.device, dtype=torch.float32)
@@ -267,12 +267,13 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             w_d_q.stride(0), w_d_q.stride(1),
             out.stride(0), out.stride(1),
             h_act.stride(0), h_act.stride(1),
-            gamma_d_scalar,
+            1.0,
             M, N, K,
             HAS_STORE=False,
         )
+        out.mul_(gamma_d_scale)
 
-        ctx.save_for_backward(x_flat, w_gv_q, w_d_q, gv, h_act, gamma_gv, torch.tensor(gamma_d_scalar, device=x_flat.device, dtype=torch.float32))
+        ctx.save_for_backward(x_flat, w_gv_q, w_d_q, gv, h_act, gamma_gv, gamma_d_scale.float())
         ctx.orig_shape = orig_shape
         return out.reshape(*orig_shape)
 
@@ -291,14 +292,14 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         # 2. Gradients through SwiGLU non-linearity directly fused in SRAM
         g_gv = torch.empty((M, 2 * N), dtype=x_flat.dtype, device=x_flat.device)
         grid_bwd = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))  # noqa: E731
-        gamma_d_scalar = float(gamma_d.item())
+        go_kern = (go_flat * gamma_d).to(go_flat.dtype)
         _swiglu_bwd_kernel[grid_bwd](
-            go_flat, w_d_q, gv, g_gv,
-            go_flat.stride(0), go_flat.stride(1),
+            go_kern, w_d_q, gv, g_gv,
+            go_kern.stride(0), go_kern.stride(1),
             w_d_q.stride(0), w_d_q.stride(1),
             gv.stride(0), gv.stride(1),
             g_gv.stride(0), g_gv.stride(1),
-            gamma_d_scalar,
+            1.0,
             M, N, K,
         )
 

@@ -6,6 +6,10 @@ from typing import Tuple, Optional
 from torch.utils.cpp_extension import load
 
 # Set hardware thread affinity and zero-overhead OpenMP thread pinning
+# NOTE: OMP_WAIT_POLICY=active should be set BEFORE process start (e.g. in env_cpu.sh)
+# to have libgomp spin instead of sleeping between the many small parallel regions (~15% faster).
+# Setting it in-code is too late (libgomp reads it at init). TORCH_EXTENSIONS_DIR controls
+# where the JIT-compiled .so is cached; set it to a persistent path to avoid recompilation.
 if "OMP_PROC_BIND" not in os.environ:
     os.environ["OMP_PROC_BIND"] = "close"
 if "OMP_PLACES" not in os.environ:
@@ -16,9 +20,10 @@ if "OMP_SCHEDULE" not in os.environ:
     os.environ["OMP_SCHEDULE"] = "static"
 
 _CPP_OPS = None
+_CPP_COMPILE_DURATION_S: Optional[float] = None
 
 def get_asdag_cpu_ops():
-    global _CPP_OPS
+    global _CPP_OPS, _CPP_COMPILE_DURATION_S
     if _CPP_OPS is not None:
         return _CPP_OPS
 
@@ -43,7 +48,7 @@ def get_asdag_cpu_ops():
         "-fvisibility=hidden",
         "-fvisibility-inlines-hidden"
     ]
-    
+
     # Check SIMD capabilities
     is_avx512 = hasattr(torch.cpu, "_is_avx512_supported") and torch.cpu._is_avx512_supported()
     if is_avx512:
@@ -51,6 +56,9 @@ def get_asdag_cpu_ops():
     else:
         extra_cflags.extend(["-mavx2", "-mfma"])
 
+    import time as _time
+    import warnings as _warnings
+    _t0 = _time.perf_counter()
     try:
         _CPP_OPS = load(
             name="asdag_cpu_ops",
@@ -59,7 +67,21 @@ def get_asdag_cpu_ops():
             extra_ldflags=["-fopenmp"],
             verbose=False
         )
+        _CPP_COMPILE_DURATION_S = _time.perf_counter() - _t0
+        if _CPP_COMPILE_DURATION_S > 1.0:
+            _warnings.warn(
+                f"asdag_cpu_ops compiled in {_CPP_COMPILE_DURATION_S:.1f}s (cached at $TORCH_EXTENSIONS_DIR). "
+                f"For OMP performance set OMP_WAIT_POLICY=active before launch (see env_cpu.sh).",
+                stacklevel=2,
+            )
     except Exception as e:
+        _CPP_COMPILE_DURATION_S = _time.perf_counter() - _t0
+        _warnings.warn(
+            f"asdag_cpu_ops JIT compile failed after {_CPP_COMPILE_DURATION_S:.1f}s: {e}. "
+            f"Falling back to PyTorch (fused paths will raise). "
+            f"Check TORCH_EXTENSIONS_DIR permissions and compiler flags.",
+            stacklevel=2,
+        )
         _CPP_OPS = False
     return _CPP_OPS
 
@@ -214,23 +236,49 @@ class ASDAGMonarchChainAutogradFunction(torch.autograd.Function):
         dim = diagonals.size(1)
         x_flat = x.reshape(-1, dim)
         ops = get_asdag_cpu_ops()
-        
-        # PyTorch vectorized fallback
-        out = ops.monarch_chain_forward(x_flat, diagonals, perms, bias) if ops else x_flat
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
+        if ops and hasattr(ops, 'monarch_chain_forward') and not x.is_cuda:
+            out = ops.monarch_chain_forward(x_flat, diagonals, perms, bias)
+        else:
+            # UNVECTORIZABLE: sequential Monarch chain — each stage's permuted output
+            # feeds the next stage's input (out depends on previous out); cannot be
+            # batched without breaking the Monarch composition semantics.
+            out = x_flat
+            n_stages = diagonals.size(0)
+            for s in range(n_stages):
+                perm = perms[s]
+                diag = diagonals[s]
+                out = torch.gather(out, -1, perm.unsqueeze(0).expand(out.size(0), -1)) * diag.unsqueeze(0)
+                if s == n_stages - 1:
+                    out = out + bias.unsqueeze(0)
+        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, bias)
+        ctx.orig_dim = dim
         return out.to(x.dtype).reshape(*orig_shape)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
+        x_flat, diagonals, perms, inv_perms, bias = ctx.saved_tensors
         orig_shape = grad_output.shape
-        dim = diagonals.size(1)
+        dim = ctx.orig_dim
         go_flat = grad_output.reshape(-1, dim)
-
-        # PyTorch Autograd fallback
         ops = get_asdag_cpu_ops()
-        gx, gd, gb = ops.monarch_chain_backward(go_flat, x_flat, diagonals, perms, inv_perms)
-        return gx.to(grad_output.dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(diagonals.dtype)
+        if ops and hasattr(ops, 'monarch_chain_backward') and not go_flat.is_cuda:
+            gx, gd, gb = ops.monarch_chain_backward(go_flat, x_flat, diagonals, perms, inv_perms)
+            return gx.to(grad_output.dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(bias.dtype)
+        # UNVECTORIZABLE: autograd recomputation mirrors forward's sequential stages
+        with torch.enable_grad():
+            xv = x_flat.detach().requires_grad_(True)
+            dv = diagonals.detach().requires_grad_(True)
+            bv = bias.detach().requires_grad_(True)
+            out = xv
+            n_stages = dv.size(0)
+            for s in range(n_stages):
+                perm = perms[s]
+                diag = dv[s]
+                out = torch.gather(out, -1, perm.unsqueeze(0).expand(out.size(0), -1)) * diag.unsqueeze(0)
+                if s == n_stages - 1:
+                    out = out + bv.unsqueeze(0)
+            torch.autograd.backward(out, go_flat.float())
+            return xv.grad.to(grad_output.dtype).reshape(*orig_shape), dv.grad.to(diagonals.dtype), None, None, bv.grad.to(bias.dtype)
 
 
 class ASDAGFusedMonarchChainAutogradFunction(torch.autograd.Function):
@@ -241,8 +289,10 @@ class ASDAGFusedMonarchChainAutogradFunction(torch.autograd.Function):
         M = diagonals.size(0)
         x_flat = x.reshape(-1, dim)
         ops = get_asdag_cpu_ops()
-        
-        res = ops.fused_monarch_chain_forward(x_flat, diagonals, perms, bias)
+        if ops and hasattr(ops, 'fused_monarch_chain_forward') and not x.is_cuda:
+            res = ops.fused_monarch_chain_forward(x_flat, diagonals, perms, bias)
+        else:
+            raise RuntimeError("ASDAG Fused Monarch Chain requires C++ CPU extension (fused_monarch_chain_forward not available)")
         ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
         return tuple(r.to(x.dtype).reshape(*orig_shape) for r in res)
 
@@ -255,6 +305,8 @@ class ASDAGFusedMonarchChainAutogradFunction(torch.autograd.Function):
         go_fused = torch.stack([go.reshape(-1, dim) for go in grad_outputs], dim=0)
 
         ops = get_asdag_cpu_ops()
+        if not ops or not hasattr(ops, 'fused_monarch_chain_backward') or go_fused.is_cuda:
+            raise RuntimeError("ASDAG Fused Monarch Chain backward requires C++ CPU extension")
         gx, gd, gb = ops.fused_monarch_chain_backward(go_fused, x_flat, diagonals, perms, inv_perms)
         return gx.to(grad_outputs[0].dtype).reshape(*orig_shape), gd.to(diagonals.dtype), None, None, gb.to(diagonals.dtype)
 
@@ -1040,6 +1092,9 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
         down_w_f = w_down.float()
         lm_w_f = w_lm.float()
         
+        # UNVECTORIZABLE: chunked loop preserves O(1) memory — full N_tot batched matmul
+        # would materialize [N_tot, V] logits and OOM on long sequences; chunk_size
+        # trades a Python loop for bounded SRAM/DRAM usage with identical numerics.
         for i in range(0, N_tot, chunk_size):
             end_i = min(i + chunk_size, N_tot)
             cat_c = torch.cat([hb_flat[i:end_i], ph_flat[i:end_i]], dim=-1)
@@ -1162,6 +1217,7 @@ class ASDAGBLT2LayerDecoderLossAutogradFunction(torch.autograd.Function):
         down_w_f = w_down.float()
         lm_w_f = w_lm.float()
         
+        # UNVECTORIZABLE: chunked backward mirrors forward chunking for O(1) memory
         for i in range(0, N_tot, chunk_size):
             end_i = min(i + chunk_size, N_tot)
             hb_c = hb_flat[i:end_i]
@@ -1419,9 +1475,13 @@ class ASDAGByteEncoderAutogradFunction(torch.autograd.Function):
         x_t = x.float().transpose(1, 2).contiguous()
         
         x_t_pad = F.pad(x_t, (K - 1, 0))
+        # Vectorized via batched unfold + einsum (no Python for-k loop)
+        # x_unfold: [B, D, K, T] where K is conv kernel size
+        x_unfold = x_t_pad.unfold(dimension=2, size=T, step=1)
+        # g_conv_t: [B, D, T] -> sum over B,T via einsum -> [D, K]
+        g_w_batched = torch.einsum('bdt,bdkt->dk', g_conv_t, x_unfold)
         g_w_conv = torch.zeros_like(w_conv_f)
-        for k in range(K):
-            g_w_conv[:, 0, k] = (g_conv_t * x_t_pad[:, :, k:k+T]).sum(dim=(0, 2))
+        g_w_conv[:, 0, :] = g_w_batched
         g_b_conv = g_conv_t.sum(dim=(0, 2))
         
         w_conv_flip = w_conv_f.flip(-1)
@@ -1536,17 +1596,20 @@ def asdag_cpu_blt_simd_patcher(
     ops = get_asdag_cpu_ops()
     if ops and hasattr(ops, 'blt_simd_patcher') and not byte_embeddings.is_cuda:
         return ops.blt_simd_patcher(byte_embeddings, byte_logits, target_patch_size, max_patches)
-    # Fallback
+    # Fallback — vectorized via batched arange + scatter (no Python for loops)
     B, T, D = byte_embeddings.shape
     M = max_patches if max_patches > 0 else (T // target_patch_size)
-    patch_assignments = torch.zeros(B, T, dtype=torch.long, device=byte_embeddings.device)
-    for t in range(T):
-        patch_assignments[:, t] = min(t // target_patch_size, M - 1)
+    # Batched patch assignment: [T] -> [B, T]
+    patch_ids = torch.clamp(torch.arange(T, device=byte_embeddings.device) // target_patch_size, max=M - 1)
+    patch_assignments = patch_ids.unsqueeze(0).expand(B, -1)
+    # Batched mean-pool via scatter_add (vectorized over M)
     pooled = torch.zeros(B, M, D, dtype=byte_embeddings.dtype, device=byte_embeddings.device)
-    for p in range(M):
-        mask = (patch_assignments == p).unsqueeze(-1)
-        cnt = mask.sum(dim=1).clamp(min=1)
-        pooled[:, p] = (byte_embeddings * mask).sum(dim=1) / cnt
+    # Expand assignments for scatter: [B, T, D]
+    idx_exp = patch_assignments.unsqueeze(-1).expand(-1, -1, D)
+    pooled.scatter_add_(1, idx_exp, byte_embeddings)
+    counts = torch.zeros(B, M, 1, dtype=byte_embeddings.dtype, device=byte_embeddings.device)
+    counts.scatter_add_(1, patch_assignments.unsqueeze(-1), torch.ones_like(byte_embeddings[:, :, :1]))
+    pooled = pooled / counts.clamp(min=1)
     return pooled, patch_assignments
 
 

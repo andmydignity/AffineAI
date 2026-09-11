@@ -187,11 +187,13 @@ def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):  # 
 class TritonRouterTopkFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves):
-        from affine_ai.core.ast_dag import ternarize
+        from affine_ai.core.ast_dag import _eval_static, ternarize
         top_k = min(top_k, num_leaves)
         with torch.no_grad():
-            W_route = ternarize(hyperplanes)
-            node_logits = torch.nn.functional.linear(x_flat.float(), W_route.float(), biases.float())
+            W_route_f = _eval_static(
+                ("router-W", 0.7), [hyperplanes],
+                lambda: ternarize(hyperplanes).float())
+            node_logits = torch.nn.functional.linear(x_flat.float(), W_route_f, biases.float())
             top_idx, top_w = triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves)
         ctx.save_for_backward(x_flat, hyperplanes, biases, top_idx)
         ctx.tree_depth = tree_depth

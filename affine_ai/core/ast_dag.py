@@ -64,6 +64,39 @@ class EdgeType(Enum):
 # Aliases
 ASDAGLayer = None # set after ASTDAGLayer definition
 
+SKIP_SHIFT4_IN_EVAL = False
+
+_EVAL_STATIC_CACHE: Dict[Any, Any] = {}
+
+def _eval_static(key: Any, version_tensors: List[Optional[torch.Tensor]], fn):
+    if torch.is_grad_enabled():
+        return fn()
+    ver = tuple(
+        None if t is None else (id(t), t._version, tuple(t.shape), str(t.dtype), str(t.device))
+        for t in version_tensors
+    )
+    ekey = (key, ver)
+    ent = _EVAL_STATIC_CACHE.get(ekey)
+    if ent is not None:
+        return ent
+    val = fn()
+    if len(_EVAL_STATIC_CACHE) < 4096:
+        _EVAL_STATIC_CACHE[ekey] = val
+    return val
+
+
+def _eval_cache_clear() -> None:
+    _EVAL_STATIC_CACHE.clear()
+
+
+def set_balance_loss_weight(module: torch.nn.Module, w: float) -> int:
+    n = 0
+    for m in module.modules():
+        if m.__class__.__name__ == "ASTDAGLayer" and hasattr(m, "balance_loss_weight"):
+            m.balance_loss_weight = float(w)
+            n += 1
+    return n
+
 
 # ---------------------------------------------------------------------------
 # Quantization Primitives: Ternary Weights & Log4 / Shift4 Activations
@@ -176,6 +209,8 @@ class _Log4ShiftSTE(torch.autograd.Function):
 
 def quantize_shift4(x: torch.Tensor, max_shift: int = 7) -> torch.Tensor:
     """Quantizes continuous activations to 4-bit logarithmic shift representations."""
+    if SKIP_SHIFT4_IN_EVAL and not torch.is_grad_enabled():
+        return x
     return _Log4ShiftSTE.apply(x, max_shift)
 
 
@@ -499,10 +534,14 @@ class ASTDAGNode(nn.Module):
 
         # 1. Primary Transformation (Ternary additions + N:M Sparsity / Permutations)
         if self.leaf_mode in ("permutation", "perm"):
-            w_perm = ternarize(
-                self.latent_w_perm,
-                threshold_frac=self.threshold_frac,
-                scale=self.scale_perm if self.learnable_scale else None
+            w_perm = _eval_static(
+                ("node-wperm", self.threshold_frac, bool(self.learnable_scale)),
+                [self.latent_w_perm, self.scale_perm if self.learnable_scale else None],
+                lambda: ternarize(
+                    self.latent_w_perm,
+                    threshold_frac=self.threshold_frac,
+                    scale=self.scale_perm if self.learnable_scale else None
+                )
             )
             x_4d = x_in.unsqueeze(1).expand(-1, self.num_permutations, -1)
             perms_4d = self.perms.long().unsqueeze(0).expand(x_in.shape[0], -1, -1)
@@ -825,6 +864,7 @@ class ASTDAGLayer(nn.Module):
         use_power_of_two_gates: bool = False,
         use_hierarchical_routing: bool = False,
         top_k: Optional[int] = 2,
+        balance_loss_weight: float = 1e-2,
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
         use_fp8: bool = False   # simulated FP8 off by default on Ampere,
@@ -873,6 +913,8 @@ class ASTDAGLayer(nn.Module):
         self.use_power_of_two_gates = use_power_of_two_gates
         self.use_hierarchical_routing = use_hierarchical_routing
         self.top_k = top_k
+        self.balance_loss_weight = balance_loss_weight
+        self._last_balance_loss = None
 
         self._next_node_id = 0
         self.nodes: nn.ModuleDict = nn.ModuleDict()
@@ -1079,22 +1121,43 @@ class ASTDAGLayer(nn.Module):
             routing_probs = quantize_fp8_hybrid(routing_probs).to(x_flat.dtype)
             top_weights = quantize_fp8_hybrid(top_weights).to(x_flat.dtype)
 
+        self._last_balance_loss = None
+        _bw = float(getattr(self, "balance_loss_weight", 0.0) or 0.0)
+        if (_bw > 0.0 and self.training and torch.is_grad_enabled()
+                and routing_probs.shape[-1] > 1 and len(orig_shape) >= 2):
+            _B0 = int(orig_shape[0])
+            _N = int(routing_probs.shape[0])
+            _K = int(routing_probs.shape[-1])
+            if _B0 > 0 and _N % _B0 == 0:
+                _rp = routing_probs.view(_B0, _N // _B0, _K)
+                with torch.no_grad():
+                    _hard = torch.zeros_like(_rp)
+                    _hard.scatter_(-1, _rp.argmax(dim=-1, keepdim=True), 1.0)
+                    _f = _hard.mean(dim=1)
+                _P = _rp.mean(dim=1)
+                self._last_balance_loss = (_K * (_f * _P).sum(dim=-1)).mean()
+
         first_leaf = leaves[0] if leaves else self.root
         r_in = quantize_shift4(root_out) if (use_shift4_act or first_leaf.use_shift4_activations) else root_out
 
         if first_leaf.leaf_mode in ("permutation", "perm"):
             latent_stack = torch.stack([leaf.latent_w_perm for leaf in leaves], dim=0)
-            abs_stack = latent_stack.detach().abs()
-            delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.threshold_frac
-            w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
-                        torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
-            if self.learnable_scale:
-                alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
-            else:
-                active = (w_sign != 0).to(latent_stack.dtype)
-                alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+            _vv = [t for leaf in leaves for t in (leaf.latent_w_perm, getattr(leaf, "scale_perm", None), leaf.bias)]
+            def _perm_consts():
+                abs_stack = latent_stack.detach().abs()
+                delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.threshold_frac
+                w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
+                            torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
+                if self.learnable_scale:
+                    alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
+                else:
+                    active = (w_sign != 0).to(latent_stack.dtype)
+                    alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+                b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
+                return delta, w_sign, alpha_stack, b_stack
+            delta, w_sign, alpha_stack, b_stack = _eval_static(
+                ("perm-consts", self.threshold_frac, bool(self.learnable_scale)), _vv, _perm_consts)
             w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
-            b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             need_rebuild = False
             if not hasattr(self, '_cached_perms_stack') or self._cached_perms_stack.numel() == 0:
                 need_rebuild = True
@@ -1373,17 +1436,22 @@ class ASTDAGLayer(nn.Module):
 
         if first_leaf.leaf_mode in ("permutation", "perm"):
             latent_stack = torch.stack([leaf.latent_w_perm for leaf in leaves], dim=0)
-            abs_stack = latent_stack.detach().abs()
-            delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.threshold_frac
-            w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
-                        torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
-            if self.learnable_scale:
-                alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
-            else:
-                active = (w_sign != 0).to(latent_stack.dtype)
-                alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+            _vv = [t for leaf in leaves for t in (leaf.latent_w_perm, getattr(leaf, "scale_perm", None), leaf.bias)]
+            def _perm_consts():
+                abs_stack = latent_stack.detach().abs()
+                delta = abs_stack.mean(dim=(1, 2), keepdim=True) * self.threshold_frac
+                w_sign = torch.where(latent_stack > delta, torch.ones_like(latent_stack),
+                            torch.where(latent_stack < -delta, -torch.ones_like(latent_stack), torch.zeros_like(latent_stack)))
+                if self.learnable_scale:
+                    alpha_stack = torch.stack([leaf.scale_perm for leaf in leaves], dim=0)
+                else:
+                    active = (w_sign != 0).to(latent_stack.dtype)
+                    alpha_stack = ((abs_stack * active).sum(dim=(1, 2), keepdim=True) / active.sum(dim=(1, 2), keepdim=True).clamp(min=1.0))
+                b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
+                return delta, w_sign, alpha_stack, b_stack
+            delta, w_sign, alpha_stack, b_stack = _eval_static(
+                ("perm-consts", self.threshold_frac, bool(self.learnable_scale)), _vv, _perm_consts)
             w_perm_stack = w_sign.detach() * alpha_stack + (latent_stack - latent_stack.detach())
-            b_stack = torch.stack([leaf.bias for leaf in leaves], dim=0)
             need_rebuild = False
             if not hasattr(self, '_cached_perms_stack') or self._cached_perms_stack.numel() == 0:
                 need_rebuild = True

@@ -593,9 +593,13 @@ class TorosHybridLanguageModel(nn.Module):
             h_sub = next_h[:, ::stride] if stride > 1 else next_h
             _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
             opt_i = optimizers[idx]
+            _cm = getattr(block, 'channel_mixer', None) or getattr(block, 'asdag', None)
+            _bl = getattr(_cm, '_last_balance_loss', None) if _cm is not None else None
+            _bw = float(getattr(_cm, 'balance_loss_weight', 0.0) or 0.0) if _cm is not None else 0.0
+            loss_opt = loss_i + _bw * _bl if (_bl is not None and _bw > 0.0) else loss_i
 
             opt_i.zero_grad(set_to_none=is_cuda)
-            loss_i.backward()
+            loss_opt.backward()
             if grad_clip > 0:
                 opt_params = [p for pg in opt_i.param_groups for p in pg['params'] if p.grad is not None]
                 if opt_params:
@@ -764,6 +768,49 @@ class TorosHybridLanguageModel(nn.Module):
             sample_inputs=(sample_byte_ids, sample_targets),
             warmup_iters=warmup_iters,
         )
+
+    def capture_forward_graph(
+        self,
+        sample_byte_ids: torch.Tensor,
+        warmup_iters: int = 3,
+    ) -> Any:
+        """
+        Captures inference forward (logits) into a dedicated CUDA Graph.
+        Requires eval mode (no training-only codebook/growth updates) and
+        static input shapes; targets-free (no loss/metrics syncs inside).
+        """
+        from affine_ai.core.cuda_graph import CUDAGraphRunner
+
+        def step_fn(bx: torch.Tensor):
+            logits, _, _ = self.forward(bx)
+            return logits
+
+        return CUDAGraphRunner(
+            step_fn=step_fn,
+            sample_inputs=(sample_byte_ids,),
+            warmup_iters=warmup_iters,
+        )
+
+    def forward_graphed(self, byte_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Logits via captured CUDA graph when shapes match a previous capture,
+        otherwise captures lazily and falls back to eager on failure.
+        Returns the logits tensor (unlike forward() tuple).
+        """
+        runner = getattr(self, "_fwd_graph_runner", None)
+        if (
+            runner is not None
+            and runner.static_inputs[0].shape == byte_ids.shape
+            and runner.static_inputs[0].dtype == byte_ids.dtype
+        ):
+            return runner.step(byte_ids)
+        try:
+            self._fwd_graph_runner = self.capture_forward_graph(byte_ids)
+            return self._fwd_graph_runner.step(byte_ids)
+        except Exception:
+            self._fwd_graph_runner = None
+            logits, _, _ = self.forward(byte_ids)
+            return logits
 
     def update_target_encoder(self, *args, **kwargs):
         """Deprecated stub: JEPA target encoder removed. No-op for checkpoint compat."""

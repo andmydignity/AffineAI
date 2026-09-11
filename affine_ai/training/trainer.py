@@ -698,6 +698,56 @@ class ASDAGTrainer:
         ppl = math.exp(min(mean_loss, 20.0))
         return {"val_loss": mean_loss, "val_bpc": bpc, "val_ppl": ppl}
 
+    @torch.no_grad()
+    def routing_health(self, n_batches: int = 2) -> Dict[int, Dict[str, float]]:
+        stats: Dict[int, Dict[str, float]] = {}
+        hybrid = getattr(self, "hybrid", None)
+        if hybrid is None:
+            return stats
+        blocks = getattr(getattr(hybrid, "context_encoder", None), "blocks", None)
+        if not blocks:
+            return stats
+        was_training = hybrid.training
+        hybrid.train()
+        try:
+            counts = []
+            for _ in range(n_batches):
+                x, _ = self.get_batch("val")
+                hybrid(x)
+                per_layer = []
+                for blk in blocks:
+                    cm = getattr(blk, "channel_mixer", None) or getattr(blk, "asdag", None)
+                    rp = getattr(cm, "_last_routing_probs", None)
+                    per_layer.append(None if rp is None else rp.detach().float().cpu())
+                counts.append(per_layer)
+            for li in range(len(blocks)):
+                parts = [c[li].reshape(-1, c[li].shape[-1]) for c in counts if c[li] is not None]
+                if not parts:
+                    continue
+                p = torch.cat(parts, dim=0)
+                K = p.shape[-1]
+                t1 = p.argmax(dim=-1).reshape(-1)
+                tot = t1.numel()
+                top1 = 0.0
+                dead = 0
+                ent = 0.0
+                for k in range(K):
+                    f = float((t1 == k).sum()) / max(1, tot)
+                    if f > top1:
+                        top1 = f
+                    if f < 0.01:
+                        dead += 1
+                    if f > 0:
+                        ent -= f * math.log(f)
+                stats[li] = {"top1": top1, "dead": float(dead), "leaves": float(K),
+                             "entropy": ent, "entropy_max": math.log(K)}
+        finally:
+            if was_training:
+                hybrid.train()
+            else:
+                hybrid.eval()
+        return stats
+
     def train_step_backpressure(self, step: int, use_sign_backpressure: bool = False) -> float:
         """
         Executes a zero-autograd closed-form local backpressure training step (1.B).
@@ -875,6 +925,25 @@ class ASDAGTrainer:
                     if getattr(self, "is_distributed", False) and not getattr(self, "is_main", True):
                         continue
                     eval_metrics = self.evaluate()
+                    try:
+                        _rh = self.routing_health(n_batches=2)
+                        if _rh:
+                            _worst_li = min(_rh, key=lambda li: _rh[li]["entropy"] / max(1e-9, _rh[li]["entropy_max"]))
+                            _w = _rh[_worst_li]
+                            print(f"Routing health: worst layer {_worst_li} "
+                                  f"top1={_w['top1']:.2f} dead={int(_w['dead'])}/{int(_w['leaves'])} "
+                                  f"ent={_w['entropy']:.2f}/{_w['entropy_max']:.2f}", flush=True)
+                            if (_w["entropy"] < 0.4 * _w["entropy_max"]
+                                    or _w["dead"] > 0.25 * _w["leaves"]):
+                                import warnings
+                                warnings.warn(
+                                    f"Router starvation signs at layer {_worst_li}: "
+                                    f"top1={_w['top1']:.2f}, dead={int(_w['dead'])}/{int(_w['leaves'])}. "
+                                    f"Consider balance_loss_weight>0.",
+                                    stacklevel=2,
+                                )
+                    except Exception:
+                        pass
                     if getattr(self, "is_distributed", False) and self.world_size > 1:
                         try:
                             _t = torch.tensor(eval_metrics["val_loss"], device=self.device if isinstance(self.device, torch.device) else torch.device(self.device) if "cuda" in str(self.device) and torch.cuda.is_available() else torch.device("cpu"))

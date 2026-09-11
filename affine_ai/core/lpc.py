@@ -371,6 +371,10 @@ class LocalPredictiveLanguageModel(nn.Module):
 
             # Local predictive head forward
             _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
+            _cm = getattr(block, 'channel_mixer', None) or getattr(block, 'asdag', None)
+            _bl = getattr(_cm, '_last_balance_loss', None) if _cm is not None else None
+            _bw = float(getattr(_cm, 'balance_loss_weight', 0.0) or 0.0) if _cm is not None else 0.0
+            loss_opt = loss_i + _bw * _bl if (_bl is not None and _bw > 0.0) else loss_i
 
             # Asynchronous Pipelined Execution on CUDA via Double-Buffering
             if is_cuda and use_async_pipelining:
@@ -383,7 +387,7 @@ class LocalPredictiveLanguageModel(nn.Module):
                     bwd_stream.wait_event(fwd_event)
                     opt_i = optimizers[idx]
                     opt_i.zero_grad(set_to_none=True)
-                    loss_i.backward()
+                    loss_opt.backward()
                     if grad_clip > 0:
                         # Vectorized param collection via itertools.chain (C-level iteration)
                         params = list(itertools.chain.from_iterable(pg['params'] for pg in opt_i.param_groups))
@@ -400,7 +404,7 @@ class LocalPredictiveLanguageModel(nn.Module):
             else:
                 opt_i = optimizers[idx]
                 opt_i.zero_grad(set_to_none=is_cuda)
-                loss_i.backward()
+                loss_opt.backward()
                 if grad_clip > 0:
                     params = list(itertools.chain.from_iterable(pg['params'] for pg in opt_i.param_groups))
                     torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=foreach_clip)

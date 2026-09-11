@@ -645,8 +645,6 @@ class NativeASDAGAssociativeMixer(nn.Module):
 
         # Data-dependent decay in (0, 1)
         gamma = torch.sigmoid(self.gate_decay(x.to(self.gate_decay.weight.dtype))).transpose(1, 2)  # [B, H, T]
-        if reset_mask is not None:
-            gamma = gamma * (~reset_mask.unsqueeze(1)).to(gamma.dtype)
 
         # 2. Sequential O(1) Step Mode (Inference Generation with state caching)
         if state is not None:
@@ -858,81 +856,20 @@ class NativeASDAGAssociativeMixer(nn.Module):
 
         eps = 1e-4 if orig_dtype == torch.float16 else 1e-5
         clamp_min = _clamp_min_for_dtype(orig_dtype)
-        # Reset-mask path: avoid dense [B,H,T,T] via sequential scan (no T*T alloc).
-        # Uses masked gamma (0 at boundaries) which zeroes decay across docs.
+        # Chunked fast path on CUDA avoids materializing dense [B, H, T, T] tensors (Issue 18)
+        # When reset_mask is passed, route to exact same_doc masked path to guarantee zero cross-doc attention
         if reset_mask is not None:
-            # gamma already masked above (gamma=0 at reset positions) so recurrence resets.
-            # Dispatch via chunked scan or torch.compile, no dense materialization.
-            def _reset_seq(phi_q_, phi_k_, v_, gamma_, eps_):
-                B_ = phi_q_.shape[0]
-                H_ = phi_q_.shape[1]
-                T_ = phi_q_.shape[2]
-                D_ = phi_q_.shape[3]
-                S_ = torch.zeros(B_, H_, D_, D_, device=phi_q_.device, dtype=phi_q_.dtype)
-                z_ = torch.zeros(B_, H_, D_, device=phi_q_.device, dtype=phi_q_.dtype)
-                outs_ = []
-                # UNVECTORIZABLE: sequential GLA with reset, needs block-sparse kernel (proposed)
-                for t in range(T_):
-                    q_t = phi_q_[:, :, t]
-                    k_t = phi_k_[:, :, t]
-                    v_t = v_[:, :, t]
-                    gam_t = gamma_[:, :, t]
-                    S_ = S_ * gam_t.unsqueeze(-1).unsqueeze(-1) + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
-                    z_ = z_ * gam_t.unsqueeze(-1) + k_t
-                    num = torch.matmul(q_t.unsqueeze(-2), S_).squeeze(-2)
-                    den = (q_t * z_).sum(dim=-1, keepdim=True).clamp(min=eps_)
-                    outs_.append((num / den).unsqueeze(2))
-                y_ = torch.cat(outs_, dim=2).transpose(1, 2).reshape(B_, T_, -1)
-                # -1 will be inferred but need C; caller reshapes with C
-                return y_
-            if x.is_cuda:
-                try:
-                    compiled = _maybe_compile(_reset_seq)
-                    y = compiled(phi_q, phi_k, v, gamma, eps)
-                    # y currently [B,T,?], need reshape to [B,T,C] via transpose logic
-                    # Our helper returns [B,T,C?] but we built with -1; more precise: use phi_q shape
-                    # Instead recompute directly if shape mismatched: fallback to eager
-                    if y.shape != (B, T, C):
-                        # fallback eager path with correct C handling
-                        raise ValueError("shape mismatch, fallback")
-                    return self.out_proj(y.to(orig_dtype) * g), None
-                except Exception as e:
-                    warnings.warn(f"reset_mask sequential compile failed: {e}; using eager loop", stacklevel=2)
-                # Eager fallback
-                S = torch.zeros(B, H, D, D, device=phi_q.device, dtype=phi_q.dtype)
-                z = torch.zeros(B, H, D, device=phi_q.device, dtype=phi_q.dtype)
-                outs = []
-                # UNVECTORIZABLE: sequential GLA with reset, needs block-sparse kernel (proposed)
-                for t in range(T):
-                    q_t = phi_q[:, :, t]
-                    k_t = phi_k[:, :, t]
-                    v_t = v[:, :, t]
-                    gam_t = gamma[:, :, t]
-                    S = S * gam_t.unsqueeze(-1).unsqueeze(-1) + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
-                    z = z * gam_t.unsqueeze(-1) + k_t
-                    num = torch.matmul(q_t.unsqueeze(-2), S).squeeze(-2)
-                    den = (q_t * z).sum(dim=-1, keepdim=True).clamp(min=eps)
-                    outs.append((num / den).unsqueeze(2))
-                y = torch.cat(outs, dim=2).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
-                return self.out_proj(y * g), None
-            else:
-                # CPU: also avoid dense T*T, use same eager loop
-                S = torch.zeros(B, H, D, D, device=phi_q.device, dtype=phi_q.dtype)
-                z = torch.zeros(B, H, D, device=phi_q.device, dtype=phi_q.dtype)
-                outs = []
-                # UNVECTORIZABLE: sequential GLA/delta, needs scan kernel (proposed)
-                for t in range(T):
-                    q_t = phi_q[:, :, t]
-                    k_t = phi_k[:, :, t]
-                    v_t = v[:, :, t]
-                    gam_t = gamma[:, :, t]
-                    S = S * gam_t.unsqueeze(-1).unsqueeze(-1) + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
-                    z = z * gam_t.unsqueeze(-1) + k_t
-                    num = torch.matmul(q_t.unsqueeze(-2), S).squeeze(-2)
-                    den = (q_t * z).sum(dim=-1, keepdim=True).clamp(min=eps)
-                    outs.append((num / den).unsqueeze(2))
-                y = torch.cat(outs, dim=2).transpose(1, 2).reshape(B, T, C).to(orig_dtype)
-                return self.out_proj(y * g), None
+            # Exact document boundary masking: guarantees 0.0 attention/decay across document boundaries
+            doc_id = torch.cumsum(reset_mask.long(), dim=-1)  # [B, T]
+            same_doc = (doc_id.unsqueeze(-1) == doc_id.unsqueeze(-2)).unsqueeze(1)  # [B, 1, T, T]
+            log_gam = torch.log(gamma.clamp(min=1e-5, max=1.0))
+            cum_log_gam = torch.cumsum(log_gam, dim=-1)
+            decay_diff = (cum_log_gam.unsqueeze(-1) - cum_log_gam.unsqueeze(-2)).clamp(min=clamp_min, max=0.0)
+            causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+            decay_mat = torch.where(causal_mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
+            decay_mat = decay_mat * same_doc
+            scores = torch.matmul(phi_q, phi_k.transpose(-1, -2)) * decay_mat
+            scores = scores * same_doc
         elif x.is_cuda and not return_state:
             if T <= 64:
                 y = FusedGLAAnalyticalCUDA.apply(phi_q, phi_k, v, gamma, T).transpose(1, 2).reshape(B, T, C)

@@ -37,6 +37,7 @@ def parse_args():
     p.add_argument("--save", type=str, default="checkpoints/fineweb2_tur_best.pt")
     p.add_argument("--eval-interval", type=int, default=None, help="eval every N steps (default max(200, steps//10))")
     p.add_argument("--log-interval", type=int, default=1, help="print train loss/ppl/speed every N steps")
+    p.add_argument("--balance-w", type=float, default=1e-2, help="sequence-wise router balance loss weight (0 disables)")
     return p.parse_args()
 
 
@@ -96,6 +97,10 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params/1e6:.1f}M params ({args.mixer})")
+    if args.balance_w and args.balance_w > 0:
+        from affine_ai.core.ast_dag import set_balance_loss_weight
+        n_hit = set_balance_loss_weight(model, args.balance_w)
+        print(f"Router balance loss ON: w={args.balance_w} applied to {n_hit} ASTDAG layers")
 
     trainer = ASDAGTrainer(
         model=model,
@@ -136,6 +141,15 @@ def main():
             em = trainer.evaluate()
             vl, vppl, vbpc = em["val_loss"], em["val_ppl"], em["val_bpc"]
             print(f"  -> eval val_loss {vl:.4f} ppl {vppl:.1f} bpc {vbpc:.3f} | elapsed {(time.time()-t0)/3600:.2f}h", flush=True)
+            try:
+                _rh = trainer.routing_health(n_batches=2)
+                if _rh:
+                    _wl = min(_rh, key=lambda li: _rh[li]["entropy"] / max(1e-9, _rh[li]["entropy_max"]))
+                    _w = _rh[_wl]
+                    print(f"  -> routing health worst=L{_wl} top1={_w['top1']:.2f} "
+                          f"dead={int(_w['dead'])}/{int(_w['leaves'])} ent={_w['entropy']:.2f}/{_w['entropy_max']:.2f}", flush=True)
+            except Exception:
+                pass
             if vl < best_val:
                 best_val = vl
                 import os as _os

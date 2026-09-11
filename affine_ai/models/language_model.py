@@ -493,6 +493,18 @@ class ASDAGLanguageModel(nn.Module):
                 error, use_sign_backpressure=use_sign_backpressure
             )
 
+    def capture_forward_graph(self, sample_ids: torch.Tensor, warmup_iters: int = 3):
+        hybrid = getattr(self, 'hybrid', None)
+        if hybrid is None or not hasattr(hybrid, 'capture_forward_graph'):
+            raise NotImplementedError("Forward graphs require the hybrid model path")
+        return hybrid.capture_forward_graph(sample_ids, warmup_iters=warmup_iters)
+
+    def forward_graphed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        hybrid = getattr(self, 'hybrid', None)
+        if hybrid is None or not hasattr(hybrid, 'forward_graphed'):
+            raise NotImplementedError("Forward graphs require the hybrid model path")
+        return hybrid.forward_graphed(input_ids)
+
     @torch.no_grad()
     def generate(
         self,

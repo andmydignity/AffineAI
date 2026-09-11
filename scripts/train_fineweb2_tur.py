@@ -37,7 +37,7 @@ def parse_args():
     p.add_argument("--save", type=str, default="checkpoints/fineweb2_tur_best.pt")
     p.add_argument("--eval-interval", type=int, default=None, help="eval every N steps (default max(200, steps//10))")
     p.add_argument("--log-interval", type=int, default=1, help="print train loss/ppl/speed every N steps")
-    p.add_argument("--balance-w", type=float, default=1e-2, help="sequence-wise router balance loss weight (0 disables)")
+    p.add_argument("--bias-rate", "--balance-w", dest="bias_rate", type=float, default=1e-3, help="DeepSeek expert bias update rate (0 disables)")
     return p.parse_args()
 
 
@@ -97,10 +97,10 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params/1e6:.1f}M params ({args.mixer})")
-    if args.balance_w and args.balance_w > 0:
-        from affine_ai.core.ast_dag import set_balance_loss_weight
-        n_hit = set_balance_loss_weight(model, args.balance_w)
-        print(f"Router balance loss ON: w={args.balance_w} applied to {n_hit} ASTDAG layers")
+    if args.bias_rate and args.bias_rate > 0:
+        from affine_ai.core.ast_dag import set_expert_bias_rate
+        n_hit = set_expert_bias_rate(model, args.bias_rate)
+        print(f"DeepSeek expert bias ON: rate={args.bias_rate} applied to {n_hit} ASTDAG layers")
 
     trainer = ASDAGTrainer(
         model=model,

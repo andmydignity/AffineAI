@@ -55,6 +55,8 @@ class ASDAGConfig:
     use_conv_prefix: bool = True
     conv_kernel_size: int = 4
     use_fp8: bool = False   # simulated FP8 off by default on Ampere
+    expert_bias_rate: float = 1e-3  # DeepSeek auxiliary-loss-free expert bias rate
+    balance_loss_weight: float = 0.0  # Deprecated: superseded by expert_bias_rate
     dtype: Any = torch.bfloat16
 
 class EdgeType(Enum):
@@ -89,13 +91,19 @@ def _eval_cache_clear() -> None:
     _EVAL_STATIC_CACHE.clear()
 
 
-def set_balance_loss_weight(module: torch.nn.Module, w: float) -> int:
+def set_expert_bias_rate(module: torch.nn.Module, rate: float) -> int:
+    """Set the online update rate for DeepSeek auxiliary-loss-free expert bias across all ASTDAG layers."""
     n = 0
     for m in module.modules():
-        if m.__class__.__name__ == "ASTDAGLayer" and hasattr(m, "balance_loss_weight"):
-            m.balance_loss_weight = float(w)
+        if m.__class__.__name__ in ("ASTDAGLayer", "AdaptiveSparseTreeDAGLayer") and hasattr(m, "expert_bias_rate"):
+            m.expert_bias_rate = float(rate)
             n += 1
     return n
+
+
+def set_balance_loss_weight(module: torch.nn.Module, w: float) -> int:
+    """Deprecated: Auxiliary balance loss is superseded by DeepSeek expert bias."""
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -864,10 +872,11 @@ class ASTDAGLayer(nn.Module):
         use_power_of_two_gates: bool = False,
         use_hierarchical_routing: bool = False,
         top_k: Optional[int] = 2,
-        balance_loss_weight: float = 1e-2,
+        balance_loss_weight: float = 0.0,
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
-        use_fp8: bool = False   # simulated FP8 off by default on Ampere,
+        use_fp8: bool = False,   # simulated FP8 off by default on Ampere
+        expert_bias_rate: float = 1e-3,  # DeepSeek auxiliary-loss-free expert bias rate
     ):
         super().__init__()
         if isinstance(dim, ASDAGConfig):
@@ -882,6 +891,7 @@ class ASTDAGLayer(nn.Module):
             leaf_mode = cfg.leaf_mode
             num_permutations = cfg.num_permutations
             use_fp8 = cfg.use_fp8
+            expert_bias_rate = getattr(cfg, "expert_bias_rate", 1e-3)
 
         if leaf_mode is None:
             if rank is not None:
@@ -913,7 +923,9 @@ class ASTDAGLayer(nn.Module):
         self.use_power_of_two_gates = use_power_of_two_gates
         self.use_hierarchical_routing = use_hierarchical_routing
         self.top_k = top_k
-        self.balance_loss_weight = balance_loss_weight
+        self.expert_bias_rate = float(expert_bias_rate)
+        self.register_buffer("expert_bias", torch.zeros(initial_branches, dtype=torch.float32), persistent=True)
+        self.balance_loss_weight = 0.0
         self._last_balance_loss = None
 
         self._next_node_id = 0
@@ -1064,6 +1076,18 @@ class ASTDAGLayer(nn.Module):
                     self._migrate_param_state(old_b, new_b_param, optimizer)
                 self._invalidate_leaves_cache()
 
+        if getattr(self, "expert_bias", None) is None or self.expert_bias.shape[0] != num_leaves:
+            old_b = getattr(self, "expert_bias", None)
+            dev = old_b.device if old_b is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+            new_b = torch.zeros(num_leaves, device=dev, dtype=torch.float32)
+            if old_b is not None:
+                min_k = min(old_b.shape[0], num_leaves)
+                new_b[:min_k] = old_b[:min_k]
+            if hasattr(self, "_buffers") and "expert_bias" in self._buffers:
+                self._buffers["expert_bias"] = new_b
+            else:
+                self.register_buffer("expert_bias", new_b, persistent=True)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1090,7 +1114,8 @@ class ASTDAGLayer(nn.Module):
                 from affine_ai.kernels.triton_router import triton_router_topk
                 top_indices, top_weights = triton_router_topk(
                     x_flat, self.router.hyperplanes, self.router.biases,
-                    self.router.tree_depth, self.top_k, self.router.num_leaves)
+                    self.router.tree_depth, self.top_k, self.router.num_leaves,
+                    expert_bias=getattr(self, "expert_bias", None))
                 routing_probs = torch.zeros(
                     B, self.router.num_leaves, device=x_flat.device,
                     dtype=top_weights.dtype).scatter_(-1, top_indices.long(), top_weights)
@@ -1109,8 +1134,15 @@ class ASTDAGLayer(nn.Module):
             top_indices = None
             top_weights = None
         if not _fused_route and self.top_k is not None and self.top_k < routing_probs.shape[-1]:
-            top_vals, top_indices = torch.topk(routing_probs, k=self.top_k, dim=-1)
-            top_weights = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # DeepSeek Expert Bias selection: add dynamic expert_bias to routing scores for top-k selection
+            if hasattr(self, "expert_bias") and self.expert_bias is not None:
+                biased_scores = routing_probs + self.expert_bias.to(routing_probs.device).float().unsqueeze(0)
+            else:
+                biased_scores = routing_probs
+            top_vals_b, top_indices = torch.topk(biased_scores, k=self.top_k, dim=-1)
+            # Crucial: combine weights use original UNBIASED routing probabilities
+            unbiased_selected = routing_probs.gather(-1, top_indices)
+            top_weights = unbiased_selected / unbiased_selected.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             sparse_probs = torch.zeros_like(routing_probs).scatter_(-1, top_indices, top_weights)
             routing_probs = sparse_probs
         elif not _fused_route:
@@ -1121,21 +1153,21 @@ class ASTDAGLayer(nn.Module):
             routing_probs = quantize_fp8_hybrid(routing_probs).to(x_flat.dtype)
             top_weights = quantize_fp8_hybrid(top_weights).to(x_flat.dtype)
 
+        # DeepSeek Auxiliary-Loss-Free Expert Bias update:
+        # Online feedback controller adjusting leaf bias outside autograd (CUDA graph compatible)
         self._last_balance_loss = None
-        _bw = float(getattr(self, "balance_loss_weight", 0.0) or 0.0)
-        if (_bw > 0.0 and self.training and torch.is_grad_enabled()
-                and routing_probs.shape[-1] > 1 and len(orig_shape) >= 2):
-            _B0 = int(orig_shape[0])
-            _N = int(routing_probs.shape[0])
-            _K = int(routing_probs.shape[-1])
-            if _B0 > 0 and _N % _B0 == 0:
-                _rp = routing_probs.view(_B0, _N // _B0, _K)
-                with torch.no_grad():
-                    _hard = torch.zeros_like(_rp)
-                    _hard.scatter_(-1, _rp.argmax(dim=-1, keepdim=True), 1.0)
-                    _f = _hard.mean(dim=1)
-                _P = _rp.mean(dim=1)
-                self._last_balance_loss = (_K * (_f * _P).sum(dim=-1)).mean()
+        _bias_rate = float(getattr(self, "expert_bias_rate", 0.0) or 0.0)
+        if (self.training and _bias_rate > 0.0 and hasattr(self, "expert_bias")
+                and self.expert_bias is not None and top_indices is not None):
+            with torch.no_grad():
+                K = self.expert_bias.shape[0]
+                flat_idx = top_indices.reshape(-1)
+                counts = torch.zeros(K, device=self.expert_bias.device, dtype=torch.float32)
+                counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+                avg_count = counts.mean()
+                # DeepSeek update: b_i += gamma * sign(avg_count - count_i)
+                self.expert_bias.add_(_bias_rate * torch.sign(avg_count - counts))
+                self.expert_bias.sub_(self.expert_bias.mean())
 
         first_leaf = leaves[0] if leaves else self.root
         r_in = quantize_shift4(root_out) if (use_shift4_act or first_leaf.use_shift4_activations) else root_out

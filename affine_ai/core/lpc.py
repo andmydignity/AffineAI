@@ -371,10 +371,7 @@ class LocalPredictiveLanguageModel(nn.Module):
 
             # Local predictive head forward
             _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
-            _cm = getattr(block, 'channel_mixer', None) or getattr(block, 'asdag', None)
-            _bl = getattr(_cm, '_last_balance_loss', None) if _cm is not None else None
-            _bw = float(getattr(_cm, 'balance_loss_weight', 0.0) or 0.0) if _cm is not None else 0.0
-            loss_opt = loss_i + _bw * _bl if (_bl is not None and _bw > 0.0) else loss_i
+            loss_opt = loss_i
 
             # Asynchronous Pipelined Execution on CUDA via Double-Buffering
             if is_cuda and use_async_pipelining:

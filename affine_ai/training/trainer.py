@@ -1172,7 +1172,7 @@ class ASDAGTrainer:
                                 warnings.warn(
                                     f"Router starvation signs at layer {_worst_li}: "
                                     f"top1={_w['top1']:.2f}, dead={int(_w['dead'])}/{int(_w['leaves'])}. "
-                                    f"Consider balance_loss_weight>0.",
+                                    f"Consider expert_bias_rate>0.",
                                     stacklevel=2,
                                 )
                     except Exception:

@@ -8,7 +8,7 @@ import os
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from affine_ai.core.ast_dag import ASTDAGLayer, ASDAGConfig, AdaptiveSparseTreeDAGLayer
+from affine_ai.core.ast_dag import ASTDAGLayer, ASDAGConfig, AdaptiveSparseTreeDAGLayer, set_expert_bias_rate
 # Deprecated: Use AdaptiveSparseTreeDAGLayer or ASTDAGLayer instead of FusedSparseBackpressureTreeV3
 from affine_ai.core.backpressure_tree import FusedSparseBackpressureTreeV3
 from affine_ai.core.associative import NativeASDAGAssociativeMixer, PermutationProjection
@@ -54,6 +54,7 @@ __all__ = [
     "ASTDAGLayer",
     "ASDAGConfig",
     "AdaptiveSparseTreeDAGLayer",
+    "set_expert_bias_rate",
     "FusedSparseBackpressureTreeV3",
     "AdaptiveBackpressureTreeLayer",
     "NativeASDAGAssociativeMixer",

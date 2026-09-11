@@ -50,8 +50,7 @@ def _is_turing(device=None) -> bool:
 if triton is not None:
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_M": 16}, num_warps=2),
-            triton.Config({"BLOCK_M": 32}, num_warps=4),
+            triton.Config({"BLOCK_M": 64}, num_warps=2),
             triton.Config({"BLOCK_M": 64}, num_warps=4),
             triton.Config({"BLOCK_M": 64}, num_warps=8),
         ],
@@ -59,13 +58,13 @@ if triton is not None:
     )
     @triton.jit
     def _router_cascade_topk_kernel(
-        Logits, TopIdx, TopW,
+        Logits, TopIdx, TopW, Bias,
         stride_lm, stride_li,
         stride_tim, stride_tik,
         stride_twm, stride_twk,
         B, I,  # noqa: E741
         NLEAF: tl.constexpr, DEPTH: tl.constexpr, TOPK: tl.constexpr,
-        MAXW: tl.constexpr, BLOCK_M: tl.constexpr,
+        MAXW: tl.constexpr, BLOCK_M: tl.constexpr, HAS_BIAS: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -103,7 +102,11 @@ if triton is not None:
         s = tl.sum(tl.where(valid, cur, 0.0), axis=1)
         s = tl.maximum(s, 1e-8)
         leaf = cur / s[:, None]
-        work = tl.where(valid & mask_m[:, None], leaf, -1.0)
+        if HAS_BIAS:
+            b_val = tl.load(Bias + col, mask=col < NLEAF, other=0.0)[None, :]
+            work = tl.where(valid & mask_m[:, None], leaf + b_val, -1.0)
+        else:
+            work = tl.where(valid & mask_m[:, None], leaf, -1.0)
         sel_idx = tl.zeros((BLOCK_M, TOPK), dtype=tl.int32)
         sel_val = tl.full((BLOCK_M, TOPK), -1.0, dtype=tl.float32)
         for t in tl.static_range(TOPK):
@@ -114,7 +117,8 @@ if triton is not None:
             bi = tl.min(masked_order, axis=1).to(tl.int32)
             bi_valid = bi < MAXW
             sel_idx = tl.where((tl.arange(0, TOPK)[None, :] == t) & mask_m[:, None] & bi_valid[:, None], bi[:, None], sel_idx)
-            sel_val = tl.where((tl.arange(0, TOPK)[None, :] == t) & mask_m[:, None] & bi_valid[:, None], best[:, None], sel_val)
+            leaf_best = tl.sum(tl.where(order == bi[:, None], leaf, 0.0), axis=1)
+            sel_val = tl.where((tl.arange(0, TOPK)[None, :] == t) & mask_m[:, None] & bi_valid[:, None], leaf_best[:, None], sel_val)
             work = tl.where((tl.arange(0, MAXW)[None, :] == bi[:, None]) & bi_valid[:, None], -1.0, work)
         wsum = tl.sum(sel_val, axis=1)
         wsum = tl.maximum(wsum, 1e-8)
@@ -131,7 +135,7 @@ def _grid(m, bm=64):
     return ((m + bm - 1) // bm,)
 
 
-def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):  # noqa: E741
+def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None, expert_bias=None):  # noqa: E741
     B, I = node_logits.shape  # noqa: E741
     assert node_logits.shape[1] == (1 << tree_depth) - 1, f"logits width {node_logits.shape[1]} != (1<<DEPTH)-1 {(1<<tree_depth)-1}"
     if num_leaves is None:
@@ -162,24 +166,32 @@ def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):  # 
             leaf = cur[:, valid]
             s = leaf.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             routing_probs = leaf / s
-            top_w, top_idx = torch.topk(routing_probs, k=top_k, dim=-1)
+            if expert_bias is not None:
+                biased_scores = routing_probs + expert_bias.to(routing_probs.device).float().unsqueeze(0)
+                top_idx = torch.topk(biased_scores, k=top_k, dim=-1)[1]
+                top_w = routing_probs.gather(-1, top_idx)
+            else:
+                top_w, top_idx = torch.topk(routing_probs, k=top_k, dim=-1)
             top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             return top_idx.to(torch.int64), top_w.to(torch.float32)
     top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int64)
     top_w = torch.empty((B, top_k), device=node_logits.device, dtype=torch.float32)
     grid = lambda META: (triton.cdiv(B, META["BLOCK_M"]),)  # noqa: E731
+    has_bias = expert_bias is not None
+    bias_tensor = expert_bias.contiguous().float() if has_bias else node_logits
     _router_cascade_topk_kernel[grid](
-        node_logits, top_idx, top_w,
+        node_logits, top_idx, top_w, bias_tensor,
         node_logits.stride(0), node_logits.stride(1),
         top_idx.stride(0), top_idx.stride(1),
         top_w.stride(0), top_w.stride(1),
-        B, I, num_leaves, tree_depth, top_k, 1 << tree_depth)
+        B, I, num_leaves, tree_depth, top_k, 1 << tree_depth,
+        HAS_BIAS=has_bias)
     return top_idx, top_w
 
 
 class TritonRouterTopkFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves):
+    def forward(ctx, x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves, expert_bias=None):
         from affine_ai.core.ast_dag import _eval_static, ternarize
         top_k = min(top_k, num_leaves)
         with torch.no_grad():
@@ -187,7 +199,7 @@ class TritonRouterTopkFunction(torch.autograd.Function):
                 ("router-W", 0.7), [hyperplanes],
                 lambda: ternarize(hyperplanes).float())
             node_logits = torch.nn.functional.linear(x_flat.float(), W_route_f, biases.float())
-            top_idx, top_w = triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves)
+            top_idx, top_w = triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves, expert_bias=expert_bias)
         ctx.save_for_backward(x_flat, hyperplanes, biases, top_idx)
         ctx.tree_depth = tree_depth
         ctx.top_k = top_k
@@ -197,7 +209,7 @@ class TritonRouterTopkFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_idx, grad_w):
         if grad_w is None or not (ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]):
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         x_flat, hyperplanes, biases, fwd_top_idx = ctx.saved_tensors
         from affine_ai.core.ast_dag import ternarize
         W_route = ternarize(hyperplanes)
@@ -286,9 +298,9 @@ class TritonRouterTopkFunction(torch.autograd.Function):
         grad_h = (grad_logits.t() @ xr_flat.float()).to(hyperplanes.dtype) if ctx.needs_input_grad[1] else None
         grad_b = grad_logits.sum(0).to(biases.dtype) if ctx.needs_input_grad[2] else None
 
-        return grad_x, grad_h, grad_b, None, None, None
+        return grad_x, grad_h, grad_b, None, None, None, None
 
 
-def triton_router_topk(x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves):
+def triton_router_topk(x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves, expert_bias=None):
     top_k = min(top_k, num_leaves)
-    return TritonRouterTopkFunction.apply(x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves)
+    return TritonRouterTopkFunction.apply(x_flat, hyperplanes, biases, tree_depth, top_k, num_leaves, expert_bias)

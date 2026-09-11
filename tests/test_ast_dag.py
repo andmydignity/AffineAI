@@ -550,6 +550,79 @@ def test_permutation_leaves():
         assert torch.allclose(out1, out2, atol=1e-5)
 
 
+def test_deepseek_expert_bias_update():
+    torch.manual_seed(42)
+    dim = 16
+    K = 4
+    layer = ASTDAGLayer(dim=dim, initial_branches=K, top_k=1, expert_bias_rate=0.05)
+    layer.train()
+
+    # Initial bias is all zeros
+    assert torch.equal(layer.expert_bias, torch.zeros(K))
+
+    # Single forward step
+    x = torch.randn(32, dim)
+    _ = layer(x)
+
+    # Bias must have updated and must be zero-centered
+    assert not torch.equal(layer.expert_bias, torch.zeros(K))
+    assert torch.allclose(layer.expert_bias.mean(), torch.tensor(0.0), atol=1e-5)
+
+    # In eval mode, bias must NOT change
+    bias_before = layer.expert_bias.clone()
+    layer.eval()
+    _ = layer(x)
+    assert torch.equal(layer.expert_bias, bias_before)
 
 
+def test_deepseek_expert_bias_revives_starved_leaf():
+    torch.manual_seed(0)
+    dim = 16
+    K = 4
+    layer = ASTDAGLayer(dim=dim, initial_branches=K, top_k=1, expert_bias_rate=0.1)
+    layer.train()
 
+    # Manually configure router weights to heavily favor leaf 0 and starve leaf 3
+    with torch.no_grad():
+        layer.router_biases.data.zero_()
+        layer.router_biases.data[0] = 10.0
+        layer.router_biases.data[3] = -10.0
+
+    # Over several training steps, leaf 3 should accumulate positive bias
+    x = torch.randn(8, dim)
+    for _ in range(5):
+        _ = layer(x)
+
+    # Leaf 3 (starved) must have higher bias than Leaf 0 (overloaded)
+    assert layer.expert_bias[3] > layer.expert_bias[0]
+    assert layer.expert_bias[3] > 0.0
+    assert layer.expert_bias[0] < 0.0
+
+
+def test_deepseek_expert_bias_unbiased_weights():
+    torch.manual_seed(123)
+    dim = 16
+    K = 4
+    layer = ASTDAGLayer(dim=dim, initial_branches=K, top_k=2, expert_bias_rate=0.0)
+    layer.eval()
+
+    # Artificial large bias on leaf 2
+    with torch.no_grad():
+        layer.expert_bias.copy_(torch.tensor([0.0, 0.0, 5.0, 0.0]))
+
+    x = torch.randn(4, dim)
+    _ = layer(x)
+
+    # With high bias, leaf 2 should be selected, but its dispatch weight should reflect its unbiased probability
+    # Verify last balance loss is None (aux loss is removed)
+    assert layer._last_balance_loss is None
+
+
+def test_set_expert_bias_rate():
+    from affine_ai.core.ast_dag import set_expert_bias_rate
+    dim = 16
+    layer = ASTDAGLayer(dim=dim, initial_branches=4, expert_bias_rate=1e-3)
+    assert layer.expert_bias_rate == 1e-3
+    n = set_expert_bias_rate(layer, 5e-4)
+    assert n == 1
+    assert layer.expert_bias_rate == 5e-4

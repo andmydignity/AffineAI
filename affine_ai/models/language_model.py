@@ -46,7 +46,7 @@ class ASDAGBlock(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.channel_mixer_type = channel_mixer_type if channel_mixer_type is not None else getattr(config, 'channel_mixer_type', 'ternary_swiglu')
+        self.channel_mixer_type = channel_mixer_type if channel_mixer_type is not None else getattr(config, 'channel_mixer_type', 'asdag_tree')
         self.norm1 = RMSNorm(config.dim)
         self.time_mixer = NativeASDAGAssociativeMixer(
             d_model=config.dim,
@@ -301,7 +301,7 @@ class ASDAGLanguageModel(nn.Module):
         top_k: int = 2,
         leaf_mode: str = "permutation",
         num_permutations: int = 4,
-        channel_mixer_type: str = "ternary_swiglu",
+        channel_mixer_type: str = "asdag_tree",
         use_fp8: bool = False,
         dtype: Any = torch.bfloat16,
         tie_weights: bool = True,

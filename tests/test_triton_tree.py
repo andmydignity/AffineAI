@@ -139,3 +139,58 @@ def test_triton_tree_perm_backward_parity(B, D, K, P, Tk):
     assert torch.allclose(bias.grad, b_ref.grad, atol=1e-4), f"bias.grad mismatch: {(bias.grad - b_ref.grad).abs().max()}"
     assert torch.allclose(top_w.grad, tw_ref.grad, atol=1e-4), f"top_w.grad mismatch: {(top_w.grad - tw_ref.grad).abs().max()}"
 
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TREE_TRITON, reason="CUDA and Triton required")
+def test_triton_tree_perm_sentinel_missing_edge():
+    """Verify missing edge sentinel -1 is NOT sorted to index 0 during backward (Issue 13)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    B, D, K, P, Tk = 8, 32, 4, 2, 2
+    r_in = torch.randn(B, D, device=device, requires_grad=True)
+    w_perm = torch.randn(K, P, D, device=device, requires_grad=True)
+    bias = torch.randn(K, D, device=device, requires_grad=True)
+    perms = torch.stack([
+        torch.stack([torch.randperm(D, device=device) for _ in range(P)])
+        for _ in range(K)
+    ]).to(torch.int32)
+    # Set several edges to -1 (missing edges)
+    perms[0, 0, 5] = -1
+    perms[1, 1, 10] = -1
+    perms[2, 0, 0] = -1
+
+    top_idx = torch.randint(0, K, (B, Tk), device=device, dtype=torch.int32)
+    top_w = torch.rand(B, Tk, device=device)
+    top_w = (top_w / top_w.sum(dim=-1, keepdim=True)).detach().requires_grad_(True)
+
+    out = triton_tree_perm(r_in, w_perm, bias, perms, top_idx, top_w)
+    out.sum().backward()
+
+    assert r_in.grad is not None
+    assert not torch.isnan(r_in.grad).any()
+    assert w_perm.grad is not None
+    assert not torch.isnan(w_perm.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TREE_TRITON, reason="CUDA and Triton required")
+def test_triton_tree_perm_fp16():
+    """Verify FP16 execution without crashing or unconditional float cast (Issue 17)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    B, D, K, P, Tk = 8, 32, 4, 2, 2
+    r_in = torch.randn(B, D, device=device, dtype=torch.float16, requires_grad=True)
+    w_perm = torch.randn(K, P, D, device=device, dtype=torch.float16, requires_grad=True)
+    bias = torch.randn(K, D, device=device, dtype=torch.float16, requires_grad=True)
+    perms = torch.stack([
+        torch.stack([torch.randperm(D, device=device) for _ in range(P)])
+        for _ in range(K)
+    ]).to(torch.int32)
+    top_idx = torch.randint(0, K, (B, Tk), device=device, dtype=torch.int32)
+    top_w = torch.rand(B, Tk, device=device, dtype=torch.float16)
+    top_w = (top_w / top_w.sum(dim=-1, keepdim=True)).detach().requires_grad_(True)
+
+    out = triton_tree_perm(r_in, w_perm, bias, perms, top_idx, top_w)
+    assert out.dtype == torch.float16
+    out.sum().backward()
+    assert r_in.grad is not None
+    assert r_in.grad.dtype == torch.float16
+

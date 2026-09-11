@@ -118,3 +118,49 @@ def test_triton_fused_monarch_chain():
     assert x.grad is not None
     assert diagonals.grad is not None
     assert bias.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_gla_linear_attention_dtype_parity():
+    """Verify triton_gla_linear_attention consistently returns q.dtype (Issue 10)."""
+    from affine_ai.kernels.triton_gla import triton_gla_linear_attention
+    torch.manual_seed(42)
+    B, H, T, D = 2, 2, 16, 32
+    for q_dtype in [torch.float16, torch.float32]:
+        q = torch.randn(B, H, T, D, device="cuda", dtype=q_dtype)
+        k = torch.randn(B, H, T, D, device="cuda", dtype=q_dtype)
+        v = torch.randn(B, H, T, D, device="cuda", dtype=q_dtype)
+        # Gamma has float32 dtype
+        gamma = torch.sigmoid(torch.randn(B, H, T, device="cuda", dtype=torch.float32))
+
+        out = triton_gla_linear_attention(q, k, v, gamma, chunk_size=64)
+        assert out.dtype == q_dtype, f"Expected {q_dtype} but got {out.dtype}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_gla_decay_large_bh_split():
+    """Verify B*H > 65535 avoids Grid-Z overflow via batch splitting (Issue 9)."""
+    from affine_ai.kernels.triton_gla import triton_gla_decay_fwd
+    torch.manual_seed(42)
+    # Total B*H = 1024 * 65 = 66560 > 65535
+    B, H, T = 1024, 65, 4
+    cum = torch.randn(B, H, T, device="cuda", dtype=torch.float16)
+    out = triton_gla_decay_fwd(cum, clamp_min=-11.0)
+    assert out.shape == (B, H, T, T)
+    assert out.dtype == torch.float16
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_gla_decay_backward_clamped_subgradient():
+    """Verify clamped/saturated entries have 0 gradient in backward (Issue 8)."""
+    from affine_ai.kernels.triton_gla import triton_gla_decay
+    torch.manual_seed(42)
+    B, H, T = 1, 1, 4
+    # With large negative differences that saturate clamp_min, subgradient is zeroed
+    gamma = torch.tensor([[[0.000001, 0.000001, 0.000001, 0.000001]]], device="cuda", dtype=torch.float32, requires_grad=True)
+    out = triton_gla_decay(gamma)
+    out.sum().backward()
+    assert gamma.grad is not None
+    # Clamped at min=1e-5 should have zero subgradient
+    assert (gamma.grad == 0.0).all()

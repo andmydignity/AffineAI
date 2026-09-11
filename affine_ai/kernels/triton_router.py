@@ -24,12 +24,12 @@ except Exception:  # CPU-only
 _TURING_CACHE: Optional[bool] = None
 
 
-def _is_turing() -> bool:
+def _is_turing(device=None) -> bool:
     global _TURING_CACHE
     if _TURING_CACHE is not None:
         return _TURING_CACHE
     try:
-        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+        from affine_ai.kernels import _IS_TURING as _T
 
         _TURING_CACHE = bool(_T)
         return _TURING_CACHE
@@ -37,7 +37,8 @@ def _is_turing() -> bool:
         pass
     try:
         if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability()
+            dev = device if device is not None else torch.cuda.current_device()
+            cap = torch.cuda.get_device_capability(dev)
             _TURING_CACHE = (7, 5) <= tuple(cap) < (8, 0)
             return _TURING_CACHE
     except Exception:
@@ -60,41 +61,44 @@ if triton is not None:
     def _router_cascade_topk_kernel(
         Logits, TopIdx, TopW,
         stride_lm, stride_li,
+        stride_tim, stride_tik,
+        stride_twm, stride_twk,
         B, I,  # noqa: E741
         NLEAF: tl.constexpr, DEPTH: tl.constexpr, TOPK: tl.constexpr,
         MAXW: tl.constexpr, BLOCK_M: tl.constexpr,
     ):
-        tl.device_assert(DEPTH <= 6, "DEPTH >6 would blow registers (MAXW=1<<DEPTH)")
-        if DEPTH > 6:
-            return
         pid_m = tl.program_id(0)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < B
 
-        col = tl.arange(0, MAXW)
         z0 = tl.load(Logits + offs_m * stride_lm, mask=mask_m, other=0.0)
         pr0 = tl.sigmoid(tl.clamp(2.0 * z0, -30.0, 30.0))
-        cur = tl.where(col[None, :] == 0, 1.0 - pr0[:, None], 0.0)
-        cur = tl.where(col[None, :] == 1, pr0[:, None], cur)
-        cur_n = 2
-        for d in tl.static_range(6):
-            if d >= 1 and d < DEPTH:
-                start_node = (1 << d) - 1
-                nxt = tl.zeros((BLOCK_M, MAXW), dtype=tl.float32)
-                for j in tl.static_range(64):
-                    if j < (1 << d):
-                        node = start_node + j
-                        tl.device_assert(node < I, "node OOB")
-                        logit = tl.load(
-                            Logits + offs_m * stride_lm + node * stride_li,
-                            mask=mask_m & (node < I), other=0.0,
-                        )
-                        sr = tl.where(node < I, tl.sigmoid(tl.clamp(2.0 * logit, -30.0, 30.0)), 0.0)
-                        pv = tl.sum(tl.where(col[None, :] == j, cur, 0.0), axis=1)
-                        nxt = tl.where(col[None, :] == 2 * j, (pv * (1.0 - sr))[:, None], nxt)
-                        nxt = tl.where(col[None, :] == 2 * j + 1, (pv * sr)[:, None], nxt)
-                cur = nxt
-                cur_n = cur_n * 2
+        p0 = 1.0 - pr0
+        p1 = pr0
+        cur = tl.reshape(tl.join(p0, p1), (BLOCK_M, 2))
+
+        if DEPTH > 1:
+            l1 = tl.load(Logits + offs_m[:, None] * stride_lm + (1 + tl.arange(0, 2))[None, :] * stride_li, mask=mask_m[:, None], other=0.0)
+            sr1 = tl.sigmoid(tl.clamp(2.0 * l1, -30.0, 30.0))
+            cur = tl.reshape(tl.join(cur * (1.0 - sr1), cur * sr1), (BLOCK_M, 4))
+        if DEPTH > 2:
+            l2 = tl.load(Logits + offs_m[:, None] * stride_lm + (3 + tl.arange(0, 4))[None, :] * stride_li, mask=mask_m[:, None], other=0.0)
+            sr2 = tl.sigmoid(tl.clamp(2.0 * l2, -30.0, 30.0))
+            cur = tl.reshape(tl.join(cur * (1.0 - sr2), cur * sr2), (BLOCK_M, 8))
+        if DEPTH > 3:
+            l3 = tl.load(Logits + offs_m[:, None] * stride_lm + (7 + tl.arange(0, 8))[None, :] * stride_li, mask=mask_m[:, None], other=0.0)
+            sr3 = tl.sigmoid(tl.clamp(2.0 * l3, -30.0, 30.0))
+            cur = tl.reshape(tl.join(cur * (1.0 - sr3), cur * sr3), (BLOCK_M, 16))
+        if DEPTH > 4:
+            l4 = tl.load(Logits + offs_m[:, None] * stride_lm + (15 + tl.arange(0, 16))[None, :] * stride_li, mask=mask_m[:, None], other=0.0)
+            sr4 = tl.sigmoid(tl.clamp(2.0 * l4, -30.0, 30.0))
+            cur = tl.reshape(tl.join(cur * (1.0 - sr4), cur * sr4), (BLOCK_M, 32))
+        if DEPTH > 5:
+            l5 = tl.load(Logits + offs_m[:, None] * stride_lm + (31 + tl.arange(0, 32))[None, :] * stride_li, mask=mask_m[:, None], other=0.0)
+            sr5 = tl.sigmoid(tl.clamp(2.0 * l5, -30.0, 30.0))
+            cur = tl.reshape(tl.join(cur * (1.0 - sr5), cur * sr5), (BLOCK_M, 64))
+
+        col = tl.arange(0, MAXW)
         valid = col[None, :] < NLEAF
         s = tl.sum(tl.where(valid, cur, 0.0), axis=1)
         s = tl.maximum(s, 1e-8)
@@ -115,9 +119,9 @@ if triton is not None:
         wsum = tl.sum(sel_val, axis=1)
         wsum = tl.maximum(wsum, 1e-8)
         sel_val = sel_val / wsum[:, None]
-        tl.store(TopIdx + offs_m[:, None] * TOPK + tl.arange(0, TOPK)[None, :],
+        tl.store(TopIdx + offs_m[:, None] * stride_tim + tl.arange(0, TOPK)[None, :] * stride_tik,
                  sel_idx.to(tl.int64), mask=mask_m[:, None])
-        tl.store(TopW + offs_m[:, None] * TOPK + tl.arange(0, TOPK)[None, :],
+        tl.store(TopW + offs_m[:, None] * stride_twm + tl.arange(0, TOPK)[None, :] * stride_twk,
                  sel_val, mask=mask_m[:, None])
 else:
     _router_cascade_topk_kernel = None  # type: ignore
@@ -141,45 +145,34 @@ def triton_router_topk_fwd(node_logits, tree_depth, top_k, num_leaves=None):  # 
         with torch.no_grad():
             cur = torch.zeros(B, 1 << tree_depth, device=node_logits.device, dtype=torch.float32)
             z0 = node_logits[:, 0]
-            pr0 = torch.sigmoid(torch.clamp(z0 * 2.0, -30, 30))
+            pr0 = torch.sigmoid(torch.clamp(z0 * 2.0, -30.0, 30.0))
             cur[:, 0] = 1.0 - pr0
             cur[:, 1] = pr0
-            cur_n = 2
             for d in range(1, tree_depth):
                 start_node = (1 << d) - 1
                 nxt = torch.zeros_like(cur)
-                for j in range(1 << d):
-                    node = start_node + j
-                    logit = node_logits[:, node]
-                    sr = torch.sigmoid(torch.clamp(logit * 2.0, -30, 30))
-                    pv = cur[:, j]
-                    nxt[:, 2 * j] = pv * (1.0 - sr)
-                    nxt[:, 2 * j + 1] = pv * sr
+                num_parents = 1 << d
+                logits_d = node_logits[:, start_node:start_node + num_parents]
+                sr = torch.sigmoid(torch.clamp(logits_d * 2.0, -30.0, 30.0))
+                pv = cur[:, :num_parents]
+                nxt[:, 0:2 * num_parents:2] = pv * (1.0 - sr)
+                nxt[:, 1:2 * num_parents:2] = pv * sr
                 cur = nxt
-                cur_n *= 2
             valid = torch.arange(1 << tree_depth, device=node_logits.device) < num_leaves
-            s = cur[:, valid].sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            leaf = cur[:, valid] / s
-            top_idx = torch.empty(B, top_k, device=node_logits.device, dtype=torch.int64)
-            top_w = torch.empty(B, top_k, device=node_logits.device, dtype=torch.float32)
-            for b in range(B):
-                work = leaf[b].clone()
-                for t in range(top_k):
-                    maxv = work.max()
-                    candidates = (work == maxv).nonzero(as_tuple=False).flatten()
-                    bi = int(candidates.min().item()) if len(candidates) > 0 else 0
-                    top_idx[b, t] = bi
-                    top_w[b, t] = maxv
-                    work[bi] = -1.0
-                wsum = top_w[b].sum().clamp(min=1e-8)
-                top_w[b] /= wsum
-            return top_idx, top_w
+            leaf = cur[:, valid]
+            s = leaf.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            routing_probs = leaf / s
+            top_w, top_idx = torch.topk(routing_probs, k=top_k, dim=-1)
+            top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            return top_idx.to(torch.int64), top_w.to(torch.float32)
     top_idx = torch.empty((B, top_k), device=node_logits.device, dtype=torch.int64)
     top_w = torch.empty((B, top_k), device=node_logits.device, dtype=torch.float32)
     grid = lambda META: (triton.cdiv(B, META["BLOCK_M"]),)  # noqa: E731
     _router_cascade_topk_kernel[grid](
         node_logits, top_idx, top_w,
         node_logits.stride(0), node_logits.stride(1),
+        top_idx.stride(0), top_idx.stride(1),
+        top_w.stride(0), top_w.stride(1),
         B, I, num_leaves, tree_depth, top_k, 1 << tree_depth)
     return top_idx, top_w
 

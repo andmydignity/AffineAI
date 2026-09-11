@@ -70,3 +70,51 @@ def test_fused_perm_proj_module_cuda():
         assert o.shape == (B, T, D)
     sum(outs).sum().backward()
     assert mod_fused.latent_w.grad is not None
+
+
+def test_fused_perm_proj_split_k():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    torch.manual_seed(42)
+    N, D, M, P = 512, 64, 4, 4
+    x = torch.randn(N, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    perms = torch.stack([torch.randperm(D, device="cuda", dtype=torch.long) for _ in range(P)])
+    inv_perms = torch.empty_like(perms)
+    for p in range(P):
+        inv_perms[p, perms[p]] = torch.arange(D, device="cuda")
+    w = torch.randn(M, P, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    biases = torch.randn(M, D, device="cuda", dtype=torch.float32, requires_grad=True)
+
+    # Reference
+    x_g = torch.gather(x.unsqueeze(1).expand(-1, P, -1), dim=-1, index=perms.unsqueeze(0).expand(N, -1, -1))
+    out_ref = (x_g.unsqueeze(0) * w.unsqueeze(1)).sum(dim=2) + biases.unsqueeze(1)
+    loss_ref = (out_ref * 0.5).sum()
+    loss_ref.backward()
+
+    # Triton
+    x_tri = x.detach().clone().requires_grad_(True)
+    w_tri = w.detach().clone().requires_grad_(True)
+    biases_tri = biases.detach().clone().requires_grad_(True)
+
+    out_tri = triton_fused_perm_proj(x_tri, w_tri, perms, inv_perms, biases_tri)
+    loss_tri = (out_tri * 0.5).sum()
+    loss_tri.backward()
+
+    assert (out_ref - out_tri).abs().max().item() < 1e-4
+    assert (x.grad - x_tri.grad).abs().max().item() < 1e-4
+    assert (w.grad - w_tri.grad).abs().max().item() < 1e-4
+
+
+def test_fused_perm_proj_oob():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    D, M, P = 64, 2, 2
+    x = torch.randn(16, D, device="cuda")
+    w = torch.randn(M, P, D, device="cuda")
+    bad_perms = torch.full((P, D), D + 1, device="cuda", dtype=torch.long)
+    inv_perms = torch.arange(D, device="cuda").expand(P, -1).contiguous()
+
+    with pytest.raises(ValueError):
+        triton_fused_perm_proj(x, w, bad_perms, inv_perms)

@@ -13,13 +13,8 @@ import triton
 import triton.language as tl
 
 
-def _is_turing() -> bool:
-    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16.
-
-    Prefer canonical ``affine_ai.kernels._IS_TURING`` when available to avoid
-    redundant ``get_device_capability`` calls; fall back to direct
-    capability probe ``(7,5) <= cap < (8,0)``.
-    """
+def _is_turing(device=None) -> bool:
+    """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
     try:
         from affine_ai.kernels import _IS_TURING as _T  # type: ignore
 
@@ -28,7 +23,8 @@ def _is_turing() -> bool:
         pass
     try:
         if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability()
+            dev = device if device is not None else torch.cuda.current_device()
+            cap = torch.cuda.get_device_capability(dev)
             return (7, 5) <= tuple(cap) < (8, 0)
     except Exception:
         pass
@@ -55,7 +51,6 @@ _GLA_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK": 32, "BLOCK_J": 32}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK": 64, "BLOCK_J": 32}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK": 64, "BLOCK_J": 64}, num_warps=8, num_stages=3),
@@ -97,7 +92,7 @@ def _gla_decay_kernel(
     offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
     mask_i = offs_i < T
     mask_j = offs_j < T
-    if tile_j > tile_i:
+    if (tile_j * BLOCK_J) >= ((tile_i + 1) * BLOCK):
         val = tl.zeros((BLOCK, BLOCK_J), dtype=tl.float32)
         out_block_ptr = tl.make_block_ptr(
             base=Decay + b * stride_db + h * stride_dh,
@@ -107,7 +102,7 @@ def _gla_decay_kernel(
             block_shape=(BLOCK, BLOCK_J),
             order=(1, 0),
         )
-        tl.store(out_block_ptr, val, boundary_check=(0, 1))
+        tl.store(out_block_ptr, val.to(Decay.dtype.element_ty), boundary_check=(0, 1))
         return
     cum_block_ptr_i = tl.make_block_ptr(
         base=Cum + b * stride_cb + h * stride_ch,
@@ -142,7 +137,7 @@ def _gla_decay_kernel(
         block_shape=(BLOCK, BLOCK_J),
         order=(1, 0),
     )
-    tl.store(out_block_ptr, val, boundary_check=(0, 1))
+    tl.store(out_block_ptr, val.to(Decay.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -160,13 +155,15 @@ def _gla_decay_kernel_raw(
     total = B.to(tl.int64) * H.to(tl.int64) * T.to(tl.int64) * T.to(tl.int64)
     offs_i64 = offs.to(tl.int64)
     mask = offs_i64 < total
-    tmp = offs_i64
-    tj = (tmp % T.to(tl.int64)).to(tl.int32)
-    tmp = tmp // T.to(tl.int64)
-    ti = (tmp % T.to(tl.int64)).to(tl.int32)
-    tmp = tmp // T.to(tl.int64)
-    th = (tmp % H.to(tl.int64)).to(tl.int32)
-    tb = (tmp // H.to(tl.int64)).to(tl.int32)
+    T_i32 = T.to(tl.int32)
+    H_i32 = H.to(tl.int32)
+    offs_i32 = offs.to(tl.int32)
+    tj = offs_i32 % T_i32
+    tmp = offs_i32 // T_i32
+    ti = tmp % T_i32
+    tmp = tmp // T_i32
+    th = tmp % H_i32
+    tb = tmp // H_i32
     ci = tl.load(Cum + tb * stride_cb + th * stride_ch + ti * stride_ct, mask=mask, other=0.0)
     cj = tl.load(Cum + tb * stride_cb + th * stride_ch + tj * stride_ct, mask=mask, other=0.0)
     diff = ci - cj
@@ -176,7 +173,7 @@ def _gla_decay_kernel_raw(
     val = tl.exp(diff)
     val = tl.where(m & mask, val, 0.0)
     out_ptr = Decay + tb * stride_db + th * stride_dh + ti * stride_di + tj * stride_dj
-    tl.store(out_ptr, val, mask=mask)
+    tl.store(out_ptr, val.to(Decay.dtype.element_ty), mask=mask)
 
 _gla_decay_kernel_tuned = _gla_decay_kernel
 
@@ -197,7 +194,7 @@ class _GlaKernelDispatcher:
 _gla_decay_kernel = _GlaKernelDispatcher()
 
 
-def triton_gla_decay_fwd(cum_log_gam: torch.Tensor, clamp_min: float = -30.0) -> torch.Tensor:
+def triton_gla_decay_fwd(cum_log_gam: torch.Tensor, clamp_min: float = -30.0, out_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """
     Materializes dense decay matrix [B, H, T, T] (O(T^2) memory).
     Use only at short T (e.g. T <= 512); for long T use the chunked
@@ -209,63 +206,91 @@ def triton_gla_decay_fwd(cum_log_gam: torch.Tensor, clamp_min: float = -30.0) ->
     B, H, T = cum_log_gam.shape
     if T > 1024:
         raise ValueError(f"T={T} exceeds 1024 limit for dense [B,H,T,T] ({B*H*T*T} floats); use chunked path")
-    if B * H > 65535 and (T + 32 - 1) // 32 > 1:
-        warnings.warn(f"B*H={B*H} exceeds 65535 z-grid limit with current T; grid z-dimension will be split", stacklevel=2)
     assert cum_log_gam.dtype in (torch.float32, torch.float16, torch.bfloat16)
     assert T > 0 and B > 0 and H > 0
-    out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=torch.float32)
-    grid = lambda META: ((T + META["BLOCK"] - 1) // META["BLOCK"], (T + META["BLOCK_J"] - 1) // META["BLOCK_J"], B * H)
-    _gla_decay_kernel[grid](
-        cum_log_gam, out,
-        cum_log_gam.stride(0), cum_log_gam.stride(1), cum_log_gam.stride(2),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        B, H, T, CLAMP_MIN=clamp_min)
+    dtype = out_dtype if out_dtype is not None else cum_log_gam.dtype
+    out = torch.empty((B, H, T, T), device=cum_log_gam.device, dtype=dtype)
+    max_z = 65535
+    if B * H <= max_z:
+        grid = lambda META: ((T + META["BLOCK"] - 1) // META["BLOCK"], (T + META["BLOCK_J"] - 1) // META["BLOCK_J"], B * H)
+        _gla_decay_kernel[grid](
+            cum_log_gam, out,
+            cum_log_gam.stride(0), cum_log_gam.stride(1), cum_log_gam.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            B, H, T, CLAMP_MIN=clamp_min)
+    else:
+        if H <= max_z:
+            b_chunk = max(1, max_z // H)
+            for b_start in range(0, B, b_chunk):
+                b_curr = min(b_chunk, B - b_start)
+                c_sub = cum_log_gam[b_start : b_start + b_curr]
+                o_sub = out[b_start : b_start + b_curr]
+                grid = lambda META, b_curr=b_curr: ((T + META["BLOCK"] - 1) // META["BLOCK"], (T + META["BLOCK_J"] - 1) // META["BLOCK_J"], b_curr * H)
+                _gla_decay_kernel[grid](
+                    c_sub, o_sub,
+                    c_sub.stride(0), c_sub.stride(1), c_sub.stride(2),
+                    o_sub.stride(0), o_sub.stride(1), o_sub.stride(2), o_sub.stride(3),
+                    b_curr, H, T, CLAMP_MIN=clamp_min)
+        else:
+            cum_contig = cum_log_gam.contiguous().view(-1, 1, T)
+            out_contig = out.view(-1, 1, T, T)
+            total_bh = B * H
+            for bh_start in range(0, total_bh, max_z):
+                bh_curr = min(max_z, total_bh - bh_start)
+                c_sub = cum_contig[bh_start : bh_start + bh_curr]
+                o_sub = out_contig[bh_start : bh_start + bh_curr]
+                grid = lambda META, bh_curr=bh_curr: ((T + META["BLOCK"] - 1) // META["BLOCK"], (T + META["BLOCK_J"] - 1) // META["BLOCK_J"], bh_curr)
+                _gla_decay_kernel[grid](
+                    c_sub, o_sub,
+                    c_sub.stride(0), c_sub.stride(1), c_sub.stride(2),
+                    o_sub.stride(0), o_sub.stride(1), o_sub.stride(2), o_sub.stride(3),
+                    bh_curr, 1, T, CLAMP_MIN=clamp_min)
     return out
 
 
 class TritonGLADecayFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gamma: torch.Tensor) -> torch.Tensor:
-        # Clamp max=1.0 on gamma to prevent positive log growth in BF16 (Issue 15)
-        # Clamp min=1e-5 to prevent log underflow (Issue 16)
-        # Accumulation precision: cum computed in float32, final out downcast to gamma.dtype (bf16/fp16) — fp32 compute then to(dtype)
-        # Turing sm_75: bf16 fallback to fp16 (acc fp32), warn once.
-        if _is_turing() and gamma.dtype == torch.bfloat16:
+        orig_dtype = gamma.dtype
+        if _is_turing(gamma.device) and gamma.dtype == torch.bfloat16:
             warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in TritonGLADecayFunction", stacklevel=3)
-        log_gam = torch.log(gamma.float().clamp(min=1e-5, max=1.0))
-        cum = torch.cumsum(log_gam, dim=-1)  # float32 cumsum; bf16/fp16 would lose precision
-        # dtype-dependent underflow clamp: fp16 subnormal floor ~ -11, fp32/bf16 ~ -30
-        # Turing bf16 is treated as fp16 (clamp -11, fp32 acc).
-        if _is_turing() and gamma.dtype == torch.bfloat16:
+            gamma_input = gamma.half()
+        else:
+            gamma_input = gamma
+        log_gam = torch.log(gamma_input.float().clamp(min=1e-5, max=1.0))
+        cum = torch.cumsum(log_gam, dim=-1)
+        if _is_turing(gamma.device) and gamma.dtype == torch.bfloat16:
             clamp_min = -11.0
         else:
-            clamp_min = -11.0 if gamma.dtype == torch.float16 else -30.0
-        assert gamma.ndim == 3, f"gamma must be [B,H,T], got {gamma.shape}"
-        if gamma.is_cuda and torch.cuda.is_available():
-            out = triton_gla_decay_fwd(cum.contiguous(), clamp_min=clamp_min)
+            clamp_min = -11.0 if gamma_input.dtype == torch.float16 else -30.0
+        assert gamma_input.ndim == 3, f"gamma must be [B,H,T], got {gamma.shape}"
+        if gamma_input.is_cuda and torch.cuda.is_available():
+            out = triton_gla_decay_fwd(cum.contiguous(), clamp_min=clamp_min, out_dtype=gamma_input.dtype)
         else:
             T = cum.shape[-1]
             decay_diff = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).clamp(min=clamp_min, max=0.0)
             mask = torch.tril(torch.ones(T, T, device=cum.device, dtype=torch.bool))
-            out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff))
-        ctx.save_for_backward(gamma, out)
-        # Unified dtype handling: both CUDA and CPU paths return gamma.dtype for parity
-        return out.to(gamma.dtype)
+            out = torch.where(mask, torch.exp(decay_diff), torch.zeros_like(decay_diff)).to(gamma_input.dtype)
+        ctx.save_for_backward(gamma_input, out)
+        ctx.clamp_min = clamp_min
+        if out.dtype != orig_dtype:
+            return out.to(orig_dtype)
+        return out
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         if not ctx.needs_input_grad[0]:
             return None
         gamma, out = ctx.saved_tensors
-        # Explicit analytical backward adjoint (Issue 20)
-        # g_c cumsum stability: O(T) error accumulation in float32; optional float64 for long T
-        M = grad_output.to(out.dtype) * out
-        g_c = M.sum(dim=-1) - M.sum(dim=-2)  # float32 reduction; for T>4k consider float64
-        g_log_gam = g_c.flip(-1).cumsum(-1).flip(-1)  # cumsum error O(T); float64 alternative: g_c.double().flip(-1).cumsum(-1).flip(-1).float()
+        clamp_min = getattr(ctx, "clamp_min", -30.0)
+        clamp_thresh = math.exp(clamp_min) * 1.0001
+        sat_mask = out > clamp_thresh
+        M = torch.where(sat_mask, grad_output * out, torch.zeros_like(out))
+        g_c = M.sum(dim=-1) - M.sum(dim=-2)
+        g_log_gam = g_c.flip(-1).cumsum(-1).flip(-1)
         g_gam = g_log_gam / gamma.float().clamp(min=1e-5)
-        mask = (gamma >= 1e-5) & (gamma <= 1.0)
+        mask = (gamma > 1e-5) & (gamma < 1.0)
         g_gam = torch.where(mask, g_gam, torch.zeros_like(g_gam))
-        # Unified dtype: return gamma.dtype
         return g_gam.to(gamma.dtype)
 
 
@@ -294,7 +319,7 @@ def triton_gla_linear_attention(
     B, H, T, D = q.shape
     dtype = q.dtype
     # Turing sm_75: bf16 -> fp16 fallback, warn
-    if _is_turing() and dtype == torch.bfloat16:
+    if _is_turing(q.device) and dtype == torch.bfloat16:
         warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_gla_linear_attention", stacklevel=2)
         eps = 1e-4
         clamp_min = -11.0
@@ -313,7 +338,7 @@ def triton_gla_linear_attention(
         scores = torch.matmul(q, k.transpose(-1, -2)) * decay_mat
         num = torch.matmul(scores, v)
         den = scores.sum(dim=-1, keepdim=True).clamp(min=eps)
-        return (num / den).to(gamma.dtype)
+        return (num / den).to(dtype)
 
     # Chunked associative scan: delegates to FusedGLAAnalyticalCUDA; peak VRAM B*H*NC*D*D
     pad_len = (chunk_size - (T % chunk_size)) % chunk_size
@@ -339,5 +364,5 @@ def triton_gla_linear_attention(
     out_pad = FusedGLAAnalyticalCUDA.apply(q_pad, k_pad, v_pad, gamma_pad, chunk_size)
     if pad_len > 0:
         # Slice NC correctly: remove padded time steps from output
-        return out_pad[:, :, :T, :].to(gamma.dtype)
-    return out_pad.to(gamma.dtype)
+        return out_pad[:, :, :T, :].to(dtype)
+    return out_pad.to(dtype)

@@ -237,3 +237,71 @@ def test_triton_patch_weighted_pool(dtype, P):
     assert torch.allclose(l_ref.grad, l_tri.grad, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton patch pooling test")
+@pytest.mark.parametrize("T", [7, 35, 100, 125])
+@pytest.mark.parametrize("P", [8, 16])
+def test_triton_patch_mean_pool_ragged(T, P):
+    """Verify triton_patch_mean_pool forward and backward parity on ragged (T % P != 0) sequences."""
+    from affine_ai.kernels.triton_byte_encoder import triton_patch_mean_pool
+
+    torch.manual_seed(42)
+    B, D = 2, 64
+    M = (T + P - 1) // P
+
+    x_ref = torch.randn(B, T, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    x_tri = x_ref.detach().clone().requires_grad_(True)
+
+    pad_len = M * P - T
+    x_padded = F.pad(x_ref, (0, 0, 0, pad_len))
+    counts = torch.full((M,), P, dtype=x_ref.dtype, device=x_ref.device)
+    counts[-1] = T - (M - 1) * P
+    out_ref = x_padded.view(B, M, P, D).sum(dim=2) / counts.view(1, M, 1)
+
+    out_tri = triton_patch_mean_pool(x_tri, P)
+
+    assert out_tri.shape == (B, M, D)
+    assert torch.allclose(out_ref, out_tri, atol=1e-4, rtol=1e-3)
+
+    g = torch.randn_like(out_ref)
+    out_ref.backward(g)
+    out_tri.backward(g)
+
+    assert torch.allclose(x_ref.grad, x_tri.grad, atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton patch pooling test")
+@pytest.mark.parametrize("T", [7, 35, 100, 125])
+@pytest.mark.parametrize("P", [8, 16])
+def test_triton_patch_weighted_pool_ragged(T, P):
+    """Verify triton_patch_weighted_pool forward and backward parity on ragged (T % P != 0) sequences."""
+    from affine_ai.kernels.triton_byte_encoder import triton_patch_weighted_pool
+
+    torch.manual_seed(42)
+    B, D = 2, 64
+    M = (T + P - 1) // P
+
+    x_ref = torch.randn(B, T, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    l_ref = torch.randn(B, T, device="cuda", dtype=torch.float32, requires_grad=True)
+    x_tri = x_ref.detach().clone().requires_grad_(True)
+    l_tri = l_ref.detach().clone().requires_grad_(True)
+
+    pad_len = M * P - T
+    logits_padded = F.pad(l_ref, (0, pad_len), value=-1e9)
+    w_ref = torch.softmax(logits_padded.view(B, M, P).float().clamp(-30, 30), dim=-1)
+    x_padded = F.pad(x_ref, (0, 0, 0, pad_len))
+    out_ref = (x_padded.view(B, M, P, D).float() * w_ref.unsqueeze(-1)).sum(dim=2).to(x_ref.dtype)
+
+    out_tri = triton_patch_weighted_pool(x_tri, l_tri, P)
+
+    assert out_tri.shape == (B, M, D)
+    assert torch.allclose(out_ref, out_tri, atol=1e-4, rtol=1e-3)
+
+    g = torch.randn_like(out_ref)
+    out_ref.backward(g)
+    out_tri.backward(g)
+
+    assert torch.allclose(x_ref.grad, x_tri.grad, atol=1e-4, rtol=1e-3)
+    assert torch.allclose(l_ref.grad, l_tri.grad, atol=1e-4, rtol=1e-3)
+
+
+

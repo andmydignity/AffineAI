@@ -15,17 +15,18 @@ import triton
 import triton.language as tl
 
 
-def _is_turing() -> bool:
+def _is_turing(device=None) -> bool:
     """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
     try:
-        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+        from affine_ai.kernels import _IS_TURING as _T
 
         return bool(_T)
     except Exception:
         pass
     try:
         if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability()
+            dev = device if device is not None else torch.cuda.current_device()
+            cap = torch.cuda.get_device_capability(dev)
             return (7, 5) <= tuple(cap) < (8, 0)
     except Exception:
         pass
@@ -57,7 +58,6 @@ def _fused_asdag_2d_grid_kernel(
     X_ptr,
     W_stack_ptr,
     Bias_stack_ptr,
-    Routing_ptr,
     Context_ptr,
     Peer_ptr,
     Norm_Factors_ptr,
@@ -65,7 +65,6 @@ def _fused_asdag_2d_grid_kernel(
     stride_xb, stride_xd,
     stride_wk, stride_wd1, stride_wd2,
     stride_bk, stride_bd,
-    stride_rb, stride_rk,
     stride_ck, stride_cm, stride_cd,
     stride_pok, stride_pos, stride_pob, stride_pod,
     stride_norm,
@@ -88,75 +87,70 @@ def _fused_asdag_2d_grid_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < B_SZ
     norm_factor = tl.load(Norm_Factors_ptr + pid_k * stride_norm, eviction_policy="evict_first").to(tl.float32)
-    num_d_blocks = (DIM + BLOCK_D - 1) // BLOCK_D
-    for d_out_idx in range(16):
-        if d_out_idx < num_d_blocks:
-            d_out_start = d_out_idx * BLOCK_D
-            offs_d = d_out_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < DIM
-            if d_out_start < DIM:
-                acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-                for d_in_start in range(0, DIM, BLOCK_D):
-                    x_block_ptr = tl.make_block_ptr(
-                        base=X_ptr,
-                        shape=(B_SZ, DIM),
-                        strides=(stride_xb, stride_xd),
-                        offsets=(pid_m * BLOCK_M, d_in_start),
-                        block_shape=(BLOCK_M, BLOCK_D),
-                        order=(1, 0),
-                    )
-                    x = tl.load(x_block_ptr, boundary_check=(0, 1), eviction_policy="evict_last")
-                    w_block_ptr = tl.make_block_ptr(
-                        base=W_stack_ptr + pid_k * stride_wk,
-                        shape=(DIM, DIM),
-                        strides=(stride_wd2, stride_wd1),
-                        offsets=(d_in_start, d_out_start),
-                        block_shape=(BLOCK_D, BLOCK_D),
-                        order=(1, 0),
-                    )
-                    w_k = tl.load(w_block_ptr, boundary_check=(0, 1), eviction_policy="evict_last")
-                    contrib = tl.dot(x, w_k, input_precision=INPUT_PRECISION)
-                    acc = acc + contrib
-                b_block_ptr = tl.make_block_ptr(
-                    base=Bias_stack_ptr + pid_k * stride_bk,
-                    shape=(DIM,),
-                    strides=(stride_bd,),
-                    offsets=(d_out_start,),
-                    block_shape=(BLOCK_D,),
-                    order=(0,),
-                )
-                b_k = tl.load(b_block_ptr, boundary_check=(0,), eviction_policy="evict_first")
-                b_k = b_k.to(tl.float32)
-                y_prim = acc + b_k[None, :]
-                if HAS_PEER:
-                    h_ctx = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-                    for s in range(MAX_SECONDARY):
-                        c_s = tl.load(
-                            Context_ptr + pid_k * stride_ck + s * stride_cm + offs_d * stride_cd,
-                            mask=mask_d, other=0.0, eviction_policy="evict_first",
-                        ).to(tl.float32)
-                        if tl.sum(c_s) != 0:
-                            p_s = tl.load(
-                            Peer_ptr + pid_k * stride_pok + s * stride_pos + offs_m[:, None] * stride_pob + offs_d[None, :] * stride_pod,
-                            mask=mask_m[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last",
-                        ).to(tl.float32)
-                            h_ctx += c_s[None, :] * p_s
-                    y_prim = y_prim + h_ctx
-                y_v = y_prim * norm_factor
-                if ACTIVATION == 1:
-                    y_v = tl.minimum(tl.maximum(y_v, 0.0), 6.0)
-                elif ACTIVATION == 2:
-                    y_v = tl.where(y_v >= 0.0, 1.0, -1.0)
-                    y_v = tl.where(mask_d[None, :], y_v, 0.0)
-                out_block_ptr = tl.make_block_ptr(
-                    base=Leaf_Outs_ptr + pid_k * stride_lok,
-                    shape=(B_SZ, DIM),
-                    strides=(stride_lob, stride_lod),
-                    offsets=(pid_m * BLOCK_M, d_out_start),
-                    block_shape=(BLOCK_M, BLOCK_D),
-                    order=(1, 0),
-                )
-                tl.store(out_block_ptr, y_v.to(Leaf_Outs_ptr.dtype.element_ty), boundary_check=(0, 1))
+    for d_out_start in range(0, DIM, BLOCK_D):
+        offs_d = d_out_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < DIM
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        for d_in_start in range(0, DIM, BLOCK_D):
+            x_block_ptr = tl.make_block_ptr(
+                base=X_ptr,
+                shape=(B_SZ, DIM),
+                strides=(stride_xb, stride_xd),
+                offsets=(pid_m * BLOCK_M, d_in_start),
+                block_shape=(BLOCK_M, BLOCK_D),
+                order=(1, 0),
+            )
+            x = tl.load(x_block_ptr, boundary_check=(0, 1), eviction_policy="evict_last")
+            w_block_ptr = tl.make_block_ptr(
+                base=W_stack_ptr + pid_k * stride_wk,
+                shape=(DIM, DIM),
+                strides=(stride_wd2, stride_wd1),
+                offsets=(d_in_start, d_out_start),
+                block_shape=(BLOCK_D, BLOCK_D),
+                order=(0, 1),
+            )
+            w_k = tl.load(w_block_ptr, boundary_check=(0, 1), eviction_policy="evict_last")
+            contrib = tl.dot(x, w_k, input_precision=INPUT_PRECISION)
+            acc = acc + contrib
+        b_block_ptr = tl.make_block_ptr(
+            base=Bias_stack_ptr + pid_k * stride_bk,
+            shape=(DIM,),
+            strides=(stride_bd,),
+            offsets=(d_out_start,),
+            block_shape=(BLOCK_D,),
+            order=(0,),
+        )
+        b_k = tl.load(b_block_ptr, boundary_check=(0,), eviction_policy="evict_first")
+        b_k = b_k.to(tl.float32)
+        y_prim = acc + b_k[None, :]
+        if HAS_PEER:
+            h_ctx = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+            for s in range(MAX_SECONDARY):
+                c_s = tl.load(
+                    Context_ptr + pid_k * stride_ck + s * stride_cm + offs_d * stride_cd,
+                    mask=mask_d, other=0.0, eviction_policy="evict_first",
+                ).to(tl.float32)
+                p_s = tl.load(
+                    Peer_ptr + pid_k * stride_pok + s * stride_pos + offs_m[:, None] * stride_pob + offs_d[None, :] * stride_pod,
+                    mask=mask_m[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last",
+                ).to(tl.float32)
+                h_ctx += c_s[None, :] * p_s
+            y_prim = y_prim + h_ctx
+        y_v = y_prim * norm_factor
+        if ACTIVATION == 1:
+            y_v = tl.minimum(tl.maximum(y_v, 0.0), 6.0)
+        elif ACTIVATION == 2:
+            y_v = tl.where(y_v >= 0.0, 1.0, -1.0)
+            y_v = tl.where(mask_d[None, :], y_v, 0.0)
+        out_block_ptr = tl.make_block_ptr(
+            base=Leaf_Outs_ptr + pid_k * stride_lok,
+            shape=(B_SZ, DIM),
+            strides=(stride_lob, stride_lod),
+            offsets=(pid_m * BLOCK_M, d_out_start),
+            block_shape=(BLOCK_M, BLOCK_D),
+            order=(1, 0),
+        )
+        tl.store(out_block_ptr, y_v.to(Leaf_Outs_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 class FusedASDAG2DFunction(torch.autograd.Function):
@@ -199,6 +193,18 @@ class FusedASDAG2DFunction(torch.autograd.Function):
         if not w_stack.is_contiguous():
             w_stack = w_stack.contiguous()
         assert w_stack.is_contiguous(), "w_stack must be contiguous for block_ptr coalescing; transposed in Python above"
+        orig_dtype = x.dtype
+        if _is_turing(x.device) and x.dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in fused_asdag_2d_triton", stacklevel=3)
+            x = x.half()
+            w_stack = w_stack.half()
+            bias_stack = bias_stack.half()
+            routing_probs = routing_probs.half()
+            context_gates = context_gates.half()
+            norm_factors = norm_factors.half()
+            if peer_outputs is not None:
+                peer_outputs = peer_outputs.half()
+
         B, D = x.shape
         K = w_stack.shape[0]
         M_max = context_gates.shape[1] if context_gates.ndim >= 3 else 1
@@ -206,12 +212,9 @@ class FusedASDAG2DFunction(torch.autograd.Function):
             raise ValueError(f"K={K} exceeds grid limit 65535")
         leaf_outs = torch.empty((B, K, D), device=x.device, dtype=x.dtype)
         act_code = 1 if activation == "relu6" else (2 if activation == "sign" else 0)
-        if _is_turing() and x.dtype == torch.bfloat16:
-            warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in fused_asdag_2d_triton", stacklevel=3)
         grid = lambda META: (triton.cdiv(B, META["BLOCK_M"]), K)
 
         has_peer = peer_outputs is not None
-        # dummy_peer stride zeroing: when not has_peer strides passed as 0, kernel gates loads via HAS_PEER
         assert not has_peer or peer_outputs.shape == (w_stack.shape[0], context_gates.shape[1] if context_gates.ndim >= 3 else 1, B, D) or peer_outputs.ndim in (2, 3, 4), "peer_outputs shape mismatch"
         dummy_peer = x if not has_peer else peer_outputs
 
@@ -227,19 +230,36 @@ class FusedASDAG2DFunction(torch.autograd.Function):
         stride_cm = context_gates.stride(1) if context_gates.ndim >= 3 else 0
         stride_cd = context_gates.stride(2) if context_gates.ndim >= 3 else context_gates.stride(1)
 
+        if has_peer:
+            if dummy_peer.ndim >= 4:
+                stride_pok = dummy_peer.stride(0)
+                stride_pos = dummy_peer.stride(1)
+                stride_pob = dummy_peer.stride(2)
+                stride_pod = dummy_peer.stride(3)
+            elif dummy_peer.ndim == 3:
+                stride_pok = dummy_peer.stride(0)
+                stride_pos = 0
+                stride_pob = dummy_peer.stride(1)
+                stride_pod = dummy_peer.stride(2)
+            elif dummy_peer.ndim == 2:
+                stride_pok = 0
+                stride_pos = 0
+                stride_pob = dummy_peer.stride(0)
+                stride_pod = dummy_peer.stride(1)
+            else:
+                stride_pok = stride_pos = stride_pob = stride_pod = 0
+        else:
+            stride_pok = stride_pos = stride_pob = stride_pod = 0
+
         stride_norm = norm_factors.stride(0)
 
         _fused_asdag_2d_grid_kernel[grid](
-            x, w_stack, bias_stack, routing_probs, context_gates, dummy_peer, norm_factors, leaf_outs,
+            x, w_stack, bias_stack, context_gates, dummy_peer, norm_factors, leaf_outs,
             x.stride(0), x.stride(1),
             w_stack.stride(0), w_stack.stride(1), w_stack.stride(2),
             bias_stack.stride(0), bias_stack.stride(1),
-            routing_probs.stride(0), routing_probs.stride(1),
             stride_ck, stride_cm, stride_cd,
-            dummy_peer.stride(0) if has_peer else 0,
-            dummy_peer.stride(1) if has_peer else 0,
-            dummy_peer.stride(2) if has_peer else 0,
-            dummy_peer.stride(3) if has_peer else 0,
+            stride_pok, stride_pos, stride_pob, stride_pod,
             stride_norm,
             leaf_outs.stride(0), leaf_outs.stride(1), leaf_outs.stride(2),
             B,
@@ -250,7 +270,10 @@ class FusedASDAG2DFunction(torch.autograd.Function):
             INPUT_PRECISION=prec,
         )
 
-        return torch.einsum('bk, bkd -> bd', routing_probs, leaf_outs)
+        res = torch.einsum('bk, bkd -> bd', routing_probs, leaf_outs)
+        if res.dtype != orig_dtype:
+            res = res.to(orig_dtype)
+        return res
 
     @staticmethod
     def backward(ctx, grad_output):

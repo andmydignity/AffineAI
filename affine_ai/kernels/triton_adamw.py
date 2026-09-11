@@ -8,7 +8,7 @@ Eliminates intermediate tensor allocations and multiple CUDA kernel launches.
 """
 
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 import torch
 from torch.optim.optimizer import Optimizer
 import triton
@@ -32,14 +32,15 @@ def _adamw_kernel(
     Master_ptr = None,  # Optional master parameter pointer (FP32)
     HAS_MASTER: tl.constexpr = False,
     HAS_WD: tl.constexpr = False,
-    BLOCK_SIZE: tl.constexpr = 1024
+    BLOCK_SIZE: tl.constexpr = 1024,
+    IS_ALIGNED_8: tl.constexpr = False
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
-    # compiler hints for better pipelining
-    # A-08: multiple_of(offs,8) illegal for N<BLOCK; use 1 or guard
-    offs = tl.max_contiguous(tl.multiple_of(offs, 1), BLOCK_SIZE)  # A-08 fixed: use 1 to avoid illegal hint for small N
+    if IS_ALIGNED_8:
+        offs = tl.multiple_of(offs, 8)
+    offs = tl.max_contiguous(offs, BLOCK_SIZE)
 
     # 1. Load parameter, gradient, and moment states into registers
     if HAS_MASTER:
@@ -146,35 +147,36 @@ class TritonAdamW(Optimizer):
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
+                    state['step'] = 0
                     moment_dtype = torch.float64 if p.dtype == torch.float64 else torch.float32
                     state['exp_avg'] = torch.zeros_like(p, dtype=moment_dtype, device=p.device)
                     state['exp_avg_sq'] = torch.zeros_like(p, dtype=moment_dtype, device=p.device)
                     if use_master and p.dtype in (torch.float16, torch.bfloat16):
                         state['master_param'] = p_data.detach().clone().to(torch.float32)
+                        state['p_version'] = p._version
 
-                try:
-                    if p.is_cuda and torch.cuda.is_available() and hasattr(torch.cuda, "is_current_stream_capturing") and torch.cuda.is_current_stream_capturing():
-                        raise RuntimeError("TritonAdamW.step is not CUDA-graph capturable (host beta**step). Run outside graph or disable capture.")
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass
-
-                state['step'].add_(1)
-                step_val = int(state['step'].item()) if not p.is_cuda else int(state['step'].cpu().item()) if state['step'].is_cuda else int(state['step'])
+                if isinstance(state['step'], torch.Tensor):
+                    state['step'] = int(state['step'])
+                state['step'] += 1
+                step_val = state['step']
                 is_fp64_param = p.dtype == torch.float64
-                if is_fp64_param:
-                    bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
-                    bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
-                else:
-                    bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
-                    bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
+                bias_correction1 = (1.0 - beta1 ** step_val) if correct_bias else 1.0
+                bias_correction2 = (1.0 - beta2 ** step_val) if correct_bias else 1.0
                 step_size = lr / bias_correction1
                 bc2_sqrt = math.sqrt(bias_correction2)
 
-                has_master = 'master_param' in state
-                master_p = state['master_param'] if has_master else p_data
+                if use_master and p.dtype in (torch.float16, torch.bfloat16):
+                    if 'master_param' not in state:
+                        state['master_param'] = p_data.detach().clone().to(torch.float32)
+                        state['p_version'] = p._version
+                    elif state.get('p_version') is not None and p._version != state['p_version']:
+                        state['master_param'].copy_(p_data)
+                        state['p_version'] = p._version
+                    has_master = True
+                    master_p = state['master_param']
+                else:
+                    has_master = False
+                    master_p = p_data
 
                 if p.is_cuda and not is_fp64_param:
                     N = p_data.numel()
@@ -185,6 +187,7 @@ class TritonAdamW(Optimizer):
                     else:
                         BLOCK_SIZE = 256
                     has_wd = weight_decay != 0.0
+                    is_aligned_8 = (N % 8 == 0)
                     grid = (triton.cdiv(N, BLOCK_SIZE),)
                     _adamw_kernel[grid](
                         p_data,
@@ -197,7 +200,8 @@ class TritonAdamW(Optimizer):
                         master_p,
                         HAS_MASTER=has_master,
                         HAS_WD=has_wd,
-                        BLOCK_SIZE=BLOCK_SIZE
+                        BLOCK_SIZE=BLOCK_SIZE,
+                        IS_ALIGNED_8=is_aligned_8
                     )
                 else:
                     exp_avg = state['exp_avg']
@@ -219,9 +223,106 @@ class TritonAdamW(Optimizer):
                         denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
                         p_data.addcdiv_(exp_avg, denom, value=-step_size)
 
-                # A-01: p is now guaranteed contiguous, no copy-back needed; kept for API compat if guard relaxed
-                # if not p.is_contiguous():
-                #     p.copy_(p_data)
-                pass
+                if has_master:
+                    state['p_version'] = p._version
 
         return loss
+
+    def sync_master_weights(self):
+        """Synchronize master FP32 weights from parameters."""
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state.get(p, None)
+                if state is not None and 'master_param' in state:
+                    state['master_param'].copy_(p.detach().to(torch.float32))
+                    state['p_version'] = p._version
+
+
+def triton_adamw_step(
+    p: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    lr: float,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.01,
+    step: int = 1,
+    master_p: Optional[torch.Tensor] = None,
+):
+    """Functional interface for fused Triton AdamW step."""
+    if not p.is_cuda or not torch.cuda.is_available():
+        has_master = master_p is not None
+        mp = master_p if has_master else p
+        grad_acc = grad.double() if p.dtype == torch.float64 else grad.float()
+        if has_master:
+            if weight_decay != 0.0:
+                mp.mul_(1.0 - lr * weight_decay)
+            exp_avg.mul_(beta1).add_(grad_acc, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad_acc, grad_acc, value=1.0 - beta2)
+            bc1 = 1.0 - beta1 ** step
+            bc2 = 1.0 - beta2 ** step
+            step_size = lr / bc1
+            bc2_sqrt = math.sqrt(bc2)
+            denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
+            mp.addcdiv_(exp_avg, denom, value=-step_size)
+            p.copy_(mp)
+        else:
+            if weight_decay != 0.0:
+                p.mul_(1.0 - lr * weight_decay)
+            exp_avg.mul_(beta1).add_(grad_acc, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad_acc, grad_acc, value=1.0 - beta2)
+            bc1 = 1.0 - beta1 ** step
+            bc2 = 1.0 - beta2 ** step
+            step_size = lr / bc1
+            bc2_sqrt = math.sqrt(bc2)
+            denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
+            p.addcdiv_(exp_avg, denom, value=-step_size)
+        return
+
+    is_fp64_param = p.dtype == torch.float64
+    if is_fp64_param:
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        step_size = lr / bc1
+        bc2_sqrt = math.sqrt(bc2)
+        grad_acc = grad.double()
+        has_master = master_p is not None
+        mp = master_p if has_master else p
+        if weight_decay != 0.0:
+            mp.mul_(1.0 - lr * weight_decay)
+        exp_avg.mul_(beta1).add_(grad_acc, alpha=1.0 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad_acc, grad_acc, value=1.0 - beta2)
+        denom = (exp_avg_sq.sqrt() / bc2_sqrt).add_(eps)
+        mp.addcdiv_(exp_avg, denom, value=-step_size)
+        if has_master:
+            p.copy_(mp)
+        return
+
+    bc1 = 1.0 - beta1 ** step
+    bc2 = 1.0 - beta2 ** step
+    step_size = lr / bc1
+    bc2_sqrt = math.sqrt(bc2)
+    N = p.numel()
+    if N > 1 << 18:
+        BLOCK_SIZE = 1024
+    elif N > 1 << 14:
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 256
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    has_master = master_p is not None
+    mp = master_p if has_master else p
+    has_wd = weight_decay != 0.0
+    is_aligned_8 = (N % 8 == 0)
+    _adamw_kernel[grid](
+        p, grad, exp_avg, exp_avg_sq,
+        lr, beta1, beta2, eps, weight_decay,
+        step_size, bc2_sqrt, N, mp,
+        HAS_MASTER=has_master, HAS_WD=has_wd, BLOCK_SIZE=BLOCK_SIZE,
+        IS_ALIGNED_8=is_aligned_8
+    )
+
+
+__all__ = ["TritonAdamW", "triton_adamw_step", "_adamw_kernel"]

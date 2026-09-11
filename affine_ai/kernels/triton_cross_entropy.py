@@ -49,7 +49,7 @@ def _prune_turing_ce_configs(configs, named_args, **kwargs):
 
 
 def _use_torch_path(V: int) -> bool:
-    return V <= 1024
+    return False
 
 
 # ==============================================================================
@@ -172,12 +172,6 @@ def _fused_linear_cross_entropy_bwd_dh_kernel(
     N, D: tl.constexpr, V: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr
 ):
-    # C-01 FIX: hoisted logits/p outside D loop — grid is 1D over M (cdiv(N,BLOCK_M)).
-    # Old grid (M,D) recomputed full logits per BLOCK_D shard => 64× redundant for D=2048/BLOCK_D=32.
-    # New: compute logits/p once per BLOCK_M per V-block (BLOCK_M×BLOCK_V in SRAM), then loop over D slices
-    # to project dh via dot(dlogits, W_d) reusing same p. No recompute of H@W^T per D shard.
-    # Measured ~8× bwd speedup (D=2048 V=32k A100) and 64× fewer dots; tail masks and fp32 scaled_fp32 preserved.
-    # If triton version lacks TMA, manual pointer path retained (block_ptr branch below).
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < N
@@ -185,42 +179,46 @@ def _fused_linear_cross_entropy_bwd_dh_kernel(
     target = tl.load(Targets_ptr + offs_m * stride_tb, mask=mask_m, other=ignore_index)
     valid_mask = mask_m & (target != ignore_index) & (target >= 0) & (target < V)
     lse = tl.load(LSE_ptr + offs_m * stride_lse, mask=mask_m, other=0.0)
-    grad_scale = tl.load(Grad_scale_ptr)  # C-06: scalar load per program
+    grad_scale = tl.load(Grad_scale_ptr)
 
     acc_dtype = tl.float64 if H_ptr.dtype.element_ty == tl.float64 else tl.float32
-    # DH_ptr is zero-initialized float32/float64 accumulator (see Python backward); we accumulate
-    # via load-add-store per D slice reusing same p. Single writer per row => no atomics needed.
 
-    for v_start in range(0, V, BLOCK_V):
-        offs_v = v_start + tl.arange(0, BLOCK_V)
-        mask_v = offs_v < V
+    for d_start in range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        dh_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=acc_dtype)
 
-        # Hoisted: compute logits once per V block (was inside pid_d loop before)
-        logits = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
-        for d_k in range(0, D, BLOCK_D):
-            offs_dk = d_k + tl.arange(0, BLOCK_D)
-            mask_dk = offs_dk < D
-            # Contiguous fast path would use tl.make_block_ptr when stride_hd==1 && stride_wd==1;
-            # keep manual for correctness with non-contiguous strides (fallback). Could be:
-            # if stride_hd==1: h_block = tl.make_block_ptr(..., block_shape=(BLOCK_M,BLOCK_D)) else manual
-            h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
-            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(h_k, tl.trans(w_k), allow_tf32=False)
+        for v_start in range(0, V, BLOCK_V):
+            offs_v = v_start + tl.arange(0, BLOCK_V)
+            mask_v = offs_v < V
 
-        diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
-        p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
-        is_target = (target[:, None] == offs_v[None, :]) & valid_mask[:, None] & mask_v[None, :]
-        dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
-        scaled_fp32 = dlogits * grad_scale  # C-02: keep fp32, allow_tf32=False below
-        # Reuse p/scaled for all D slices without recomputing logits
-        for d_start in range(0, D, BLOCK_D):
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
             w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-            dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), allow_tf32=False)
-            dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
-            cur = tl.load(dh_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-            tl.store(dh_ptrs, cur + dh_contrib, mask=mask_m[:, None] & mask_d[None, :])
+            if D <= BLOCK_D:
+                h_d = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+                logits = tl.dot(h_d, tl.trans(w_d), allow_tf32=False)
+            else:
+                logits = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
+                for d_k in range(0, D, BLOCK_D):
+                    offs_dk = d_k + tl.arange(0, BLOCK_D)
+                    mask_dk = offs_dk < D
+                    h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
+                    if d_k == d_start:
+                        w_k = w_d
+                    else:
+                        w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+                    logits += tl.dot(h_k, tl.trans(w_k), allow_tf32=False)
+
+            diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
+            p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
+            is_target = (target[:, None] == offs_v[None, :]) & valid_mask[:, None] & mask_v[None, :]
+            dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
+            scaled_acc = (dlogits * grad_scale).to(acc_dtype)
+
+            dh_contrib = tl.dot(scaled_acc, w_d.to(acc_dtype), allow_tf32=False)
+            dh_acc += dh_contrib
+
+        dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
+        tl.store(dh_ptrs, dh_acc.to(DH_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 # ==============================================================================
@@ -264,35 +262,46 @@ def _fused_linear_cross_entropy_bwd_dw_kernel(
     acc_dtype = tl.float64 if W_ptr.dtype.element_ty == tl.float64 else tl.float32
     grad_scale = tl.load(Grad_scale_ptr)
 
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
+    for d_start in range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        dw_acc = tl.zeros([BLOCK_V, BLOCK_D], dtype=acc_dtype)
 
-        target = tl.load(Targets_ptr + offs_n * stride_tb, mask=mask_n, other=ignore_index)
-        valid_mask = mask_n & (target != ignore_index) & (target >= 0) & (target < V)
-        lse = tl.load(LSE_ptr + offs_n * stride_lse, mask=mask_n, other=0.0)
+        for n_start in range(0, N, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < N
 
-        logits = tl.zeros([BLOCK_V, BLOCK_N], dtype=acc_dtype)
-        for d_k in range(0, D, BLOCK_D):
-            offs_dk = d_k + tl.arange(0, BLOCK_D)
-            mask_dk = offs_dk < D
-            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(w_k, tl.trans(h_k), allow_tf32=False)
+            target = tl.load(Targets_ptr + offs_n * stride_tb, mask=mask_n, other=ignore_index)
+            valid_mask = mask_n & (target != ignore_index) & (target >= 0) & (target < V)
+            lse = tl.load(LSE_ptr + offs_n * stride_lse, mask=mask_n, other=0.0)
 
-        diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
-        p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
-        is_target = (offs_v[:, None] == target[None, :]) & mask_v[:, None] & valid_mask[None, :]
-        dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
-        scaled_fp32_dw = dlogits * grad_scale
-        for d_start in range(0, D, BLOCK_D):
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
             h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-            dw_contrib = tl.dot(scaled_fp32_dw, h_d.to(tl.float32), allow_tf32=False)
-            dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
-            cur = tl.load(dw_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-            tl.store(dw_ptrs, cur + dw_contrib, mask=mask_v[:, None] & mask_d[None, :])
+            if D <= BLOCK_D:
+                w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+                logits = tl.dot(w_d, tl.trans(h_d), allow_tf32=False)
+            else:
+                logits = tl.zeros([BLOCK_V, BLOCK_N], dtype=acc_dtype)
+                for d_k in range(0, D, BLOCK_D):
+                    offs_dk = d_k + tl.arange(0, BLOCK_D)
+                    mask_dk = offs_dk < D
+                    w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+                    if d_k == d_start:
+                        h_k = h_d
+                    else:
+                        h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
+                    logits += tl.dot(w_k, tl.trans(h_k), allow_tf32=False)
+
+            diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
+            p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
+            is_target = (offs_v[:, None] == target[None, :]) & mask_v[:, None] & valid_mask[None, :]
+            dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
+            scaled_acc_dw = (dlogits * grad_scale).to(acc_dtype)
+
+            dw_contrib = tl.dot(scaled_acc_dw, h_d.to(acc_dtype), allow_tf32=False)
+            dw_acc += dw_contrib
+
+        dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
+        tl.store(dw_ptrs, dw_acc.to(DW_ptr.dtype.element_ty), mask=mask_v[:, None] & mask_d[None, :])
 
 
 # ==============================================================================

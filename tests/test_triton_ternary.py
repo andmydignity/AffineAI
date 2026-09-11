@@ -204,3 +204,76 @@ def test_triton_quantize_x_and_fast_gw():
     diff = (gw_prequant - gw_legacy).abs().max().item()
     assert diff == 0.0, f"Discrepancy between fast prequant gw and legacy gw: {diff}"
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton ternary tests")
+def test_triton_ternary_twin_gradient_scaling_issue23():
+    from affine_ai.kernels.triton_ternary import triton_ternary_twin
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    M, K, O = 32, 64, 48
+    x = torch.randn(M, K, device=device, requires_grad=True)
+    w1 = torch.randn(O, K, device=device) * 2.5
+    w2 = torch.randn(O, K, device=device) * 3.5
+
+    out = triton_ternary_twin(x, w1, None, w2, None)
+    go = torch.randn_like(out)
+    out.backward(go)
+
+    # Reference gradient scaling check:
+    g1 = w1.abs().mean().clamp(min=1e-5)
+    g2 = w2.abs().mean().clamp(min=1e-5)
+    w1t = torch.round(w1 / g1).clamp(-1.0, 1.0)
+    w2t = torch.round(w2 / g2).clamp(-1.0, 1.0)
+    go1, go2 = go.split(O, dim=-1)
+    ref_gx = torch.matmul(go1, w1t * g1) + torch.matmul(go2, w2t * g2)
+
+    # Gradient must be scaled by g, NOT g^2
+    diff = (x.grad - ref_gx).abs().max().item()
+    assert diff < 1e-2, f"Twin gx scale mismatch vs reference: {diff}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton ternary tests")
+def test_triton_ternary_bf16_tc_enabled_issue24():
+    from affine_ai.kernels.triton_ternary import triton_ternary_linear, _resolve_tc
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    x = torch.randn(16, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(32, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    assert _resolve_tc(None, x) is True
+    out = triton_ternary_linear(x, w)
+    assert out.dtype == torch.bfloat16
+    out.sum().backward()
+    assert x.grad is not None
+    assert x.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton ternary tests")
+def test_triton_row_amax_and_quantize_x_3d_issue25_26():
+    from affine_ai.kernels.triton_ternary import triton_row_amax, triton_quantize_x
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    B, T, K = 4, 16, 64
+    x_cpu = torch.randn(B, T, K)
+    x_cuda = x_cpu.to(device)
+
+    # Issue 25: Harmonize 3D shapes between CPU and CUDA
+    amax_cpu = triton_row_amax(x_cpu)
+    amax_cuda = triton_row_amax(x_cuda)
+    assert amax_cpu.shape == (B, T)
+    assert amax_cuda.shape == (B, T)
+    assert torch.allclose(amax_cpu, amax_cuda.cpu(), atol=1e-5)
+
+    # Issue 26: 3D support in triton_quantize_x
+    xq_cpu = triton_quantize_x(x_cpu, amax_cpu)
+    xq_cuda = triton_quantize_x(x_cuda, amax_cuda)
+    assert xq_cuda.shape == (B, T, K)
+    assert torch.allclose(xq_cpu, xq_cuda.cpu(), atol=1e-4)
+
+

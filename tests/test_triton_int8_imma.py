@@ -26,10 +26,13 @@ def ref_int8_imma(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = No
     sw = (weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5).float() / 127.0).squeeze(-1)
     w_int8 = (weight / sw.unsqueeze(-1)).round().clamp(-128, 127).to(torch.int8)
 
-    out = torch.matmul(x_int8.float(), w_int8.float().t()) * sx.unsqueeze(-1) * sw.unsqueeze(0)
+    xq = x_int8.float() * sx.unsqueeze(-1)
+    wq = w_int8.float() * sw.unsqueeze(-1)
+
+    out = torch.matmul(xq, wq.t())
     if bias is not None:
         out = out + bias
-    return out.to(x.dtype).reshape(*orig_shape[:-1], N)
+    return out.to(x.dtype).reshape(*orig_shape[:-1], N), xq, wq
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for IMMA tests")
@@ -47,7 +50,7 @@ def test_triton_int8_imma_forward_backward_parity(M, has_bias):
     out = triton_int8_imma_linear(x, weight, bias)
     assert out.shape == (M, N)
 
-    ref_out = ref_int8_imma(x, weight, bias)
+    ref_out, ref_xq, ref_wq = ref_int8_imma(x, weight, bias)
     diff = (out - ref_out).abs().max().item()
     assert diff < 1e-3, f"Forward diff exceeded threshold: {diff}"
 
@@ -55,13 +58,16 @@ def test_triton_int8_imma_forward_backward_parity(M, has_bias):
     loss = (out * 2.0).sum()
     loss.backward()
 
-    ref_loss = (ref_out * 2.0).sum()
-    ref_loss.backward()
+    # Independent reference gradient reflecting INT8 quantization scale factors
+    go_ref = torch.full_like(ref_out, 2.0).reshape(-1, N)
+    ref_gx = torch.matmul(go_ref, ref_wq).reshape_as(x)
+    ref_gw = torch.matmul(go_ref.t(), ref_xq).reshape_as(weight)
+    ref_gb = go_ref.sum(dim=0) if has_bias else None
 
-    assert torch.allclose(x.grad, x.grad, atol=1e-4)
-    assert torch.allclose(weight.grad, weight.grad, atol=1e-4)
+    assert torch.allclose(x.grad, ref_gx, atol=1e-3)
+    assert torch.allclose(weight.grad, ref_gw, atol=1e-3)
     if has_bias:
-        assert torch.allclose(bias.grad, bias.grad, atol=1e-4)
+        assert torch.allclose(bias.grad, ref_gb, atol=1e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for IMMA tests")

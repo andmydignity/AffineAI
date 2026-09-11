@@ -4,7 +4,6 @@ Custom Triton Kernels for Local Predictive Coding (LPC)
 Implements fused Forward-Predict-Loss-Gradient operations specifically tailored
 for in-place, forward-only local error learning:
 1. Zero DRAM allocation for un-materialized intermediate logits [B, T, V].
-   For V<=1024 falls back to torch allocating [N,V] logits; fusion only for V>1024.
 2. Fused online Log-Sum-Exp (LSE) loss calculation in GPU SRAM.
 3. In-place gradient projection (dH = err @ W_head) and dW_head accumulation.
 4. Seamless integration with standard PyTorch autograd and forward-only execution.
@@ -12,14 +11,15 @@ Coalesced access via tl.make_block_ptr with boundary_check for tails.
 """
 
 import warnings
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-from typing import Tuple, Optional
 
 
 _TURING_CACHE = None
+
 
 def _is_turing() -> bool:
     global _TURING_CACHE
@@ -59,7 +59,7 @@ def _prune_turing_lpc_configs(configs, named_args, **kwargs):
 
 
 def _use_torch_path(V: int) -> bool:
-    return V <= 1024
+    return False
 
 
 # ==============================================================================
@@ -90,7 +90,6 @@ lpc_bwd_dw_configs = [
 ]
 
 
-
 @triton.autotune(
     configs=lpc_fwd_configs,
     key=['D', 'V'],
@@ -106,7 +105,8 @@ def _triton_lpc_fwd_kernel(
     stride_lse,
     ignore_index: tl.constexpr,
     N, D: tl.constexpr, V: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr,
+    IS_TURING: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -138,7 +138,10 @@ def _triton_lpc_fwd_kernel(
                 h_tile = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
                 w_tile = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
 
-            acc += tl.dot(h_tile, tl.trans(w_tile), allow_tf32=False)
+            if IS_TURING:
+                acc += tl.dot(h_tile.to(tl.float16), tl.trans(w_tile).to(tl.float16), allow_tf32=False)
+            else:
+                acc += tl.dot(h_tile, tl.trans(w_tile), allow_tf32=False)
 
         acc_masked = tl.where(mask_m[:, None] & mask_v[None, :], acc, -1e30)
         chunk_max = tl.max(acc_masked, axis=1)
@@ -177,7 +180,8 @@ def _triton_lpc_bwd_dh_kernel(
     stride_dhb, stride_dhd,
     ignore_index: tl.constexpr,
     N, D: tl.constexpr, V: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr,
+    IS_TURING: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -190,31 +194,41 @@ def _triton_lpc_bwd_dh_kernel(
 
     acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
 
-    for v_start in range(0, V, BLOCK_V):
-        offs_v = v_start + tl.arange(0, BLOCK_V)
-        mask_v = offs_v < V
+    for d_start in range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        dh_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=acc_dtype)
 
-        logits = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
-        for d_k in range(0, D, BLOCK_D):
-            offs_dk = d_k + tl.arange(0, BLOCK_D)
-            mask_dk = offs_dk < D
-            h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
-            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(h_k, tl.trans(w_k), allow_tf32=False)
+        for v_start in range(0, V, BLOCK_V):
+            offs_v = v_start + tl.arange(0, BLOCK_V)
+            mask_v = offs_v < V
 
-        diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
-        p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
-        is_target = (target[:, None] == offs_v[None, :]) & valid_mask[:, None] & mask_v[None, :]
-        dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
-        scaled_fp32 = dlogits * grad_scale
-        for d_start in range(0, D, BLOCK_D):
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
+            logits = tl.zeros([BLOCK_M, BLOCK_V], dtype=acc_dtype)
+            for d_k in range(0, D, BLOCK_D):
+                offs_dk = d_k + tl.arange(0, BLOCK_D)
+                mask_dk = offs_dk < D
+                h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
+                w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+                if IS_TURING:
+                    logits += tl.dot(h_k.to(tl.float16), tl.trans(w_k).to(tl.float16), allow_tf32=False)
+                else:
+                    logits += tl.dot(h_k, tl.trans(w_k), allow_tf32=False)
+
+            diff = tl.where(valid_mask[:, None] & mask_v[None, :], logits - lse[:, None], -50.0)
+            p = tl.where(valid_mask[:, None] & mask_v[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
+            is_target = (target[:, None] == offs_v[None, :]) & valid_mask[:, None] & mask_v[None, :]
+            dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
+            scaled_fp32 = dlogits * grad_scale
+
             w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-            dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), allow_tf32=False)
-            dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
-            cur = tl.load(dh_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-            tl.store(dh_ptrs, cur + dh_contrib, mask=mask_m[:, None] & mask_d[None, :])
+            if IS_TURING:
+                dh_contrib = tl.dot(scaled_fp32.to(tl.float16), w_d.to(tl.float16), allow_tf32=False)
+            else:
+                dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), allow_tf32=False)
+            dh_acc += dh_contrib
+
+        dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
+        tl.store(dh_ptrs, dh_acc, mask=mask_m[:, None] & mask_d[None, :])
 
 
 @triton.autotune(
@@ -231,46 +245,64 @@ def _triton_lpc_bwd_dw_kernel(
     stride_tb,
     stride_lse,
     stride_dwv, stride_dwd,
+    stride_split,
     ignore_index: tl.constexpr,
     N, D: tl.constexpr, V: tl.constexpr,
-    BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr
+    BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
+    SPLIT_N: tl.constexpr,
+    IS_TURING: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
+    pid_split = tl.program_id(1)
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
 
     acc_dtype = tl.float32 if (H_ptr.dtype.element_ty == tl.bfloat16 or W_ptr.dtype.element_ty == tl.bfloat16 or H_ptr.dtype.element_ty == tl.float16 or W_ptr.dtype.element_ty == tl.float16) else (tl.float64 if (H_ptr.dtype.element_ty == tl.float64 or W_ptr.dtype.element_ty == tl.float64) else tl.float32)
     grad_scale = tl.load(Grad_scale_ptr)
 
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
+    n_per_split = (N + SPLIT_N - 1) // SPLIT_N
+    split_start = pid_split * n_per_split
+    split_end = tl.minimum(N, (pid_split + 1) * n_per_split)
 
-        target = tl.load(Targets_ptr + offs_n * stride_tb, mask=mask_n, other=ignore_index)
-        valid_mask = mask_n & (target != ignore_index) & (target >= 0) & (target < V)
-        lse = tl.load(LSE_ptr + offs_n * stride_lse, mask=mask_n, other=0.0)
+    for d_start in range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        dw_tile = tl.zeros([BLOCK_V, BLOCK_D], dtype=acc_dtype)
 
-        logits = tl.zeros([BLOCK_V, BLOCK_N], dtype=acc_dtype)
-        for d_k in range(0, D, BLOCK_D):
-            offs_dk = d_k + tl.arange(0, BLOCK_D)
-            mask_dk = offs_dk < D
-            w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-            h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
-            logits += tl.dot(w_k, tl.trans(h_k), allow_tf32=False)
+        for n_start in range(split_start, split_end, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < N
 
-        diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
-        p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
-        is_target = (offs_v[:, None] == target[None, :]) & mask_v[:, None] & valid_mask[None, :]
-        dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
-        scaled_fp32 = dlogits * grad_scale
-        for d_start in range(0, D, BLOCK_D):
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
+            target = tl.load(Targets_ptr + offs_n * stride_tb, mask=mask_n, other=ignore_index)
+            valid_mask = mask_n & (target != ignore_index) & (target >= 0) & (target < V)
+            lse = tl.load(LSE_ptr + offs_n * stride_lse, mask=mask_n, other=0.0)
+
+            logits = tl.zeros([BLOCK_V, BLOCK_N], dtype=acc_dtype)
+            for d_k in range(0, D, BLOCK_D):
+                offs_dk = d_k + tl.arange(0, BLOCK_D)
+                mask_dk = offs_dk < D
+                w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+                h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
+                if IS_TURING:
+                    logits += tl.dot(w_k.to(tl.float16), tl.trans(h_k).to(tl.float16), allow_tf32=False)
+                else:
+                    logits += tl.dot(w_k, tl.trans(h_k), allow_tf32=False)
+
+            diff = tl.where(mask_v[:, None] & valid_mask[None, :], logits - lse[None, :], -50.0)
+            p = tl.where(mask_v[:, None] & valid_mask[None, :], tl.exp(tl.minimum(diff, 0.0)), 0.0)
+            is_target = (offs_v[:, None] == target[None, :]) & mask_v[:, None] & valid_mask[None, :]
+            dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
+            scaled_fp32 = dlogits * grad_scale
+
             h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-            dw_contrib = tl.dot(scaled_fp32, h_d.to(tl.float32), allow_tf32=False)
-            dw_ptrs = DW_ptr + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
-            cur = tl.load(dw_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
-            tl.store(dw_ptrs, cur + dw_contrib, mask=mask_v[:, None] & mask_d[None, :])
+            if IS_TURING:
+                dw_contrib = tl.dot(scaled_fp32.to(tl.float16), h_d.to(tl.float16), allow_tf32=False)
+            else:
+                dw_contrib = tl.dot(scaled_fp32, h_d.to(tl.float32), allow_tf32=False)
+            dw_tile += dw_contrib
+
+        dw_ptrs = DW_ptr + pid_split * stride_split + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
+        tl.store(dw_ptrs, dw_tile, mask=mask_v[:, None] & mask_d[None, :])
 
 
 class _TritonFusedLPCHeadFunc(torch.autograd.Function):
@@ -282,7 +314,6 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         targets: torch.Tensor,
         ignore_index: int = -100
     ) -> torch.Tensor:
-        # Turing sm_75: 64KB SMEM => BLOCK<=64 already pruned; force fp16→fp32 accum even if bf16; bf16→fp16 fallback
         if _is_turing():
             if h.dtype == torch.bfloat16:
                 warnings.warn(
@@ -296,11 +327,8 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
                     stacklevel=3,
                 )
                 weight = weight.to(torch.float16)
-        # Keep original weight untouched; compute matmuls in promoted dtype without mutating param
-        calc_dtype = torch.float32 if h.dtype in (torch.bfloat16, torch.float16) else (torch.float64 if h.dtype == torch.float64 else h.dtype)
-        weight_compute = weight.to(calc_dtype) if weight.dtype != calc_dtype else weight
+
         h = h.contiguous()
-        weight_compute = weight_compute.contiguous()
         weight_orig = weight.contiguous()
         targets = targets.contiguous()
 
@@ -311,33 +339,7 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         N, D = h_flat.shape
         V = weight.shape[0]
 
-        # For V<=1024 falls back to torch allocating [N,V] logits; fusion only for V>1024
         alloc_dtype = torch.float64 if h.dtype == torch.float64 else torch.float32
-        if _use_torch_path(V):
-            # Capture-safe branchless small-V path (no .item()/sync, no nested
-            # autograd), mirroring triton_cross_entropy semantics.
-            valid_bool = (targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)
-            # Use int64/float32 for n_valid sum to avoid bf16 mantissa loss
-            n_valid = valid_bool.sum().to(torch.float32).clamp(min=1)
-            valid = valid_bool.to(torch.float32)
-            lse = torch.empty(0, dtype=alloc_dtype, device=h.device)
-            ctx.save_for_backward(h_flat, weight_orig, targets_flat, lse, n_valid)
-            ctx.orig_shape = orig_shape
-            ctx.N = N
-            ctx.D = D
-            ctx.V = V
-            ctx.ignore_index = ignore_index
-            ctx.use_torch = True
-            safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
-            # Ensure matmul uses fp32 when bf16 for stable log_softmax
-            h_for_logits = h_flat.to(torch.float32) if h.dtype in (torch.bfloat16, torch.float16) else h_flat.to(calc_dtype)
-            w_for_logits = weight_compute.to(torch.float32) if h.dtype in (torch.bfloat16, torch.float16) else weight_compute
-            logits = torch.matmul(h_for_logits, w_for_logits.t())
-            # log_softmax in fp32 when bf16: keep logits fp32
-            nll = -logits.log_softmax(dim=-1).gather(1, safe_idx).squeeze(1).to(torch.float32)
-            total_loss = (nll * valid).sum() / n_valid
-            return total_loss.to(h.dtype)
-
         losses = torch.empty(N, dtype=alloc_dtype, device=h.device)
         lse = torch.empty(N, dtype=alloc_dtype, device=h.device)
 
@@ -353,6 +355,7 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
             lse.stride(0),
             ignore_index=ignore_index,
             N=N, D=D, V=V,
+            IS_TURING=_is_turing(),
         )
 
         valid_mask = (targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V)
@@ -365,7 +368,6 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         ctx.D = D
         ctx.V = V
         ctx.ignore_index = ignore_index
-        ctx.use_torch = False
         return total_loss.to(h.dtype)
 
     @staticmethod
@@ -375,30 +377,6 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
         D = ctx.D
         V = ctx.V
         ignore_index = ctx.ignore_index
-
-        if getattr(ctx, 'use_torch', False) or _use_torch_path(V):
-            # Explicit softmax backward, capture-safe (plain tensor ops only).
-            need_dx = ctx.needs_input_grad[0]
-            need_dw = ctx.needs_input_grad[1]
-            if not need_dx and not need_dw:
-                return None, None, None, None
-            valid_bool = ((targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < V))
-            safe_idx = targets_flat.clamp(0, V - 1).unsqueeze(1)
-            # Promote bf16/fp16 to fp32 for stable log_softmax and to avoid mantissa loss
-            acc_dtype = torch.float32 if h_flat.dtype in (torch.bfloat16, torch.float16) else (torch.float64 if h_flat.dtype == torch.float64 else h_flat.dtype)
-            valid = valid_bool.to(torch.float32)
-            # Ensure matmul uses fp32 when bf16 for stable log_softmax
-            h_for_logits = h_flat.to(torch.float32) if h_flat.dtype in (torch.bfloat16, torch.float16) else h_flat.to(acc_dtype)
-            w_for_logits = weight.to(torch.float32) if h_flat.dtype in (torch.bfloat16, torch.float16) else weight.to(acc_dtype)
-            logits = torch.matmul(h_for_logits, w_for_logits.t())
-            probs = logits.log_softmax(dim=-1).exp()
-            one_hot = torch.zeros_like(probs)
-            one_hot.scatter_(1, safe_idx, valid.unsqueeze(1))
-            dlogits = (probs - one_hot) * valid.unsqueeze(1)
-            dlogits = dlogits * (grad_output / n_valid).to(dlogits.dtype)
-            dh_flat = torch.matmul(dlogits, w_for_logits).to(h_flat.dtype).view(ctx.orig_shape) if need_dx else None
-            dw = torch.matmul(dlogits.t(), h_flat.to(torch.float32) if h_flat.dtype in (torch.bfloat16, torch.float16) else h_flat.to(acc_dtype)).to(weight.dtype) if need_dw else None
-            return dh_flat, dw, None, None
 
         scale_dtype = torch.float64 if h_flat.dtype == torch.float64 else torch.float32
         grad_scale_tensor = (grad_output / n_valid).to(scale_dtype)
@@ -419,28 +397,44 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
                 dh_acc.stride(0), dh_acc.stride(1),
                 ignore_index=ignore_index,
                 N=N, D=D, V=V,
+                IS_TURING=_is_turing(),
             )
             dh_flat = dh_acc.to(h_flat.dtype).view(ctx.orig_shape)
 
         dw = None
         if ctx.needs_input_grad[1]:
             calc_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
-            dw_acc = torch.zeros((V, D), dtype=calc_dtype, device=weight.device)
+            split_n = min(16, triton.cdiv(N, 256)) if N >= 256 else 1
+            if split_n > 1:
+                dw_split = torch.empty((split_n, V, D), dtype=calc_dtype, device=weight.device)
+                dw_target = dw_split
+                stride_split = dw_split.stride(0)
+            else:
+                dw_acc = torch.zeros((V, D), dtype=calc_dtype, device=weight.device)
+                dw_target = dw_acc
+                stride_split = 0
+
             def grid_dw(META):
-                return (triton.cdiv(V, META['BLOCK_V']),)
+                return (triton.cdiv(V, META['BLOCK_V']), split_n)
 
             _triton_lpc_bwd_dw_kernel[grid_dw](
-                h_flat, weight, targets_flat, lse, dw_acc,
+                h_flat, weight, targets_flat, lse, dw_target,
                 grad_scale_tensor,
                 h_flat.stride(0), h_flat.stride(1),
                 weight.stride(0), weight.stride(1),
                 targets_flat.stride(0),
                 lse.stride(0),
-                dw_acc.stride(0), dw_acc.stride(1),
+                dw_target.stride(-2), dw_target.stride(-1),
+                stride_split,
                 ignore_index=ignore_index,
                 N=N, D=D, V=V,
+                SPLIT_N=split_n,
+                IS_TURING=_is_turing(),
             )
-            dw = dw_acc.to(weight.dtype)
+            if split_n > 1:
+                dw = dw_split.sum(dim=0).to(weight.dtype)
+            else:
+                dw = dw_acc.to(weight.dtype)
 
         return dh_flat, dw, None, None
 
@@ -453,9 +447,7 @@ def triton_fused_lpc_head(
 ) -> torch.Tensor:
     """
     Computes Local Predictive Coding loss and exact in-place gradients via Triton.
-    Eliminates intermediate logits allocation in DRAM. For V<=1024 falls back to
-    torch allocating [N,V] logits; fusion only for V>1024. Masking OOB (ignore_index,
-    target <0 or >=V) is handled via valid_mask with masked stores/loads.
+    Eliminates intermediate logits allocation in DRAM.
 
     Args:
         h: Local layer hidden representation of shape (B, T, D) or (N, D).
@@ -467,21 +459,16 @@ def triton_fused_lpc_head(
         Scalar local cross-entropy loss.
     """
     if not h.is_cuda:
-        if _use_torch_path(weight.shape[0]):
-            # Capture-safe branchless torch path via the Function (single code
-            # path; also faster than the AVX C++ head for small V on CPU).
-            return _TritonFusedLPCHeadFunc.apply(h, weight, targets, ignore_index)
         try:
             from affine_ai.core.cpp_ops import asdag_cpu_lpc_head
             return asdag_cpu_lpc_head(h, weight, targets, ignore_index).to(h.dtype)
         except Exception:
-            orig_shape = h.shape
-            h_flat = h.view(-1, orig_shape[-1]).float()
-            w_flat = weight.float()
-            targets_flat = targets.view(-1)
-            logits = torch.matmul(h_flat, w_flat.t())
-            return torch.nn.functional.cross_entropy(logits, targets_flat, ignore_index=ignore_index).to(h.dtype)
+            pass
+        orig_shape = h.shape
+        h_flat = h.view(-1, orig_shape[-1]).float()
+        w_flat = weight.float()
+        targets_flat = targets.view(-1)
+        logits = torch.matmul(h_flat, w_flat.t())
+        return torch.nn.functional.cross_entropy(logits, targets_flat, ignore_index=ignore_index).to(h.dtype)
 
-    # Single code path on CUDA: the Function dispatches internally (see note
-    # in triton_cross_entropy wrapper). Keeps the captured region sync-free.
     return _TritonFusedLPCHeadFunc.apply(h, weight, targets, ignore_index)

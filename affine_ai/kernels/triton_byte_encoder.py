@@ -180,14 +180,6 @@ class TritonByteEncoderFunction(torch.autograd.Function):
             g_x = (g_res + g_x_conv).to(embed_w.dtype)
 
             g_embed_w = torch.zeros_like(embed_w)
-            vocab = embed_w.shape[0]
-            capturing = (
-                byte_ids.is_cuda
-                and hasattr(torch.cuda, "is_current_stream_capturing")
-                and torch.cuda.is_current_stream_capturing()
-            )
-            if not capturing and (torch.any(byte_ids >= vocab) or torch.any(byte_ids < 0)):
-                raise ValueError(f"byte_ids OOB: vocab={vocab}, min={int(byte_ids.min())}, max={int(byte_ids.max())}")
             idx = byte_ids.to(torch.int64).view(-1, 1).expand(-1, d_byte)
             g_embed_w.scatter_add_(0, idx, g_x.reshape(-1, d_byte))
         else:
@@ -252,7 +244,8 @@ if triton is not None:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < M
 
-        inv_p = 1.0 / P
+        valid_cnt = tl.maximum(tl.minimum(T - offs_m * P, P), 1)
+        inv_cnt = 1.0 / valid_cnt.to(tl.float32)
         for d_start in range(0, D_DIM, BLOCK_D):
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D_DIM
@@ -265,7 +258,7 @@ if triton is not None:
                 val = tl.load(x_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
                 acc += val
 
-            out = acc * inv_p
+            out = acc * inv_cnt[:, None]
             out_ptrs = Out_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
             tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
@@ -284,13 +277,16 @@ if triton is not None:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < M
 
+        valid_cnt = tl.maximum(tl.minimum(T - offs_m * P, P), 1)
+        inv_cnt = 1.0 / valid_cnt.to(tl.float32)
+
         for d_start in range(0, D_DIM, BLOCK_D):
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D_DIM
 
             out_ptrs = dOut_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
             dout = tl.load(out_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-            scaled_dout = (dout * (1.0 / P)).to(dX_ptr.dtype.element_ty)
+            scaled_dout = (dout * inv_cnt[:, None]).to(dX_ptr.dtype.element_ty)
 
             for p in range(P):
                 t = offs_m * P + p
@@ -307,13 +303,17 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, P: int) -> torch.Tensor:
         x = x.contiguous()
         B, T, D = x.shape
-        if T % P != 0:
-            raise ValueError(
-                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped. Pad to next multiple of P before calling (EntropyPatcher contract)."
-            )
-        M = T // P
+        M = (T + P - 1) // P
         if triton is None or not x.is_cuda or _patch_mean_pool_fwd_kernel is None:
-            out = x.view(B, M, P, D).mean(dim=2)
+            if T % P == 0:
+                out = x.view(B, M, P, D).mean(dim=2)
+            else:
+                pad_len = M * P - T
+                x_padded = F.pad(x, (0, 0, 0, pad_len))
+                x_blocks = x_padded.view(B, M, P, D)
+                counts = torch.full((M,), P, dtype=x.dtype, device=x.device)
+                counts[-1] = T - (M - 1) * P
+                out = x_blocks.sum(dim=2) / counts.view(1, M, 1)
             ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
             ctx.dtype = x.dtype
             ctx._used_triton = False
@@ -336,7 +336,13 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
         dout = dout.contiguous()
         B, T, D, M, P = ctx.B, ctx.T, ctx.D, ctx.M, ctx.P
         if not getattr(ctx, "_used_triton", True) or triton is None or _patch_mean_pool_bwd_kernel is None:
-            dx = torch.repeat_interleave(dout / P, P, dim=1)
+            if T % P == 0:
+                dx = torch.repeat_interleave(dout / P, P, dim=1)
+            else:
+                counts = torch.full((M,), P, dtype=dout.dtype, device=dout.device)
+                counts[-1] = T - (M - 1) * P
+                scaled_dout = dout / counts.view(1, M, 1)
+                dx = torch.repeat_interleave(scaled_dout, P, dim=1)[:, :T, :]
             return dx, None
         dx = torch.empty((B, T, D), device=dout.device, dtype=ctx.dtype)
         BLOCK_M = 8 if M <= 8 else 16
@@ -380,14 +386,19 @@ if triton is not None:
         offs_p = tl.arange(0, P_POW2)
         mask_p = offs_p < P
 
-        l_ptrs = Logits_ptr + pid_b * stride_lb + (offs_m[:, None] * P + offs_p[None, :]) * stride_lt
-        logits = tl.load(l_ptrs, mask=mask_m[:, None] & mask_p[None, :], other=-1e9).to(tl.float32)
+        t_p = offs_m[:, None] * P + offs_p[None, :]
+        mask_valid = mask_m[:, None] & mask_p[None, :] & (t_p < T)
+
+        l_ptrs = Logits_ptr + pid_b * stride_lb + t_p * stride_lt
+        logits = tl.load(l_ptrs, mask=mask_valid, other=-30.0).to(tl.float32)
         logits = tl.clamp(logits, -30.0, 30.0)
+        logits = tl.where(mask_valid, logits, -1e9)
 
         m_l = tl.max(logits, axis=1)
         exp_l = tl.exp(logits - m_l[:, None])
-        exp_l = tl.where(mask_p[None, :], exp_l, 0.0)
+        exp_l = tl.where(mask_valid, exp_l, 0.0)
         sum_exp = tl.sum(exp_l, axis=1)
+        sum_exp = tl.maximum(sum_exp, 1e-6)
         w = exp_l / sum_exp[:, None]
 
         w_ptrs = Weights_ptr + pid_b * stride_wb + offs_m[:, None] * stride_wm + offs_p[None, :] * stride_wp
@@ -399,7 +410,7 @@ if triton is not None:
 
             acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
             for p in range(P):
-                w_p = tl.load(Weights_ptr + pid_b * stride_wb + offs_m * stride_wm + p * stride_wp, mask=mask_m)
+                w_p = tl.sum(tl.where(offs_p[None, :] == p, w, 0.0), axis=1)
                 t = offs_m * P + p
                 mask_t = mask_m & (t < T)
                 x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
@@ -418,17 +429,20 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         x = x.contiguous()
         logits = logits.contiguous()
         B, T, D = x.shape
-        if T % P != 0:
-            raise ValueError(
-                f"T ({T}) must be divisible by patch_size P ({P}); got remainder {T % P} — tail bytes would be silently dropped. Pad to next multiple of P before calling (EntropyPatcher contract)."
-            )
-        M = T // P
+        M = (T + P - 1) // P
         if triton is None or not x.is_cuda or _patch_weighted_pool_fwd_kernel is None:
-            w = torch.softmax(logits.view(B, M, P).float().clamp(-30, 30), dim=-1)
+            if T % P == 0:
+                w = torch.softmax(logits.view(B, M, P).float().clamp(-30, 30), dim=-1)
+                out = (x.view(B, M, P, D).float() * w.unsqueeze(-1)).sum(dim=2).to(x.dtype)
+            else:
+                pad_len = M * P - T
+                logits_padded = F.pad(logits, (0, pad_len), value=-1e9)
+                w = torch.softmax(logits_padded.view(B, M, P).float().clamp(-30, 30), dim=-1)
+                x_padded = F.pad(x, (0, 0, 0, pad_len))
+                out = (x_padded.view(B, M, P, D).float() * w.unsqueeze(-1)).sum(dim=2).to(x.dtype)
             ctx.save_for_backward(x, w.to(torch.float32))
             ctx.B, ctx.T, ctx.D, ctx.M, ctx.P = B, T, D, M, P
             ctx._used_triton = False
-            out = (x.view(B, M, P, D).float() * w.unsqueeze(-1)).sum(dim=2).to(x.dtype)
             return out
         out = torch.empty((B, M, D), device=x.device, dtype=x.dtype)
         P_POW2 = triton.next_power_of_2(P)
@@ -462,12 +476,17 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         else:
             w_fp32 = weights.float()
         w = w_fp32.to(dout.dtype)
-        h_reshaped = x.view(B, M, P, D)
+        pad_len = M * P - T
+        if pad_len > 0:
+            x_pad = F.pad(x, (0, 0, 0, pad_len))
+        else:
+            x_pad = x
+        h_reshaped = x_pad.view(B, M, P, D)
         dout_u = dout.unsqueeze(2)
-        gx = (dout_u * w.unsqueeze(-1)).reshape(B, T, D)
+        gx = (dout_u * w.unsqueeze(-1)).reshape(B, M * P, D)[:, :T, :]
         gw_fp32 = (dout_u.float() * h_reshaped.float()).sum(dim=-1)
         glogits_fp32 = w_fp32 * (gw_fp32 - (w_fp32 * gw_fp32).sum(dim=-1, keepdim=True))
-        glogits = glogits_fp32.to(dout.dtype).reshape(B, T)
+        glogits = glogits_fp32.to(dout.dtype).reshape(B, M * P)[:, :T]
         return gx, glogits, None
 
 

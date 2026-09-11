@@ -18,17 +18,18 @@ import triton.language as tl
 import warnings
 
 
-def _is_turing() -> bool:
+def _is_turing(device=None) -> bool:
     """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
     try:
-        from affine_ai.kernels import _IS_TURING as _T  # type: ignore
+        from affine_ai.kernels import _IS_TURING as _T
 
         return bool(_T)
     except Exception:
         pass
     try:
         if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability()
+            dev = device if device is not None else torch.cuda.current_device()
+            cap = torch.cuda.get_device_capability(dev)
             return (7, 5) <= tuple(cap) < (8, 0)
     except Exception:
         pass
@@ -127,7 +128,7 @@ def _tree_perm_fwd_kernel(
         block_shape=(BLOCK_B, BLOCK_D),
         order=(1, 0),
     )
-    tl.store(y_block_ptr, acc_total, boundary_check=(0, 1))
+    tl.store(y_block_ptr, acc_total.to(Y.dtype.element_ty), boundary_check=(0, 1))
     # Fallback manual (non-contiguous):
     # tl.store(Y + offs_b[:, None] * stride_ym + offs_d[None, :] * stride_yd, acc_total, mask=mask)
 
@@ -149,11 +150,11 @@ def triton_tree_perm_fwd(r_in, w_perm, bias, perms, top_idx, top_w):
     if B * D > 1 << 24:
         warnings.warn(f"large B*D={B*D} may pressure grid y-dimension", stacklevel=2)
     Tk = top_idx.shape[1]
-    if _is_turing() and r_in.dtype == torch.bfloat16:
+    if _is_turing(r_in.device) and r_in.dtype == torch.bfloat16:
         warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_tree_perm_fwd", stacklevel=2)
-    if _is_turing() and w_perm.dtype == torch.bfloat16:
+    if _is_turing(w_perm.device) and w_perm.dtype == torch.bfloat16:
         warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_tree_perm_fwd (w_perm)", stacklevel=2)
-    out = torch.empty((B, D), device=r_in.device, dtype=torch.float32)
+    out = torch.empty((B, D), device=r_in.device, dtype=r_in.dtype)
     grid = lambda META: ((B + META["BLOCK_B"] - 1) // META["BLOCK_B"], (D + META["BLOCK_D"] - 1) // META["BLOCK_D"])
     _tree_perm_fwd_kernel[grid](
         r_in, w_perm, bias, perms, top_idx, top_w, out,
@@ -230,13 +231,11 @@ def _tree_perm_bwd_dprim_kernel(
         # relu6 derivative strict >/< : 0 outside (0,6), 1 inside; matches forward clamp
         mask_relu = (acc > 0.0) & (acc < 6.0)
         dp = go_val * tw[:, None] * tl.where(mask_relu, 1.0, 0.0)
-        # D_PRIM store via block_ptr where possible (contiguous D)
-        # D_PRIM is (B_ROWS, TOPK, D_DIM) — not 2D, keep manual for 3D, but note contiguous D could use make_block_ptr with proper strides
-        tl.store(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd, dp, mask=mask)
+        tl.store(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd, dp.to(D_PRIM.dtype.element_ty), mask=mask)
 
         if STORE_ACT:
             act = tl.minimum(tl.maximum(acc, 0.0), 6.0)
-            tl.store(ACT + offs_b[:, None] * stride_actm + tk * stride_acttk + offs_d[None, :] * stride_actd, act, mask=mask)
+            tl.store(ACT + offs_b[:, None] * stride_actm + tk * stride_acttk + offs_d[None, :] * stride_actd, act.to(ACT.dtype.element_ty), mask=mask)
 
 
 @triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["B_ROWS", "D_DIM"])
@@ -274,7 +273,6 @@ def _tree_perm_bwd_dx_kernel(
             w = tl.load(W + ki[:, None] * stride_wk + p * stride_wp + src * stride_wd, mask=mask & is_valid, other=0.0, eviction_policy="evict_first")
             w = tl.where(is_valid, w, 0.0)
             acc += dp * w
-    # GR store via block_ptr for coalesced contiguous D (stride_grd==1)
     gr_block_ptr = tl.make_block_ptr(
         base=GR,
         shape=(B_ROWS, D_DIM),
@@ -283,8 +281,7 @@ def _tree_perm_bwd_dx_kernel(
         block_shape=(BLOCK_B, BLOCK_D),
         order=(1, 0),
     )
-    tl.store(gr_block_ptr, acc, boundary_check=(0, 1))
-    # fallback manual: tl.store(GR + offs_b[:, None] * stride_grm + offs_d[None, :] * stride_grd, acc, mask=mask)
+    tl.store(gr_block_ptr, acc.to(GR.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -298,14 +295,6 @@ def _tree_perm_bwd_gw_kernel(
     B_ROWS: tl.constexpr, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    """
-    Bwd GW: reduction over B. Grid (K,P,D/BD); B loop is serial because Triton max 3D grid
-    prevents flattening B as 4th dim. Could flatten B*K*P*D tiles into 2D grid with block
-    remapping but added indexing overhead exceeds benefit for typical B<=512; so kept serial
-    with bounded BLOCK_B tiling. Documented alternative: flatten B into grid via
-    pid = pid_b*D_tiles + pid_d with divmod (2D launch) if B>2048.
-    Eviction: P/W evict_first, R evict_last, D_PRIM evict_last.
-    """
     assert BLOCK_B <= 64 and BLOCK_D <= 64
     pid_k = tl.program_id(0)
     pid_p = tl.program_id(1)
@@ -319,19 +308,18 @@ def _tree_perm_bwd_gw_kernel(
     for b_start in range(0, B_ROWS, BLOCK_B):
         offs_b = b_start + tl.arange(0, BLOCK_B)
         mask_b = offs_b < B_ROWS
-        xv = tl.load(R + offs_b[:, None] * stride_rm + p_idx[None, :] * stride_rd, mask=mask_b[:, None] & mask_d[None, :] & is_p_valid[None, :], other=0.0, eviction_policy="evict_last")
+        dp_sum = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
         for tk in range(TOPK):
-            ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=0, eviction_policy="evict_last")
-            ki = tl.where(mask_b, ki, 0)
-            dp = tl.load(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd, mask=mask_b[:, None] & mask_d[None, :], other=0.0, eviction_policy="evict_last")
-            need = ki == pid_k
-            dp = tl.where(need[:, None] & is_p_valid[None, :], dp, 0.0)
-            grad = dp * xv
-            acc += tl.sum(grad, axis=0)
-    # GW is 3D [K,P,D] not 2D block_ptr friendly due to K*P striding; keep manual store
-    # Contiguous D case (stride_gwd==1) would be coalesced via make_block_ptr if reshaped, but fallback manual kept for simplicity
+            ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=-1, eviction_policy="evict_last")
+            match = (ki == pid_k) & mask_b
+            dp = tl.load(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd,
+                         mask=match[:, None] & mask_d[None, :] & is_p_valid[None, :], other=0.0, eviction_policy="evict_last")
+            dp_sum += dp
+        xv = tl.load(R + offs_b[:, None] * stride_rm + p_idx[None, :] * stride_rd,
+                     mask=mask_b[:, None] & mask_d[None, :] & is_p_valid[None, :], other=0.0, eviction_policy="evict_last")
+        acc += tl.sum(dp_sum * xv, axis=0)
     gw_ptrs = GW + pid_k * stride_gwk + pid_p * stride_gwp + offs_d * stride_gwd
-    tl.store(gw_ptrs, acc, mask=mask_d)
+    tl.store(gw_ptrs, acc.to(GW.dtype.element_ty), mask=mask_d)
 
 
 class TritonTreePermFunction(torch.autograd.Function):
@@ -340,13 +328,22 @@ class TritonTreePermFunction(torch.autograd.Function):
         ctx.save_for_backward(r_in, w_perm, bias, perms, top_idx, top_w)
         orig_shape = r_in.shape
         D = orig_shape[-1]
-        r_f = r_in.reshape(-1, D).contiguous().float()
+        dtype = r_in.dtype
+        if _is_turing(r_in.device) and dtype == torch.bfloat16:
+            warnings.warn("Turing sm_75: bf16 not supported, treating as fp16 (acc fp32) in triton_tree_perm", stacklevel=3)
+            r_in = r_in.half()
+            w_perm = w_perm.half()
+            if isinstance(bias, torch.Tensor):
+                bias = bias.half()
+            top_w = top_w.half()
+            dtype = torch.float16
+        r_f = r_in.reshape(-1, D).contiguous()
         top_idx_f = top_idx.reshape(-1, top_idx.shape[-1]).contiguous().to(torch.int32)
-        top_w_f = top_w.reshape(-1, top_w.shape[-1]).contiguous().float()
+        top_w_f = top_w.reshape(-1, top_w.shape[-1]).contiguous().to(dtype)
         out = triton_tree_perm_fwd(
             r_f,
-            w_perm.detach().float().contiguous(),
-            bias.detach().float().contiguous(),
+            w_perm.detach().to(dtype).contiguous(),
+            bias.detach().to(dtype).contiguous() if isinstance(bias, torch.Tensor) else torch.zeros((w_perm.shape[0], D), device=r_in.device, dtype=dtype),
             perms.detach().to(torch.int32).contiguous(),
             top_idx_f,
             top_w_f,
@@ -361,22 +358,22 @@ class TritonTreePermFunction(torch.autograd.Function):
         r_in, w_perm, bias, perms, top_idx, top_w = ctx.saved_tensors
         orig_shape = r_in.shape
         D = orig_shape[-1]
-        r_flat = r_in.reshape(-1, D).contiguous().float()
+        dtype = r_in.dtype
+        r_flat = r_in.reshape(-1, D).contiguous()
         B_flat = r_flat.shape[0]
         K, P, _ = w_perm.shape
         Tk = top_idx.shape[-1]
         top_idx_flat = top_idx.reshape(B_flat, Tk).contiguous().to(torch.int32)
-        top_w_flat = top_w.reshape(B_flat, Tk).contiguous().float()
-        go_flat = grad_output.reshape(B_flat, D).contiguous().float()
+        top_w_flat = top_w.reshape(B_flat, Tk).contiguous().to(dtype)
+        go_flat = grad_output.reshape(B_flat, D).contiguous().to(dtype)
 
-        w_perm_f = w_perm.detach().float().contiguous()
-        bias_f = bias.detach().float().contiguous() if isinstance(bias, torch.Tensor) else torch.zeros((K, D), device=r_in.device, dtype=torch.float32)
+        w_perm_f = w_perm.detach().to(dtype).contiguous()
+        bias_f = bias.detach().to(dtype).contiguous() if isinstance(bias, torch.Tensor) else torch.zeros((K, D), device=r_in.device, dtype=dtype)
         perms_f = perms.detach().to(torch.int32).contiguous()
 
-        # d_prim reused by gr/gw/gb; fusing would 3x leaf-prim recompute (P*D gathers) for ~B*T*D memory saved
-        d_prim = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=torch.float32)
+        d_prim = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=dtype)
         store_act = ctx.needs_input_grad[5]
-        act = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=torch.float32) if store_act else torch.empty(0, device=r_flat.device, dtype=torch.float32)
+        act = torch.empty((B_flat, Tk, D), device=r_flat.device, dtype=dtype) if store_act else torch.empty(0, device=r_flat.device, dtype=dtype)
 
         grid = lambda META: ((B_flat + META["BLOCK_B"] - 1) // META["BLOCK_B"], (D + META["BLOCK_D"] - 1) // META["BLOCK_D"])
 
@@ -404,22 +401,19 @@ class TritonTreePermFunction(torch.autograd.Function):
         gb = None
         if ctx.needs_input_grad[2] and isinstance(bias, torch.Tensor):
             flat_k = top_idx_flat.reshape(-1).long()
-            # Duplicate k in topk: index_add_ sums correctly; order nondeterministic but sum deterministic
-            if __debug__ and flat_k.numel() > 0:
-                # Optional debug assert for duplicate detection (no-op if unique)
-                pass  # duplicates sum; to enforce uniqueness: assert flat_k.unique().numel() == flat_k.numel()
-            gb = torch.zeros(bias.shape, dtype=torch.float32, device=bias.device)
+            gb = torch.zeros(bias.shape, dtype=dtype, device=bias.device)
             gb.index_add_(0, flat_k, d_prim.reshape(-1, D))
             gb = gb.to(bias.dtype)
 
         gw = None
         if ctx.needs_input_grad[1]:
-            gw = torch.zeros(w_perm.shape, dtype=torch.float32, device=w_perm.device)
-            BD_GW = 32
-            BM_GW = 32
-            if _is_turing():
-                BD_GW = min(BD_GW, 64)
-                BM_GW = min(BM_GW, 64)
+            gw = torch.zeros(w_perm.shape, dtype=dtype, device=w_perm.device)
+            BD_GW = 64
+            BM_GW = 64
+            if _is_turing(r_in.device):
+                BD_GW = 32
+                BM_GW = 32
+            num_warps_gw = max(1, min(4, BD_GW // 32))
             grid_gw = (K, P, (D + BD_GW - 1) // BD_GW)
             _tree_perm_bwd_gw_kernel[grid_gw](
                 d_prim, r_flat, perms_f, top_idx_flat, gw,
@@ -429,14 +423,20 @@ class TritonTreePermFunction(torch.autograd.Function):
                 top_idx_flat.stride(0), top_idx_flat.stride(1),
                 gw.stride(0), gw.stride(1), gw.stride(2),
                 B_flat, D, P, Tk,
-                BLOCK_B=BM_GW, BLOCK_D=BD_GW, num_warps=4,
+                BLOCK_B=BM_GW, BLOCK_D=BD_GW, num_warps=num_warps_gw,
             )
             gw = gw.to(w_perm.dtype)
 
         gr = None
         if ctx.needs_input_grad[0]:
-            gr_flat = torch.zeros((B_flat, D), dtype=torch.float32, device=r_flat.device)
-            inv_perms_f = torch.argsort(perms_f, dim=-1).to(torch.int32).contiguous()
+            gr_flat = torch.zeros((B_flat, D), dtype=dtype, device=r_flat.device)
+            # Sentinel -1 (missing edge) inversion via scatter to dummy slot at D (Issue 13)
+            temp = torch.full((K, P, D + 1), -1, device=perms_f.device, dtype=torch.int32)
+            valid_mask = (perms_f >= 0) & (perms_f < D)
+            target = torch.where(valid_mask, perms_f.long(), torch.tensor(D, device=perms_f.device, dtype=torch.long))
+            arange_d = torch.arange(D, device=perms_f.device, dtype=torch.int32).expand_as(perms_f)
+            temp.scatter_(-1, target, arange_d)
+            inv_perms_f = temp[..., :D].contiguous()
             _tree_perm_bwd_dx_kernel[grid](
                 d_prim, w_perm_f, inv_perms_f, top_idx_flat, gr_flat,
                 d_prim.stride(0), d_prim.stride(1), d_prim.stride(2),

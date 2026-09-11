@@ -18,7 +18,6 @@ import triton.language as tl
 def _is_turing() -> bool:
     try:
         from affine_ai.kernels import _IS_TURING as _T  # type: ignore
-            # noqa: E501
         return bool(_T)
     except Exception:
         pass
@@ -42,19 +41,27 @@ def _prune_swa_configs(configs, named_args, **kwargs):
             min_block = min(c.kwargs["BLOCK_D"] for c in valid)
             configs = [c for c in configs if c.kwargs["BLOCK_D"] == min_block]
     if _is_turing():
-        pruned = [c for c in configs if c.kwargs.get("BLOCK_D", 64) <= 64 and c.num_warps <= 4]
+        pruned = [
+            c
+            for c in configs
+            if c.kwargs.get("BLOCK_D", 64) <= 64
+            and c.kwargs.get("BLOCK_M", 64) <= 32
+            and c.num_warps <= 4
+        ]
         if pruned:
             return pruned
     return configs
 
 
 _SWA_CONFIGS = [
-    triton.Config({"BLOCK_D": 32}, num_warps=2, num_stages=2),
-    triton.Config({"BLOCK_D": 32}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_D": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_D": 256}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_D": 32}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_D": 128}, num_warps=4, num_stages=2),
 ]
 
 
@@ -65,132 +72,348 @@ _SWA_CONFIGS = [
 )
 @triton.jit
 def _swa_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr, Out_ptr,
+    Q_ptr, K_ptr, V_ptr, Out_ptr, LSE_ptr,
     stride_qb, stride_qt, stride_qd,
     stride_kb, stride_kt, stride_kd,
     stride_vb, stride_vt, stride_vd,
     stride_ob, stride_ot, stride_od,
+    stride_lb, stride_lt,
     T, D,
     WINDOW: tl.constexpr,
     SINK: tl.constexpr,
     SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """
-    One program per query position (bh, t).
-    Grid: (BH, T)
-    Q/K/V shape: (BH, T, D) contiguous: stride_b = T*D, stride_t = D, stride_d = 1
-    Handles arbitrary BH via pid_bh, arbitrary T via pid_t.
-    WINDOW constexpr, SINK constexpr bool.
-    """
-    pid_bh = tl.program_id(0)
-    pid_t = tl.program_id(1)
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_bh = tl.program_id(1).to(tl.int64)
+    T_i64 = T.to(tl.int64)
 
-    # Guard tail: non-divisible T handled via mask, but grid ensures pid_t < T via Python launch
-    # However we still guard if T not multiple of BLOCK_T=1, caller ensures cdiv.
-    if pid_t >= T:
-        return
-
-    offs_d = tl.arange(0, BLOCK_D)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
+    mask_m = offs_m < T_i64
     mask_d = offs_d < D
 
-    # Load q vector for this position
-    q_ptrs = Q_ptr + pid_bh * stride_qb + pid_t * stride_qt + offs_d * stride_qd
-    q = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+    q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
-    if SINK:
-        lo_candidate = pid_t - WINDOW + 1
-        if lo_candidate < 1:
-            lo = 1
-        else:
-            lo = lo_candidate
-    else:
-        lo_candidate = pid_t - WINDOW + 1
-        if lo_candidate < 0:
-            lo = 0
-        else:
-            lo = lo_candidate
+    m_i = tl.full([BLOCK_M], -1e30, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    m_val = -1e30
+    m_start = pid_m * BLOCK_M
+    win_lo = m_start - WINDOW + 1
+    zero_i64 = tl.zeros([], dtype=tl.int64)
+    need_sep_sink = SINK and (win_lo > 1)
 
-    if SINK:
+    if need_sep_sink:
         k0_ptrs = K_ptr + pid_bh * stride_kb + 0 * stride_kt + offs_d * stride_kd
         k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-        dot0 = tl.sum(q * k0, axis=0) * SCALE
-        m_val = tl.maximum(m_val, dot0)
-
-    for w in range(WINDOW):
-        j = pid_t - w
-        if j >= lo:
-            if SINK:
-                if j != 0:
-                    k_ptrs = K_ptr + pid_bh * stride_kb + j * stride_kt + offs_d * stride_kd
-                    k = tl.load(k_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-                    dot = tl.sum(q * k, axis=0) * SCALE
-                    m_val = tl.maximum(m_val, dot)
-            else:
-                k_ptrs = K_ptr + pid_bh * stride_kb + j * stride_kt + offs_d * stride_kd
-                k = tl.load(k_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-                dot = tl.sum(q * k, axis=0) * SCALE
-                m_val = tl.maximum(m_val, dot)
-
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    l_sum = 0.0
-
-    if SINK:
-        k0_ptrs = K_ptr + pid_bh * stride_kb + 0 * stride_kt + offs_d * stride_kd
-        k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-        dot0 = tl.sum(q * k0, axis=0) * SCALE
-        e0 = tl.exp(dot0 - m_val)
-        l_sum += e0
+        dot0 = tl.sum(q * k0[None, :], axis=1) * SCALE
+        m_i = tl.where(mask_m, dot0, -1e30)
+        l_i = tl.where(mask_m, 1.0, 0.0)
         v0_ptrs = V_ptr + pid_bh * stride_vb + 0 * stride_vt + offs_d * stride_vd
         v0 = tl.load(v0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-        acc += e0 * v0
+        acc = tl.where(mask_m[:, None], v0[None, :], 0.0)
+        k_start = (win_lo // BLOCK_N) * BLOCK_N
+    else:
+        k_start = zero_i64
 
-    for w in range(WINDOW):
-        j = pid_t - w
-        if j >= lo:
-            if SINK:
-                if j != 0:
-                    k_ptrs = K_ptr + pid_bh * stride_kb + j * stride_kt + offs_d * stride_kd
-                    k = tl.load(k_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-                    dot = tl.sum(q * k, axis=0) * SCALE
-                    e = tl.exp(dot - m_val)
-                    l_sum += e
-                    v_ptrs = V_ptr + pid_bh * stride_vb + j * stride_vt + offs_d * stride_vd
-                    v = tl.load(v_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-                    acc += e * v
+    k_end = tl.minimum(T_i64, (pid_m + 1) * BLOCK_M)
+    for n_start in range(k_start, k_end, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
+        mask_n = offs_n < T_i64
+
+        k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+        v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+        s = tl.dot(q, tl.trans(k), allow_tf32=False) * SCALE
+
+        if SINK:
+            if need_sep_sink:
+                attn_mask = (
+                    mask_m[:, None]
+                    & mask_n[None, :]
+                    & (offs_n[None, :] <= offs_m[:, None])
+                    & (offs_n[None, :] > offs_m[:, None] - WINDOW)
+                    & (offs_n[None, :] >= 1)
+                )
             else:
-                k_ptrs = K_ptr + pid_bh * stride_kb + j * stride_kt + offs_d * stride_kd
-                k = tl.load(k_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-                dot = tl.sum(q * k, axis=0) * SCALE
-                e = tl.exp(dot - m_val)
-                l_sum += e
-                v_ptrs = V_ptr + pid_bh * stride_vb + j * stride_vt + offs_d * stride_vd
-                v = tl.load(v_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-                acc += e * v
+                attn_mask = (
+                    mask_m[:, None]
+                    & mask_n[None, :]
+                    & (offs_n[None, :] <= offs_m[:, None])
+                    & (
+                        (offs_n[None, :] > offs_m[:, None] - WINDOW)
+                        | (offs_n[None, :] == 0)
+                    )
+                )
+        else:
+            attn_mask = (
+                mask_m[:, None]
+                & mask_n[None, :]
+                & (offs_n[None, :] <= offs_m[:, None])
+                & (offs_n[None, :] > offs_m[:, None] - WINDOW)
+            )
 
-    # Normalize
-    # l_sum >0 because at least self is visible
-    out = acc / l_sum
+        s = tl.where(attn_mask, s, -1e30)
+        chunk_max = tl.max(s, axis=1)
+        m_new = tl.maximum(m_i, chunk_max)
 
-    out_ptrs = Out_ptr + pid_bh * stride_ob + pid_t * stride_ot + offs_d * stride_od
-    tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_d)
+        alpha = tl.where(m_i > -1e20, tl.exp(m_i - m_new), 0.0)
+        p = tl.where(attn_mask, tl.exp(s - m_new[:, None]), 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None] + tl.dot(p, v, allow_tf32=False)
+        m_i = m_new
+        l_i = l_new
+
+    inv_l = 1.0 / tl.maximum(l_i, 1e-12)
+    out = acc * inv_l[:, None]
+
+    out_ptrs = Out_ptr + pid_bh * stride_ob + offs_m[:, None] * stride_ot + offs_d[None, :] * stride_od
+    tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+
+    lse = tl.where(mask_m, m_i + tl.log(tl.maximum(l_i, 1e-12)), -1e30)
+    lse_ptrs = LSE_ptr + pid_bh * stride_lb + offs_m * stride_lt
+    tl.store(lse_ptrs, lse, mask=mask_m)
+
+
+@triton.autotune(
+    configs=_SWA_CONFIGS,
+    key=["D"],
+    prune_configs_by={"early_config_prune": _prune_swa_configs},
+)
+@triton.jit
+def _swa_bwd_dq_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, LSE_ptr, Delta_ptr, dQ_ptr,
+    stride_qb, stride_qt, stride_qd,
+    stride_kb, stride_kt, stride_kd,
+    stride_vb, stride_vt, stride_vd,
+    stride_dob, stride_dot, stride_dod,
+    stride_lb, stride_lt,
+    stride_delb, stride_delt,
+    stride_dqb, stride_dqt, stride_dqd,
+    T, D,
+    WINDOW: tl.constexpr,
+    SINK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_bh = tl.program_id(1).to(tl.int64)
+    T_i64 = T.to(tl.int64)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
+    mask_m = offs_m < T_i64
+    mask_d = offs_d < D
+
+    q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+    do_ptrs = dO_ptr + pid_bh * stride_dob + offs_m[:, None] * stride_dot + offs_d[None, :] * stride_dod
+    do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+    lse_ptrs = LSE_ptr + pid_bh * stride_lb + offs_m * stride_lt
+    lse = tl.load(lse_ptrs, mask=mask_m, other=0.0)
+
+    delta_ptrs = Delta_ptr + pid_bh * stride_delb + offs_m * stride_delt
+    delta = tl.load(delta_ptrs, mask=mask_m, other=0.0)
+
+    dq = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+    m_start = pid_m * BLOCK_M
+    win_lo = m_start - WINDOW + 1
+    zero_i64 = tl.zeros([], dtype=tl.int64)
+    need_sep_sink = SINK and (win_lo > 1)
+
+    if need_sep_sink:
+        k0_ptrs = K_ptr + pid_bh * stride_kb + 0 * stride_kt + offs_d * stride_kd
+        k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+        v0_ptrs = V_ptr + pid_bh * stride_vb + 0 * stride_vt + offs_d * stride_vd
+        v0 = tl.load(v0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+        s0 = tl.sum(q * k0[None, :], axis=1) * SCALE
+        p0 = tl.where(mask_m, tl.exp(s0 - lse), 0.0)
+        dp0 = tl.sum(do * v0[None, :], axis=1)
+        ds0 = p0 * (dp0 - delta) * SCALE
+        dq += ds0[:, None] * k0[None, :]
+        k_start = (win_lo // BLOCK_N) * BLOCK_N
+    else:
+        k_start = zero_i64
+
+    k_end = tl.minimum(T_i64, (pid_m + 1) * BLOCK_M)
+    for n_start in range(k_start, k_end, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
+        mask_n = offs_n < T_i64
+
+        k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+        v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+        s = tl.dot(q, tl.trans(k), allow_tf32=False) * SCALE
+
+        if SINK:
+            if need_sep_sink:
+                attn_mask = (
+                    mask_m[:, None]
+                    & mask_n[None, :]
+                    & (offs_n[None, :] <= offs_m[:, None])
+                    & (offs_n[None, :] > offs_m[:, None] - WINDOW)
+                    & (offs_n[None, :] >= 1)
+                )
+            else:
+                attn_mask = (
+                    mask_m[:, None]
+                    & mask_n[None, :]
+                    & (offs_n[None, :] <= offs_m[:, None])
+                    & (
+                        (offs_n[None, :] > offs_m[:, None] - WINDOW)
+                        | (offs_n[None, :] == 0)
+                    )
+                )
+        else:
+            attn_mask = (
+                mask_m[:, None]
+                & mask_n[None, :]
+                & (offs_n[None, :] <= offs_m[:, None])
+                & (offs_n[None, :] > offs_m[:, None] - WINDOW)
+            )
+
+        p = tl.where(attn_mask, tl.exp(s - lse[:, None]), 0.0)
+        dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+        ds = p * (dp - delta[:, None]) * SCALE
+        dq += tl.dot(ds, k, allow_tf32=False)
+
+    dq_ptrs = dQ_ptr + pid_bh * stride_dqb + offs_m[:, None] * stride_dqt + offs_d[None, :] * stride_dqd
+    tl.store(dq_ptrs, dq.to(dQ_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+
+
+@triton.autotune(
+    configs=_SWA_CONFIGS,
+    key=["D"],
+    prune_configs_by={"early_config_prune": _prune_swa_configs},
+)
+@triton.jit
+def _swa_bwd_dkv_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, LSE_ptr, Delta_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qt, stride_qd,
+    stride_kb, stride_kt, stride_kd,
+    stride_vb, stride_vt, stride_vd,
+    stride_dob, stride_dot, stride_dod,
+    stride_lb, stride_lt,
+    stride_delb, stride_delt,
+    stride_dkb, stride_dkt, stride_dkd,
+    stride_dvb, stride_dvt, stride_dvd,
+    T, D,
+    WINDOW: tl.constexpr,
+    SINK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_n = tl.program_id(0).to(tl.int64)
+    pid_bh = tl.program_id(1).to(tl.int64)
+    T_i64 = T.to(tl.int64)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
+    mask_n = offs_n < T_i64
+    mask_d = offs_d < D
+
+    k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
+    k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+    v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+    v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+    dk = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+
+    n_start = pid_n * BLOCK_N
+    zero_i64 = tl.zeros([], dtype=tl.int64)
+    if pid_n == 0 and SINK:
+        q_start = zero_i64
+        q_end = T_i64
+    else:
+        q_start = (n_start // BLOCK_M) * BLOCK_M
+        n_max = (pid_n + 1) * BLOCK_N - 1
+        q_end = tl.minimum(T_i64, ((n_max + WINDOW + BLOCK_M - 1) // BLOCK_M) * BLOCK_M)
+
+    for m_start in range(q_start, q_end, BLOCK_M):
+        offs_m = m_start + tl.arange(0, BLOCK_M).to(tl.int64)
+        mask_m = offs_m < T_i64
+
+        q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+        do_ptrs = dO_ptr + pid_bh * stride_dob + offs_m[:, None] * stride_dot + offs_d[None, :] * stride_dod
+        do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+
+        lse_ptrs = LSE_ptr + pid_bh * stride_lb + offs_m * stride_lt
+        lse = tl.load(lse_ptrs, mask=mask_m, other=0.0)
+
+        delta_ptrs = Delta_ptr + pid_bh * stride_delb + offs_m * stride_delt
+        delta = tl.load(delta_ptrs, mask=mask_m, other=0.0)
+
+        s = tl.dot(k, tl.trans(q), allow_tf32=False) * SCALE
+
+        if SINK:
+            attn_mask = (
+                mask_n[:, None]
+                & mask_m[None, :]
+                & (offs_n[:, None] <= offs_m[None, :])
+                & (
+                    (offs_n[:, None] > offs_m[None, :] - WINDOW)
+                    | (offs_n[:, None] == 0)
+                )
+            )
+        else:
+            attn_mask = (
+                mask_n[:, None]
+                & mask_m[None, :]
+                & (offs_n[:, None] <= offs_m[None, :])
+                & (offs_n[:, None] > offs_m[None, :] - WINDOW)
+            )
+
+        p = tl.where(attn_mask, tl.exp(s - lse[None, :]), 0.0)
+        dp = tl.dot(v, tl.trans(do), allow_tf32=False)
+        ds = p * (dp - delta[None, :]) * SCALE
+
+        dk += tl.dot(ds, q, allow_tf32=False)
+        dv += tl.dot(p, do, allow_tf32=False)
+
+    dk_ptrs = dK_ptr + pid_bh * stride_dkb + offs_n[:, None] * stride_dkt + offs_d[None, :] * stride_dkd
+    tl.store(dk_ptrs, dk.to(dK_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+
+    dv_ptrs = dV_ptr + pid_bh * stride_dvb + offs_n[:, None] * stride_dvt + offs_d[None, :] * stride_dvd
+    tl.store(dv_ptrs, dv.to(dV_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
 
 # ---------------------------------------------------------------------------
-# Eager reference (for backward and CPU fallback)
+# Eager reference (for CPU fallback)
 # ---------------------------------------------------------------------------
 
-def _eager_swa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int, sink: bool = True, scale: Optional[float] = None) -> torch.Tensor:
-    """
-    Eager SWA reference: q/k/v shape (B, H, T, D) or (BH, T, D).
-    Returns same shape as q.
-    """
-    # Normalize to 4D for mask logic, then restore
+def _eager_swa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window: int,
+    sink: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
     orig_is_4d = q.ndim == 4
     if q.ndim == 3:
-        # (BH, T, D) -> (1, BH, T, D) for uniform handling, then squeeze
         q4 = q.unsqueeze(0)
         k4 = k.unsqueeze(0)
         v4 = v.unsqueeze(0)
@@ -211,22 +434,24 @@ def _eager_swa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int, s
     qi = torch.arange(T, device=device)
     kj = torch.arange(T, device=device)
     if sink:
-        lo = torch.clamp(qi - window + 1, min=1).unsqueeze(1)  # [T,1]
+        lo = torch.clamp(qi - window + 1, min=1).unsqueeze(1)
         window_mask = (kj.unsqueeze(0) >= lo) & (kj.unsqueeze(0) <= qi.unsqueeze(1))
         sink_mask = (kj.unsqueeze(0) == 0).expand(T, T)
-        # For pid_t=0, window_mask has no valid j>=1, sink covers 0
         mask = window_mask | sink_mask
-        # But for pid_t=0, window_mask incorrectly has no entries, sink gives 0 => correct.
-        # For pid_t where lo=1, window_mask excludes 0, sink adds it.
     else:
         mask = (kj.unsqueeze(0) <= qi.unsqueeze(1)) & (kj.unsqueeze(0) > (qi - window).unsqueeze(1))
 
-    # mask shape [T, T] -> [1,1,T,T] broadcast to [B,H,T,T]
-    # Use scaled_dot_product_attention with is_causal=False and attn_mask
-    # mask True = allowed
-    y = torch.nn.functional.scaled_dot_product_attention(
-        q4, k4, v4, attn_mask=mask, is_causal=False, scale=scale
-    )
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel(SDPBackend.MATH):
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q4, k4, v4, attn_mask=mask, is_causal=False, scale=scale
+            )
+    except Exception:
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q4, k4, v4, attn_mask=mask, is_causal=False, scale=scale
+        )
+
     if was_3d:
         return y.squeeze(0)
     return y
@@ -234,49 +459,48 @@ def _eager_swa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int, s
 
 class _SlidingWindowAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int, sink: bool, scale: Optional[float]):
-        # Save for backward (eager recompute)
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        window: int,
+        sink: bool,
+        scale: Optional[float],
+    ):
         ctx.window = window
         ctx.sink = sink
         ctx.scale = scale
-        # Need to save q/k/v for grad; also need to know if they require grad
-        # Save detached copies to avoid holding graph? Use save_for_backward with original tensors
-        ctx.save_for_backward(q, k, v)
-        # If not CUDA or triton unavailable, use eager
-        # Check that caller already gated, but double-check
+
         if not q.is_cuda:
+            ctx.save_for_backward(q, k, v)
+            ctx.is_cuda = False
             return _eager_swa(q, k, v, window, sink, scale)
 
-        # Try triton path; on any exception fallback to eager (will be handled by caller, but also here)
-        # Assume q/k/v are contiguous; if not, make contiguous (no graph impact for forward)
-        # We cannot call .item() or sync here.
         B, H, T, D = q.shape
         BH = B * H
-        # Flatten to (BH, T, D) contiguous for simple strides
         q_ = q.reshape(BH, T, D).contiguous()
         k_ = k.reshape(BH, T, D).contiguous()
         v_ = v.reshape(BH, T, D).contiguous()
         out_ = torch.empty_like(q_)
+        lse_ = torch.empty((BH, T), device=q.device, dtype=torch.float32)
 
         if scale is None:
             scale_val = 1.0 / math.sqrt(D)
         else:
             scale_val = float(scale)
 
-        # Determine BLOCK_D via next_power_of_2
-        # Autotune will pick appropriate BLOCK_D; we pass D and let autotune select.
-        # Grid: (BH, T)
-        grid = (BH, T)
+        def grid(META):
+            return (triton.cdiv(T, META["BLOCK_M"]), BH)
 
-        # Launch kernel; SINK as constexpr bool (int 0/1)
-        # WINDOW as constexpr, SCALE as constexpr float
         try:
             _swa_fwd_kernel[grid](
-                q_, k_, v_, out_,
+                q_, k_, v_, out_, lse_,
                 q_.stride(0), q_.stride(1), q_.stride(2),
                 k_.stride(0), k_.stride(1), k_.stride(2),
                 v_.stride(0), v_.stride(1), v_.stride(2),
                 out_.stride(0), out_.stride(1), out_.stride(2),
+                lse_.stride(0), lse_.stride(1),
                 T, D,
                 WINDOW=window,
                 SINK=sink,
@@ -284,21 +508,21 @@ class _SlidingWindowAttnFunc(torch.autograd.Function):
             )
         except Exception as e:
             warnings.warn(f"Triton SWA forward failed ({e}), falling back to eager", stacklevel=2)
+            ctx.save_for_backward(q, k, v)
+            ctx.is_cuda = False
             return _eager_swa(q, k, v, window, sink, scale)
 
+        ctx.save_for_backward(q_, k_, v_, out_, lse_)
+        ctx.is_cuda = True
+        ctx.shape = (B, H, T, D)
         return out_.view(B, H, T, D)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        q, k, v = ctx.saved_tensors
         window = ctx.window
         sink = ctx.sink
         scale = ctx.scale
 
-        # Recompute eager with grad enabled
-        # Use torch.autograd.grad to get grads w.r.t q,k,v
-        # This is correct but recomputes O(T^2) anyway; training still gets correct grads.
-        # No host sync beyond Python ints.
         need_q = ctx.needs_input_grad[0]
         need_k = ctx.needs_input_grad[1]
         need_v = ctx.needs_input_grad[2]
@@ -306,41 +530,92 @@ class _SlidingWindowAttnFunc(torch.autograd.Function):
         if not (need_q or need_k or need_v):
             return None, None, None, None, None, None
 
-        # Detach and require grad for eager recompute
-        # Preserve dtype and device
-        with torch.enable_grad():
-            q_req = q.detach().requires_grad_(need_q)
-            k_req = k.detach().requires_grad_(need_k)
-            v_req = v.detach().requires_grad_(need_v)
-            # Ensure they are leaf
-            out = _eager_swa(q_req, k_req, v_req, window, sink, scale)
-            grads = torch.autograd.grad(
-                out, (q_req, k_req, v_req) if (need_q or need_k or need_v) else (),
-                grad_output,
-                allow_unused=True,
-                retain_graph=False,
-            )
-        # Map grads to outputs; grads tuple may contain None
-        # torch.autograd.grad returns tuple in order of inputs that required grad
-        # But we passed only those that need grad? Simpler: always pass all three and filter
-        # Instead we did conditional, so need to unpack.
-        # Easier: compute with all three always, then mask
-        # Redo if we need distinct handling
-        # The above grads order corresponds to (q_req, k_req, v_req) filtered
-        # To avoid complexity, recompute with all three
-        # If any None, we need to align
-        # Simpler approach: call grad with list of all that need grad, then fill
+        if not getattr(ctx, "is_cuda", False):
+            q, k, v = ctx.saved_tensors[:3]
+            with torch.enable_grad():
+                q_req = q.detach().requires_grad_(need_q)
+                k_req = k.detach().requires_grad_(need_k)
+                v_req = v.detach().requires_grad_(need_v)
+                out = _eager_swa(q_req, k_req, v_req, window, sink, scale)
+                grads = torch.autograd.grad(
+                    out,
+                    [t for t, need in [(q_req, need_q), (k_req, need_k), (v_req, need_v)] if need],
+                    grad_output,
+                    allow_unused=True,
+                )
+            grad_q = grad_k = grad_v = None
+            idx = 0
+            if need_q:
+                grad_q = grads[idx]
+                idx += 1
+            if need_k:
+                grad_k = grads[idx]
+                idx += 1
+            if need_v:
+                grad_v = grads[idx]
+                idx += 1
+            return grad_q, grad_k, grad_v, None, None, None
+
+        q_, k_, v_, out_, lse_ = ctx.saved_tensors
+        BH, T, D = q_.shape
+        B, H = ctx.shape[0], ctx.shape[1]
+
+        if scale is None:
+            scale_val = 1.0 / math.sqrt(D)
+        else:
+            scale_val = float(scale)
+
+        do_ = grad_output.reshape(BH, T, D).contiguous()
+        delta_ = (do_.float() * out_.float()).sum(dim=-1).contiguous()
+
         grad_q = grad_k = grad_v = None
-        idx = 0
+
         if need_q:
-            grad_q = grads[idx]
-            idx += 1
-        if need_k:
-            grad_k = grads[idx]
-            idx += 1
-        if need_v:
-            grad_v = grads[idx]
-            idx += 1
+            dq_ = torch.empty_like(q_)
+            def grid_dq(META):
+                return (triton.cdiv(T, META["BLOCK_M"]), BH)
+
+            _swa_bwd_dq_kernel[grid_dq](
+                q_, k_, v_, do_, lse_, delta_, dq_,
+                q_.stride(0), q_.stride(1), q_.stride(2),
+                k_.stride(0), k_.stride(1), k_.stride(2),
+                v_.stride(0), v_.stride(1), v_.stride(2),
+                do_.stride(0), do_.stride(1), do_.stride(2),
+                lse_.stride(0), lse_.stride(1),
+                delta_.stride(0), delta_.stride(1),
+                dq_.stride(0), dq_.stride(1), dq_.stride(2),
+                T, D,
+                WINDOW=window,
+                SINK=sink,
+                SCALE=scale_val,
+            )
+            grad_q = dq_.view(B, H, T, D)
+
+        if need_k or need_v:
+            dk_ = torch.empty_like(k_)
+            dv_ = torch.empty_like(v_)
+            def grid_dkv(META):
+                return (triton.cdiv(T, META["BLOCK_N"]), BH)
+
+            _swa_bwd_dkv_kernel[grid_dkv](
+                q_, k_, v_, do_, lse_, delta_, dk_, dv_,
+                q_.stride(0), q_.stride(1), q_.stride(2),
+                k_.stride(0), k_.stride(1), k_.stride(2),
+                v_.stride(0), v_.stride(1), v_.stride(2),
+                do_.stride(0), do_.stride(1), do_.stride(2),
+                lse_.stride(0), lse_.stride(1),
+                delta_.stride(0), delta_.stride(1),
+                dk_.stride(0), dk_.stride(1), dk_.stride(2),
+                dv_.stride(0), dv_.stride(1), dv_.stride(2),
+                T, D,
+                WINDOW=window,
+                SINK=sink,
+                SCALE=scale_val,
+            )
+            if need_k:
+                grad_k = dk_.view(B, H, T, D)
+            if need_v:
+                grad_v = dv_.view(B, H, T, D)
 
         return grad_q, grad_k, grad_v, None, None, None
 
@@ -357,7 +632,7 @@ def sliding_window_attn(
     Sliding-window causal attention with optional sink token.
 
     Args:
-        q, k, v: shape (B, H, T, D) with same dtype/device. D <= 128 supported.
+        q, k, v: shape (B, H, T, D) with same dtype/device.
                  Also accepts (BH, T, D) 3D.
         window: window size W (int)
         sink: if True, position 0 is always visible (attend to 0 plus window [max(1,t-W+1)..t])
@@ -365,41 +640,29 @@ def sliding_window_attn(
 
     Returns:
         Tensor same shape as q.
-
-    Notes:
-        CUDA-graph safe: no .item(), no host-device sync in capture path.
-        Backward uses eager SDPA recompute for correctness (verified via gradcheck).
     """
     if q.ndim not in (3, 4):
         raise ValueError(f"q must be 3D or 4D, got {q.shape}")
     if q.shape != k.shape or q.shape != v.shape:
         raise ValueError(f"q/k/v shape mismatch: {q.shape} vs {k.shape} vs {v.shape}")
 
-    # CPU fallback directly to eager
     if not q.is_cuda:
         return _eager_swa(q, k, v, window, sink, scale)
 
-    # Dtype guard: only fp16/bf16/fp32 on CUDA; fallback to eager for other dtypes
     if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        warnings.warn(f"SWA Triton supports fp16/bf16/fp32, got {q.dtype}, falling back to eager", stacklevel=2)
+        warnings.warn(
+            f"SWA Triton supports fp16/bf16/fp32, got {q.dtype}, falling back to eager",
+            stacklevel=2,
+        )
         return _eager_swa(q, k, v, window, sink, scale)
 
-    # If triton not available, eager
     try:
         import triton  # noqa: F401
     except Exception:
         return _eager_swa(q, k, v, window, sink, scale)
 
-    # Check D limit: kernel supports D <=128 (BLOCK_D max 128). Larger D fallback
-    D = q.shape[-1]
-    if D > 128:
-        warnings.warn(f"SWA Triton D={D} >128, falling back to eager", stacklevel=2)
-        return _eager_swa(q, k, v, window, sink, scale)
-
-    # For 3D case, unsqueeze to 4D for Function, then squeeze
     was_3d = q.ndim == 3
     if was_3d:
-        # (BH, T, D) -> (BH,1,T,D) -> treat B=BH, H=1
         q4 = q.unsqueeze(1)
         k4 = k.unsqueeze(1)
         v4 = v.unsqueeze(1)

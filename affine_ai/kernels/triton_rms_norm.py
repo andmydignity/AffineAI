@@ -41,18 +41,18 @@ def _prune_fwd_bwd_configs(configs: List[triton.Config], named_args: dict, **kwa
     Ensures 128-bit aligned vectorization with zero extraneous configuration compile overhead.
     On Turing (sm_75, 64KB SMEM) additionally prunes to BLOCK_SIZE <=64.
     """
-    # Turing SMEM cap: 64KB => clamp BLOCK_SIZE to <=64 to avoid SMEM overflow.
+    # Turing SMEM cap: 64KB => clamp BLOCK_SIZE to <=1024 to avoid SMEM overflow for 1D reductions.
     if _is_turing():
-        turing_pruned = [c for c in configs if c.kwargs.get('BLOCK_SIZE', 0) <= 64]
+        turing_pruned = [c for c in configs if c.kwargs.get('BLOCK_SIZE', 0) <= 1024]
         # Keep only turing-safe configs if any; otherwise fall through to dimension prune
         if turing_pruned:
             configs = turing_pruned
     D = kwargs.get('D', named_args.get('D', None))
     if D is not None:
         target_block = triton.next_power_of_2(D)
-        # Clamp target to 64 on Turing (64KB SMEM)
+        # Clamp target to 1024 on Turing (64KB SMEM)
         if _is_turing():
-            target_block = min(target_block, 64)
+            target_block = min(target_block, 1024)
         valid_blocks = [c.kwargs['BLOCK_SIZE'] for c in configs]
         if target_block not in valid_blocks:
             ge_blocks = [b for b in valid_blocks if b >= D]
@@ -92,14 +92,14 @@ def _get_fwd_bwd_autotune_configs() -> List[triton.Config]:
 
 def _prune_dscale_configs(configs: List[triton.Config], named_args: dict, **kwargs) -> List[triton.Config]:
     if _is_turing():
-        turing_pruned = [c for c in configs if c.kwargs.get('BLOCK_D', 0) <= 64]
+        turing_pruned = [c for c in configs if c.kwargs.get('BLOCK_D', 0) <= 1024]
         if turing_pruned:
             configs = turing_pruned
     D = kwargs.get('D', named_args.get('D', None))
     if D is not None:
         target = min(128, max(16, triton.next_power_of_2(D)))
         if _is_turing():
-            target = min(target, 64)
+            target = min(target, 1024)
         pruned = [c for c in configs if c.kwargs.get('BLOCK_D') == target]
         if pruned:
             return pruned
@@ -129,7 +129,7 @@ def _rms_norm_fwd_kernel(
     stride_xb, stride_xd,
     stride_sb,
     stride_ob, stride_od,
-    D: tl.constexpr, eps: tl.constexpr,
+    D: tl.constexpr, eps: tl.float32,
     BLOCK_SIZE: tl.constexpr
 ):
     # BENCH: block_ptr path gives 5-15% HBM BW gain on A100 for contiguous D=1024-4096 (N=4096) vs manual pointer arithmetic
@@ -156,6 +156,46 @@ def _rms_norm_fwd_kernel(
         y = (x * rsqrt * scale).to(x_dtype)
         out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
         tl.store(out_ptrs, y, mask=mask)
+        return
+
+    if D <= 2 * BLOCK_SIZE:
+        cols0 = tl.arange(0, BLOCK_SIZE)
+        mask0 = cols0 < D
+        cols1 = BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask1 = cols1 < D
+
+        if stride_xd == 1:
+            x0 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            x0 = tl.where(mask0, x0, 0.0)
+            x1 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            x1 = tl.where(mask1, x1, 0.0)
+        else:
+            x0 = tl.load(X_ptr + row_idx * stride_xb + cols0 * stride_xd, mask=mask0, other=0.0).to(acc_dtype)
+            x1 = tl.load(X_ptr + row_idx * stride_xb + cols1 * stride_xd, mask=mask1, other=0.0).to(acc_dtype)
+
+        sum_sq = tl.sum(x0 * x0, axis=0) + tl.sum(x1 * x1, axis=0)
+        var = sum_sq / D
+        rsqrt = tl.rsqrt(var + eps_val)
+        tl.store(Rsqrt_ptr + row_idx, rsqrt)
+
+        if stride_sb == 1:
+            scale0 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            scale0 = tl.where(mask0, scale0, 0.0)
+            scale1 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            scale1 = tl.where(mask1, scale1, 0.0)
+        else:
+            scale0 = tl.load(Scale_ptr + cols0 * stride_sb, mask=mask0, other=0.0).to(acc_dtype)
+            scale1 = tl.load(Scale_ptr + cols1 * stride_sb, mask=mask1, other=0.0).to(acc_dtype)
+
+        y0 = (x0 * rsqrt * scale0).to(x_dtype)
+        y1 = (x1 * rsqrt * scale1).to(x_dtype)
+
+        if stride_od == 1:
+            tl.store(tl.make_block_ptr(base=Out_ptr + row_idx * stride_ob, shape=(D,), strides=(stride_od,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), y0, boundary_check=(0,))
+            tl.store(tl.make_block_ptr(base=Out_ptr + row_idx * stride_ob, shape=(D,), strides=(stride_od,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), y1, boundary_check=(0,))
+        else:
+            tl.store(Out_ptr + row_idx * stride_ob + cols0 * stride_od, y0, mask=mask0)
+            tl.store(Out_ptr + row_idx * stride_ob + cols1 * stride_od, y1, mask=mask1)
         return
 
     sum_sq = 0.0
@@ -250,6 +290,51 @@ def _rms_norm_bwd_dx_kernel(
             tl.store(DX_ptr + row_idx * stride_dxb + cols * stride_dxd, dx.to(x_dtype), mask=mask)
         return
 
+    if D <= 2 * BLOCK_SIZE:
+        cols0 = tl.arange(0, BLOCK_SIZE)
+        mask0 = cols0 < D
+        cols1 = BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask1 = cols1 < D
+
+        if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1:
+            dy0 = tl.load(tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            dy0 = tl.where(mask0, dy0, 0.0)
+            x0 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            x0 = tl.where(mask0, x0, 0.0)
+            scale0 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            scale0 = tl.where(mask0, scale0, 0.0)
+
+            dy1 = tl.load(tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            dy1 = tl.where(mask1, dy1, 0.0)
+            x1 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            x1 = tl.where(mask1, x1, 0.0)
+            scale1 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
+            scale1 = tl.where(mask1, scale1, 0.0)
+        else:
+            dy0 = tl.load(DY_ptr + row_idx * stride_dyb + cols0 * stride_dyd, mask=mask0, other=0.0).to(acc_dtype)
+            x0 = tl.load(X_ptr + row_idx * stride_xb + cols0 * stride_xd, mask=mask0, other=0.0).to(acc_dtype)
+            scale0 = tl.load(Scale_ptr + cols0 * stride_sb, mask=mask0, other=0.0).to(acc_dtype)
+
+            dy1 = tl.load(DY_ptr + row_idx * stride_dyb + cols1 * stride_dyd, mask=mask1, other=0.0).to(acc_dtype)
+            x1 = tl.load(X_ptr + row_idx * stride_xb + cols1 * stride_xd, mask=mask1, other=0.0).to(acc_dtype)
+            scale1 = tl.load(Scale_ptr + cols1 * stride_sb, mask=mask1, other=0.0).to(acc_dtype)
+
+        dy_scale0 = dy0 * scale0
+        dy_scale1 = dy1 * scale1
+        inner = tl.sum(dy_scale0 * x0, axis=0) + tl.sum(dy_scale1 * x1, axis=0)
+        coeff = (inner * rsqrt * rsqrt) / D
+
+        dx0 = (dy_scale0 - x0 * coeff) * rsqrt
+        dx1 = (dy_scale1 - x1 * coeff) * rsqrt
+
+        if stride_dxd == 1:
+            tl.store(tl.make_block_ptr(base=DX_ptr + row_idx * stride_dxb, shape=(D,), strides=(stride_dxd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), dx0.to(x_dtype), boundary_check=(0,))
+            tl.store(tl.make_block_ptr(base=DX_ptr + row_idx * stride_dxb, shape=(D,), strides=(stride_dxd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), dx1.to(x_dtype), boundary_check=(0,))
+        else:
+            tl.store(DX_ptr + row_idx * stride_dxb + cols0 * stride_dxd, dx0.to(x_dtype), mask=mask0)
+            tl.store(DX_ptr + row_idx * stride_dxb + cols1 * stride_dxd, dx1.to(x_dtype), mask=mask1)
+        return
+
     inner = 0.0
     for d_start in range(0, D, BLOCK_SIZE):
         cols = d_start + tl.arange(0, BLOCK_SIZE)
@@ -300,7 +385,7 @@ def _rms_norm_bwd_dx_kernel(
 
 @triton.autotune(
     configs=_get_dscale_autotune_configs(),
-    key=['D'],
+    key=['D', 'N'],
     prune_configs_by={'prune_dscale_configs': _prune_dscale_configs},
     reset_to_zero=['DScale_ptr']  # R-08: requires zeroed DScale_ptr; autotune reuses buffers, so caller must zero-init (see Python assert)
     # Doc(R-01/R-02): atomic_add for float64 requires single split (num_n_splits==1), else raise. Python guards grid=(cdiv(D,BLOCK),1) for fp64.
@@ -342,10 +427,9 @@ def _rms_norm_bwd_dscale_kernel(
 
         acc += tl.sum(dy * (x * rsqrt[:, None]), axis=0)
 
-    is_fp64 = X_ptr.dtype.element_ty == tl.float64
     # R-01/R-02: float64 atomic_add not universally available; requires single split (num_n_splits==1).
     # Doc: atomic_add for float64 requires single split, else raise. Python guards grid=(cdiv(D,BLOCK),1) for fp64.
-    if is_fp64:
+    if acc_dtype == tl.float64:
         tl.device_assert(num_n_splits == 1, "FP64 dscale requires single split (num_n_splits==1); atomic_add unsupported for float64")
         tl.store(DScale_ptr + offs_d, acc, mask=mask_d)
     else:
@@ -366,7 +450,7 @@ def _get_fused_bwd_autotune_configs() -> List[triton.Config]:
 
 @triton.autotune(
     configs=_get_fused_bwd_autotune_configs(),
-    key=['D', 'BLOCK_ROW'],
+    key=['D'],
     reset_to_zero=['DScale_ptr']
 )
 @triton.jit
@@ -490,13 +574,13 @@ class TritonRMSNormFunc(torch.autograd.Function):
         dx = None
         dscale = None
 
-        if need_dx and need_dscale and D <= 4096 and x_flat.dtype != torch.float64:
+        if need_dx and need_dscale and D <= 4096 and x_flat.dtype != torch.float64 and N <= 8192:
             dx = torch.empty_like(x_flat)
             calc_dtype = torch.float64 if x_flat.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
             BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))
             if _is_turing():
-                BLOCK_D = min(BLOCK_D, 64)
+                BLOCK_D = min(BLOCK_D, 1024)
             def grid(META):
                 return (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
@@ -560,7 +644,7 @@ def _fused_add_rms_norm_fwd_kernel(
     stride_sb,
     stride_ob, stride_od,
     stride_rob, stride_rod,
-    D: tl.constexpr, eps: tl.constexpr,
+    D: tl.constexpr, eps: tl.float32,
     BLOCK_SIZE: tl.constexpr
 ):
     # BENCH: block_ptr contiguous path gives 5-15% BW gain (measured on A100, N=4096 D=2048) via coalesced loads
@@ -640,19 +724,12 @@ def _fused_add_rms_norm_fwd_kernel(
     for d_start in range(0, D, BLOCK_SIZE):
         cols = d_start + tl.arange(0, BLOCK_SIZE)
         mask = cols < D
-        if stride_xd == 1 and stride_rd == 1:
-            x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
-            res_block = tl.make_block_ptr(base=Res_ptr + row_idx * stride_rb, shape=(D,), strides=(stride_rd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
-            x = tl.load(x_block, boundary_check=(0,))
-            x = tl.where(cols < D, x, 0.0)
-            res = tl.load(res_block, boundary_check=(0,))
-            res = tl.where(cols < D, res, 0.0)
+        if stride_rod == 1:
+            res_out_block = tl.make_block_ptr(base=Res_out_ptr + row_idx * stride_rob, shape=(D,), strides=(stride_rod,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
+            res_acc = tl.load(res_out_block, boundary_check=(0,)).to(acc_dtype)
+            res_acc = tl.where(cols < D, res_acc, 0.0)
         else:
-            x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
-            res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
-            x = tl.load(x_ptrs, mask=mask, other=0.0)
-            res = tl.load(res_ptrs, mask=mask, other=0.0)
-        res_acc = x.to(acc_dtype) + res.to(acc_dtype)
+            res_acc = tl.load(Res_out_ptr + row_idx * stride_rob + cols * stride_rod, mask=mask, other=0.0).to(acc_dtype)
         if stride_sb == 1:
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
@@ -752,13 +829,13 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
         dres_out_val = None
         dscale = None
 
-        if need_dx and need_dscale and D <= 4096 and res_out.dtype != torch.float64:
+        if need_dx and need_dscale and D <= 4096 and res_out.dtype != torch.float64 and N <= 8192:
             dx = torch.empty_like(res_out)
             calc_dtype = torch.float64 if res_out.dtype == torch.float64 else torch.float32
             dscale_acc = torch.zeros(D, dtype=calc_dtype, device=scale.device)
             BLOCK_D = min(2048, max(16, triton.next_power_of_2(D)))
             if _is_turing():
-                BLOCK_D = min(BLOCK_D, 64)
+                BLOCK_D = min(BLOCK_D, 1024)
             def grid(META):
                 return (triton.cdiv(N, META['BLOCK_ROW']),)
             _rms_norm_bwd_fused_kernel[grid](
@@ -805,8 +882,7 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
                 else:
                     dx_add = dx
                 if ctx.needs_input_grad[0] and ctx.needs_input_grad[1]:
-                    dx_clone = dx_add.clone()
-                    dx_out = dx_clone.reshape(*ctx.orig_shape)
+                    dx_out = dx_add.reshape(*ctx.orig_shape)
                     dres_out_val = dx_add.clone().reshape(*ctx.orig_shape)
                 elif ctx.needs_input_grad[0]:
                     dx_out = dx_add.reshape(*ctx.orig_shape)

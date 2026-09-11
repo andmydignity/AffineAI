@@ -43,9 +43,11 @@ except ImportError:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA & Triton required")
-def test_triton_lpc_head_cuda_parity():
-    """Verify GPU Triton LPC kernel matches PyTorch reference."""
-    B, T, D, V = 4, 32, 64, 128
+@pytest.mark.parametrize("V", [256, 2048])
+def test_triton_lpc_head_cuda_parity(V):
+    """Verify GPU Triton LPC kernel matches PyTorch reference for V=256 and V=2048."""
+    B, T, D = 4, 32, 64
+    torch.manual_seed(42)
     h = torch.randn(B, T, D, device="cuda", requires_grad=True)
     w = torch.randn(V, D, device="cuda", requires_grad=True)
     targets = torch.randint(0, V, (B, T), device="cuda")

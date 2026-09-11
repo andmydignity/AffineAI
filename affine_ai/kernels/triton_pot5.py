@@ -461,11 +461,6 @@ def triton_pot5_int8_linear(
         w = _maybe_cast_fp16_for_turing(w)
         if alpha is not None and alpha.dtype == torch.bfloat16:
             alpha = alpha.to(torch.float16)
-        K = x.shape[-1]
-        if K > 16384:
-            warnings.warn(f"Turing sm_75: clamping K {K} -> 16384", stacklevel=2)
-            x = x[..., :16384]
-            w = w[..., :16384]
         if alpha is None:
             alpha = (w.float().abs().mean() * 1.4).to(x.dtype)
         if alpha.ndim == 0:
@@ -482,12 +477,6 @@ def triton_pot5_int8_linear(
         alpha = (w.float().abs().mean() * 1.4).to(x.dtype)
     if alpha.ndim == 0:
         alpha = alpha.unsqueeze(0)
-
-    if K > 16384:
-        warnings.warn(f"Clamping K {K} -> 16384 for int32 acc safety", stacklevel=2)
-        K = 16384
-        x_2d = x_2d[..., :K]
-        w = w[..., :K]
 
     # Quantize activations to INT8 with per-token scale
     amax_x = x_2d.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
@@ -580,16 +569,22 @@ class Triton5StatePOTLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=dtype) / math.sqrt(in_features))
-        self.register_buffer("alpha", torch.tensor([1.0], dtype=dtype))
+        init_alpha = (self.weight.detach().float().abs().mean() * 1.4).to(dtype).unsqueeze(0)
+        self.register_buffer("alpha", init_alpha)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            alpha = (self.weight.detach().float().abs().mean() * 1.4).to(self.weight.dtype).unsqueeze(0)
+            self.alpha.copy_(alpha)
+            return triton_pot5_linear(x, self.weight, alpha)
         return triton_pot5_linear(x, self.weight, self.alpha)
 
 
 def pack_pot5_gpu_3bitplane(
     w: torch.Tensor,
     threshold_z: float = 0.35,
-    shift: int = 1
+    shift: int = 1,
+    alpha: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
     Packs 5-state POT weights [N, K] into 3 GPU bitplanes of torch.int32:
@@ -597,19 +592,14 @@ def pack_pot5_gpu_3bitplane(
       Magnitude bitplane: 1 bit per weight (1.0 vs 0.5)
       Sign bitplane: 1 bit per weight (- vs +)
     Storage: Exactly 3 bits/weight (5.33x reduction vs BF16, 2.67x vs INT8).
-    Quantization rule for this pack path is intentionally std-relative
-    (t0=0.35*std, t1=0.9*std, q in {0,0.5,1}*sign, alpha = <w,q>/<q,q>)
-    to stay bit-exact with training-time pot5_quantize (ast_dag) and
-    .toros format. Online kernels use the unified alpha-relative rule
-    (t_low=0.25*alpha, t_high=0.75*alpha) via _pot5_thresholds; bitpacked
-    inference reproduces training numerics because unpack is a LUT
-    (nz*(0.5+0.5*mag)*(1-2*sign)*alpha) with no threshold recompute at
-    matmul time. Use _pot5_quantize_weight / _pot5_alpha_levels_for_comparison
-    to cross-check alpha-relative vs std packing for the same w.
+    When alpha is provided, thresholds align with online GEMM (_pot5_thresholds).
+    When alpha is None, thresholds use std-relative formula to match training pot5_quantize.
     Returns: (w_nz_bits, w_mag_bits, w_sign_bits, alpha, K_orig)
     """
     N, K_orig = w.shape
     device = w.device
+    std = w.float().std().clamp_min(1e-8)
+
     pad_len = (32 - (K_orig % 32)) % 32
     if pad_len > 0:
         w_padded = F.pad(w, (0, pad_len), value=0.0)
@@ -618,23 +608,30 @@ def pack_pot5_gpu_3bitplane(
 
     w_f = w_padded.float()
     K_padded = w_f.shape[1]
-    std = w_f.std().clamp_min(1e-8)
     val_low = 2.0 ** (-shift)
     val_high = 1.0
-    t0 = threshold_z * std
-    t1 = (val_low + val_high) * 0.5 * std * 1.2
 
     abs_w = w_f.abs()
     sign = w_f.sign()
 
-    q = torch.zeros_like(w_f)
-    # Align to online `>` edge (was `>=`); keep inclusive documented if reverted
-    q = torch.where(abs_w > t0, sign * val_low, q)
-    q = torch.where(abs_w > t1, sign * val_high, q)
-    alpha = ((w_f * q).sum() / (q * q).sum().clamp_min(1e-8)).to(w.dtype)
+    if alpha is not None:
+        t0, t1 = _pot5_thresholds(alpha.to(device).float())
+        q = torch.zeros_like(w_f)
+        q = torch.where(abs_w > t0, sign * val_low, q)
+        q = torch.where(abs_w > t1, sign * val_high, q)
+        out_alpha = alpha.to(w.dtype)
+        nz_mask = (abs_w > t0)
+        mag_mask = (abs_w > t1)
+    else:
+        t0 = threshold_z * std
+        t1 = (val_low + val_high) * 0.5 * std * 1.2
+        q = torch.zeros_like(w_f)
+        q = torch.where(abs_w >= t0, sign * val_low, q)
+        q = torch.where(abs_w >= t1, sign * val_high, q)
+        out_alpha = ((w_f * q).sum() / (q * q).sum().clamp_min(1e-8)).to(w.dtype)
+        nz_mask = (abs_w >= t0)
+        mag_mask = (abs_w >= t1)
 
-    nz_mask = (abs_w > t0)
-    mag_mask = (abs_w > t1)
     sign_mask = (w_f < 0.0)
 
     # Fix signed overflow: 1<<31 overflows int32; use int64 for powers
@@ -645,7 +642,7 @@ def pack_pot5_gpu_3bitplane(
     w_mag_bits = (mag_mask.view(N, K_words, 32).to(torch.int64) * lane_shifts).sum(dim=-1).to(torch.int32)
     w_sign_bits = (sign_mask.view(N, K_words, 32).to(torch.int64) * lane_shifts).sum(dim=-1).to(torch.int32)
 
-    return w_nz_bits, w_mag_bits, w_sign_bits, alpha, K_orig
+    return w_nz_bits, w_mag_bits, w_sign_bits, out_alpha, K_orig
 
 
 def unpack_pot5_gpu_3bitplane(
@@ -795,6 +792,10 @@ def triton_pot5_bitpacked_linear(
     # K_padded is 32-aligned padded K (>= K_orig); K_orig is logical dim for slicing output. Kernel loops K_padded with mask_k< K_orig? Actually K_padded includes padding zeros, kernel masks with kk<K (K_padded) but W bitplanes padded zero, so tail is exact. We pass K_padded to kernel and mask with K_padded, but logical K_orig is used for CPU fallback slicing.
     if x.is_cuda and HAS_TRITON and not _is_turing():
         assert K_padded % 32 == 0, f"K_padded must be 32-aligned, got {K_padded}"
+        if w_nz_bits.stride(0) != 1:
+            w_nz_bits = w_nz_bits.transpose(0, 1).contiguous().transpose(0, 1)
+            w_mag_bits = w_mag_bits.transpose(0, 1).contiguous().transpose(0, 1)
+            w_sign_bits = w_sign_bits.transpose(0, 1).contiguous().transpose(0, 1)
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
         grid = lambda META: (  # noqa: E731
             triton.cdiv(M, META["BLOCK_M"]),
@@ -860,6 +861,11 @@ class Triton5StatePOTBitpackedLinear(nn.Module):
         if alpha is not None and alpha.ndim == 0:
             alpha = alpha.unsqueeze(0)
 
+        if w_nz_bits is not None and w_nz_bits.stride(0) != 1:
+            w_nz_bits = w_nz_bits.transpose(0, 1).contiguous().transpose(0, 1)
+            w_mag_bits = w_mag_bits.transpose(0, 1).contiguous().transpose(0, 1)
+            w_sign_bits = w_sign_bits.transpose(0, 1).contiguous().transpose(0, 1)
+
         self.register_buffer("w_nz_bits", w_nz_bits)
         self.register_buffer("w_mag_bits", w_mag_bits)
         self.register_buffer("w_sign_bits", w_sign_bits)
@@ -916,6 +922,11 @@ class Triton5StatePOTBitpackedResidualLinear(nn.Module):
             alpha = alpha.unsqueeze(0)
 
         idx_i64 = outlier_indices.to(torch.int64)
+        if w_nz_bits is not None and w_nz_bits.stride(0) != 1:
+            w_nz_bits = w_nz_bits.transpose(0, 1).contiguous().transpose(0, 1)
+            w_mag_bits = w_mag_bits.transpose(0, 1).contiguous().transpose(0, 1)
+            w_sign_bits = w_sign_bits.transpose(0, 1).contiguous().transpose(0, 1)
+
         self.register_buffer("w_nz_bits", w_nz_bits)
         self.register_buffer("w_mag_bits", w_mag_bits)
         self.register_buffer("w_sign_bits", w_sign_bits)
@@ -989,14 +1000,22 @@ class Triton5StatePOTBitpackedResidualLinear(nn.Module):
         y = triton_pot5_bitpacked_linear(
             x, self.w_nz_bits, self.w_mag_bits, self.w_sign_bits, self.alpha, self.in_features
         )
-        # 2. Add Top-2% Outlier contributions
+        # 2. Add Top-2% Outlier contributions (tiled to prevent VRAM spikes)
         if self.outlier_indices.numel() > 0:
             orig_shape = x.shape
             x_flat = x.reshape(-1, self.in_features)
             y_flat = y.reshape(-1, self.out_features)
-            x_sampled = x_flat[:, self.outlier_cols]
-            scaled = x_sampled * self.outlier_values.to(x.dtype)
-            y_flat.index_add_(1, self.outlier_rows, scaled)
+            num_outliers = self.outlier_rows.shape[0]
+            outlier_vals = self.outlier_values.to(x.dtype)
+            CHUNK_SIZE = 4096
+            for start in range(0, num_outliers, CHUNK_SIZE):
+                end = min(start + CHUNK_SIZE, num_outliers)
+                cols = self.outlier_cols[start:end]
+                rows = self.outlier_rows[start:end]
+                vals = outlier_vals[start:end]
+                x_sampled = x_flat[:, cols]
+                scaled = x_sampled * vals
+                y_flat.index_add_(1, rows, scaled)
             y = y_flat.reshape(*orig_shape[:-1], self.out_features)
         if getattr(self, "bias", None) is not None:
             y = y + self.bias

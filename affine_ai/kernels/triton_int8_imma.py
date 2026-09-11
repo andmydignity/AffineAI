@@ -39,22 +39,6 @@ def _maybe_cast_fp16_for_turing(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
-def _prune_turing_block(block: int) -> int:
-    if _is_turing() and block > 64:
-        warnings.warn(f"Turing sm_75: clamping BLOCK {block} -> 64 (64KB SMEM)", stacklevel=3)
-        return 64
-    return block
-
-
-def _turing_fp16_matmul_fallback(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
-    x_f = _maybe_cast_fp16_for_turing(x).float()
-    w_f = _maybe_cast_fp16_for_turing(weight).float()
-    out = torch.matmul(x_f.reshape(-1, x_f.shape[-1]), w_f.t())
-    if bias is not None:
-        out = out + bias.float().reshape(-1)
-    return out.reshape(*x.shape[:-1], weight.shape[0]).to(x.dtype if not _is_turing() or x.dtype != torch.bfloat16 else torch.float16)
-
-
 @triton.autotune(
     configs=[
         # Consumer GPU & single-token inference small tiles
@@ -71,8 +55,6 @@ def _turing_fp16_matmul_fallback(x: torch.Tensor, weight: torch.Tensor, bias: Op
         # BLOCK_K=128 for wide K
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
-        # M=1 inference
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_warps=2, num_stages=2),
     ],
     key=['M', 'N', 'K'],
 )
@@ -118,14 +100,6 @@ def _int8_imma_gemm_kernel(
         out += b_val[None, :]
 
     tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
-
-# Shared bias dummy: avoid stride_b=0 type-pun dummy (x_flat alias); use dedicated dummy bias buffer with stride 1
-_dummy_bias_buf = None
-def _get_dummy_bias(device):
-    global _dummy_bias_buf
-    if _dummy_bias_buf is None or _dummy_bias_buf.device != device:
-        _dummy_bias_buf = torch.zeros(1, device=device, dtype=torch.float32)
-    return _dummy_bias_buf
 
 
 class TritonINT8IMMAFunction(torch.autograd.Function):
@@ -183,7 +157,7 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             bias_tensor = bias.contiguous().reshape(-1)
             stride_b = bias_tensor.stride(0)
         else:
-            bias_tensor = _get_dummy_bias(x.device)
+            bias_tensor = torch.zeros(1, device=x.device, dtype=torch.float32)
             stride_b = bias_tensor.stride(0)
 
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))  # noqa: E731
@@ -200,8 +174,9 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             HAS_BIAS=has_bias,
         )
 
-        # Save for backward STE: FP master weights (diverges from quantized w_int8*sw; see doc). Quantized path would be w_int8*sw but test expects FP parity, so we keep FP for compatibility and document divergence.
-        ctx.save_for_backward(x_flat, weight, bias if bias is not None else torch.empty(0, device=x.device))
+        w_q = (w_int8.float() * sw.unsqueeze(-1)).to(weight.dtype)
+        x_q = (x_int8.float() * sx.unsqueeze(-1)).to(x.dtype)
+        ctx.save_for_backward(x_q, w_q, bias if bias is not None else torch.empty(0, device=x.device))
         ctx.orig_shape = orig_shape
         ctx.has_bias = bias is not None
         ctx.K = K
@@ -211,18 +186,12 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Backward STE ignores quantization: gx/gw use FP weight/x not int8 (diverges from w_int8*sw / x_int8*sx; documented).
-        # Ideal STE would use quantized values w_int8*sw and x_int8*sx, but we keep FP for test parity and document divergence.
-        x_flat, weight, bias = ctx.saved_tensors
+        x_q, w_q, bias = ctx.saved_tensors
         orig_shape = ctx.orig_shape
-        go_flat = grad_output.reshape(-1, weight.shape[0]).contiguous()
-
-        x_flat, weight, bias = ctx.saved_tensors
-        orig_shape = ctx.orig_shape
-        go_flat = grad_output.reshape(-1, weight.shape[0]).contiguous()
-        gx = torch.matmul(go_flat, weight) if ctx.needs_input_grad[0] else None
-        gw = torch.matmul(go_flat.t(), x_flat) if ctx.needs_input_grad[1] else None
-        gb = go_flat.sum(dim=0) if (bias is not None and ctx.needs_input_grad[2]) else None
+        go_flat = grad_output.reshape(-1, w_q.shape[0]).contiguous()
+        gx = torch.matmul(go_flat, w_q.to(go_flat.dtype)) if ctx.needs_input_grad[0] else None
+        gw = torch.matmul(go_flat.t(), x_q.to(go_flat.dtype)) if ctx.needs_input_grad[1] else None
+        gb = go_flat.sum(dim=0) if (ctx.has_bias and ctx.needs_input_grad[2]) else None
         if gx is not None:
             gx = gx.reshape(*orig_shape)
         return gx, gw, gb

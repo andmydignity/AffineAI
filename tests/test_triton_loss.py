@@ -5,10 +5,11 @@ from affine_ai.kernels import triton_fused_linear_cross_entropy, TRITON_AVAILABL
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_AVAILABLE, reason="CUDA & Triton required")
-def test_triton_fused_linear_cross_entropy_parity():
+@pytest.mark.parametrize("V", [65, 128, 256, 4096])
+def test_triton_fused_linear_cross_entropy_parity(V):
+    torch.manual_seed(42)
     N = 64
     D = 32
-    V = 128
 
     hidden = torch.randn(N, D, device="cuda", requires_grad=True)
     weight = torch.randn(V, D, device="cuda", requires_grad=True)

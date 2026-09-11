@@ -90,3 +90,31 @@ def test_triton_fused_monarch_chain_branches():
     assert x.grad is not None
     assert diagonals.grad is not None
     assert bias.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Monarch tests")
+def test_triton_monarch_sliced_bias_and_dtype():
+    """Verify sliced bias with non-standard stride and bias dtype matching in backward."""
+    device = torch.device("cuda")
+    M, D, S = 8, 64, 2
+    torch.manual_seed(42)
+
+    x = torch.randn(M, D, device=device, dtype=torch.float32, requires_grad=True)
+    diagonals = torch.randn(S, D, device=device, dtype=torch.float32, requires_grad=True)
+    perms = torch.stack([torch.randperm(D, device=device) for _ in range(S)])
+    inv_perms = torch.empty_like(perms)
+    for s in range(S):
+        inv_perms[s] = torch.argsort(perms[s])
+
+    # Sliced bias with stride != 1
+    bias_2d = torch.randn(D, 4, device=device, dtype=torch.float32, requires_grad=True)
+    bias_sliced = bias_2d[:, 1]  # stride is 4
+    assert bias_sliced.stride(0) != 1
+
+    out = triton_monarch_chain(x, diagonals, perms, inv_perms, bias_sliced)
+    ref_out = ref_monarch_chain(x, diagonals, perms, bias_sliced)
+    assert torch.allclose(out, ref_out, atol=1e-5)
+
+    out.sum().backward()
+    assert bias_2d.grad is not None
+    assert bias_sliced.dtype == torch.float32

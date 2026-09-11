@@ -2,13 +2,45 @@
 AffineAI Custom Hardware Acceleration Kernels (Triton & CUDA)
 """
 
+import torch
+import warnings
+
+_cap = (0, 0)
+_IS_TURING = False
+_IS_AMPERE_PLUS = False
+_UNSUPPORTED = False
+
+if torch.cuda.is_available():
+    try:
+        _dev = torch.cuda.current_device()
+        _cap = tuple(torch.cuda.get_device_capability(_dev))
+        _UNSUPPORTED = _cap < (7, 5)
+        _IS_TURING = (7, 5) <= _cap < (8, 0)
+        _IS_AMPERE_PLUS = _cap >= (8, 0)
+    except Exception:
+        _UNSUPPORTED = False
+
+    if _UNSUPPORTED:
+        _cap_str = f"{_cap[0]}{_cap[1]}"
+        warnings.warn(
+            f"Unsupported GPU sm_{_cap_str}: Triton kernels require Turing sm_75+ (Ampere sm_80+ for bf16/int8). "
+            "Falling back to PyTorch paths.",
+            stacklevel=2,
+        )
+    elif _IS_TURING:
+        warnings.warn(
+            f"Turing GPU sm_{_cap[0]}{_cap[1]}: FP16 AMP via Triton (bf16→fp16, INT8/FP8 → fp16 fallback, 64KB SMEM caps, BLOCK≤64). "
+            "Use dtype=torch.float16 + torch.amp.GradScaler() for training.",
+            stacklevel=2,
+        )
+
+
 def _optional_import(module_name, symbol):
     try:
         import importlib
         module = importlib.import_module(module_name)
         return getattr(module, symbol)
-    except Exception as e:  # I-01: capture e
-        import warnings
+    except Exception as e:
         warnings.warn(f"{module_name}:{symbol} unavailable: {e}", stacklevel=2)
         return None
 
@@ -17,10 +49,7 @@ triton_rms_norm = _optional_import("affine_ai.kernels.triton_rms_norm", "triton_
 triton_fused_add_rms_norm = _optional_import("affine_ai.kernels.triton_rms_norm", "triton_fused_add_rms_norm")
 triton_fused_linear_cross_entropy = _optional_import(
     "affine_ai.kernels.triton_cross_entropy", "triton_fused_linear_cross_entropy")
-try:
-    from affine_ai.kernels.triton_asdag import fused_asdag_forward_triton
-except Exception:
-    fused_asdag_forward_triton = None
+fused_asdag_forward_triton = _optional_import("affine_ai.kernels.triton_asdag", "fused_asdag_forward_triton")
 triton_fused_lpc_head = _optional_import("affine_ai.kernels.triton_lpc", "triton_fused_lpc_head")
 triton_ternary_linear = _optional_import("affine_ai.kernels.triton_ternary", "triton_ternary_linear")
 triton_ternary_twin = _optional_import("affine_ai.kernels.triton_ternary", "triton_ternary_twin")
@@ -40,6 +69,8 @@ triton_unpack_ternary_2bit = _optional_import("affine_ai.kernels.triton_ternary"
 triton_pack_ternary_2bit = _optional_import("affine_ai.kernels.triton_ternary", "triton_pack_ternary_2bit")
 triton_pack_sign_bits = _optional_import("affine_ai.kernels.triton_popc", "triton_pack_sign_bits")
 triton_popc_sign_similarity = _optional_import("affine_ai.kernels.triton_popc", "triton_popc_sign_similarity")
+triton_differentiable_popc_similarity = _optional_import("affine_ai.kernels.triton_popc", "triton_differentiable_popc_similarity")
+TritonPopcSignSimilarityFunction = _optional_import("affine_ai.kernels.triton_popc", "TritonPopcSignSimilarityFunction")
 triton_int8_imma_linear = _optional_import("affine_ai.kernels.triton_int8_imma", "triton_int8_imma_linear")
 triton_pot5_linear = _optional_import("affine_ai.kernels.triton_pot5", "triton_pot5_linear")
 triton_pot5_int8_linear = _optional_import("affine_ai.kernels.triton_pot5", "triton_pot5_int8_linear")
@@ -144,7 +175,6 @@ if triton_adamw_step is None:
         triton_adamw_step = None
 
 try:
-    import torch
     import triton  # noqa: F401
     _ALL_TRITON_SYMBOLS = [
         triton_rms_norm, triton_fused_add_rms_norm, triton_fused_linear_cross_entropy,
@@ -155,6 +185,7 @@ try:
         triton_fused_monarch_chain, triton_gla_decay, triton_router_topk,
         triton_unpack_ternary_2bit, triton_pack_ternary_2bit,
         triton_pack_sign_bits, triton_popc_sign_similarity,
+        triton_differentiable_popc_similarity, TritonPopcSignSimilarityFunction,
         triton_int8_imma_linear, triton_pot5_linear, triton_pot5_int8_linear,
         triton_pot5_fused_swiglu, triton_pot5_bitpacked_linear,
         pack_pot5_gpu_3bitplane, unpack_pot5_gpu_3bitplane,
@@ -164,40 +195,7 @@ try:
         triton_bitlinear_swiglu, TritonBitLinearSwiGLUFunction,
         TritonAdamW, triton_adamw_step, triton_fused_perm_proj, sliding_window_attn,
     ]
-    TRITON_AVAILABLE = torch.cuda.is_available() and any(s is not None for s in _ALL_TRITON_SYMBOLS)
-    # Turing (sm_75) FP16 AMP support: keep Triton but cap SMEM/BLOCK and force fp16
-    _IS_TURING = False
-    _IS_AMPERE_PLUS = False
-    if torch.cuda.is_available():
-        try:
-            _cap = tuple(torch.cuda.get_device_capability())
-            # <7.5 = unsupported (no Tensor Core fp16 m16n8k8)
-            # 7.5 <= cap < 8.0 = Turing: fp16 only, 64KB SMEM, no bf16/int8 m16n8k32
-            # >=8.0 = Ampere+ full (bf16/tf32/int8 m16n8k32, 164KB SMEM)
-            # FP8 additionally needs Ada sm_89+
-            _UNSUPPORTED = _cap < (7, 5)
-            _IS_TURING = (7, 5) <= _cap < (8, 0)
-            _IS_AMPERE_PLUS = _cap >= (8, 0)
-        except Exception:
-            _UNSUPPORTED = False
-        if _UNSUPPORTED:
-            import warnings as _warnings
-            _cap_str = f"{_cap[0]}{_cap[1]}" if "_cap" in locals() else "unknown"
-            _warnings.warn(
-                f"Unsupported GPU sm_{_cap_str}: Triton kernels require Turing sm_75+ (Ampere sm_80+ for bf16/int8). "
-                "Falling back to PyTorch paths.",
-                stacklevel=2,
-            )
-            TRITON_AVAILABLE = False
-        elif _IS_TURING:
-            import warnings as _warnings
-            _warnings.warn(
-                f"Turing GPU sm_{_cap[0]}{_cap[1]}: FP16 AMP via Triton (bf16→fp16, INT8/FP8 → fp16 fallback, 64KB SMEM caps, BLOCK≤64). "
-                "Use dtype=torch.float16 + torch.amp.GradScaler() for training.",
-                stacklevel=2,
-            )
-            # keep TRITON_AVAILABLE True but kernels must clamp BLOCK and force fp16
-            TRITON_AVAILABLE = TRITON_AVAILABLE and True
+    TRITON_AVAILABLE = torch.cuda.is_available() and not _UNSUPPORTED and any(s is not None for s in _ALL_TRITON_SYMBOLS)
 except Exception:
     TRITON_AVAILABLE = False
 
@@ -222,6 +220,8 @@ __all__ = [
     "triton_pack_ternary_2bit",
     "triton_pack_sign_bits",
     "triton_popc_sign_similarity",
+    "triton_differentiable_popc_similarity",
+    "TritonPopcSignSimilarityFunction",
     "triton_int8_imma_linear",
     "triton_pot5_linear",
     "triton_pot5_int8_linear",

@@ -68,6 +68,8 @@ class TorosHybridConfig:
     channel_mixer_type: str = "asdag_tree"
     mlp_hidden_dim: int = 84
     time_mixer_rule: str = "gla"
+    swa_every_n: int = 6
+    swa_window: int = 256
     gen_loss_weight: float = 1.0
     use_conv_prefix: bool = True
     conv_kernel_size: int = 4
@@ -287,6 +289,10 @@ class TorosHybridLanguageModel(nn.Module):
             )
         if self.config.dtype is not None and self.config.dtype != torch.float32:
             self.to(self.config.dtype)
+        if getattr(self.config, "swa_every_n", 0):
+            from affine_ai.core.swa import interleave_swa
+            interleave_swa(self, every_n=int(self.config.swa_every_n),
+                           window=int(getattr(self.config, "swa_window", 256)))
         if getattr(self.config, 'compile_forward', False) and _COMPILE:
             try:
                 self.forward = torch.compile(self.forward, mode="max-autotune", dynamic=False)  # type: ignore[method-assign]

@@ -43,20 +43,28 @@ except Exception:  # pragma: no cover
     # Fallback stubs if distributed module missing
     def setup_distributed(backend="nccl"):  # type: ignore
         return None
+
     def cleanup_distributed():  # type: ignore
         return None
+
     def is_distributed():  # type: ignore
         return False
+
     def get_rank():  # type: ignore
         return 0
+
     def get_world_size():  # type: ignore
         return 1
+
     def is_main_process():  # type: ignore
         return True
+
     def get_local_device():  # type: ignore
         return "cpu"
+
     def barrier():  # type: ignore
         return None
+
     def all_reduce_sum(tensor):  # type: ignore
         return tensor
 
@@ -115,7 +123,9 @@ def get_cpu_physical_cores() -> int:
     try:
         seen = set()
         for cpu in range(count):
-            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            with open(
+                f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            ) as f:
                 first = f.read().strip().split(",")[0].split("-")[0]
                 if first not in seen:
                     seen.add(first)
@@ -131,6 +141,7 @@ class ASDAGTrainer:
     High-Performance Trainer for ASDAG Language Models.
     Optimized for both GPU and CPU execution.
     """
+
     def __init__(
         self,
         model: Any,
@@ -170,6 +181,8 @@ class ASDAGTrainer:
         mtp_lambda: Optional[float] = None,
         channel_mixer: Optional[str] = None,
         time_mixer: Optional[str] = None,
+        swa_every_n: Optional[int] = None,
+        swa_window: Optional[int] = None,
         distributed: Optional[bool] = None,
     ):
         self.pad_id = pad_id
@@ -193,7 +206,9 @@ class ASDAGTrainer:
         self.is_distributed = self.distributed
         if self.distributed:
             try:
-                setup_distributed(backend="nccl" if torch.cuda.is_available() else "gloo")
+                setup_distributed(
+                    backend="nccl" if torch.cuda.is_available() else "gloo"
+                )
             except Exception:
                 pass
             self.rank = get_rank()
@@ -201,7 +216,19 @@ class ASDAGTrainer:
             self.is_main = is_main_process()
             try:
                 _lr_env = os.environ.get("LOCAL_RANK", "")
-                self.local_rank = int(_lr_env) if _lr_env != "" else (self.rank % max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1))
+                self.local_rank = (
+                    int(_lr_env)
+                    if _lr_env != ""
+                    else (
+                        self.rank
+                        % max(
+                            1,
+                            torch.cuda.device_count()
+                            if torch.cuda.is_available()
+                            else 1,
+                        )
+                    )
+                )
             except Exception:
                 self.local_rank = self.rank
             _has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
@@ -219,10 +246,16 @@ class ASDAGTrainer:
             self.world_size = 1
             self.is_main = True
             self.local_rank = 0
-            _has_cuda_fallback = torch.cuda.is_available() and torch.cuda.device_count() > 0
+            _has_cuda_fallback = (
+                torch.cuda.is_available() and torch.cuda.device_count() > 0
+            )
             self.device = device or ("cuda" if _has_cuda_fallback else "cpu")
         self.train_sampler = None
-        self.use_cuda_graph = ("cuda" in str(self.device)) if use_cuda_graph is None else bool(use_cuda_graph)
+        self.use_cuda_graph = (
+            ("cuda" in str(self.device))
+            if use_cuda_graph is None
+            else bool(use_cuda_graph)
+        )
         self.use_backpressure = use_backpressure
         self.use_lpc = use_lpc
         self.use_muon = use_muon
@@ -241,14 +274,15 @@ class ASDAGTrainer:
 
         if self.use_priority_replay:
             from affine_ai.core.priority_replay import DynamicPriorityReplayBuffer
+
             self.replay_buffer = DynamicPriorityReplayBuffer(
                 max_capacity=replay_buffer_capacity,
                 max_replays=replay_max_replays,
-                replay_ratio=replay_ratio
+                replay_ratio=replay_ratio,
             )
         else:
             self.replay_buffer = None
-        
+
         # CPU Threading Optimization
         if self.device == "cpu":
             target_threads = num_threads or get_cpu_physical_cores()
@@ -261,7 +295,11 @@ class ASDAGTrainer:
         self.model = model.to(self.device)
         if getattr(self, "is_distributed", False) and self.world_size > 1:
             try:
-                if torch.cuda.is_available() and torch.cuda.device_count() > 0 and "cuda" in str(self.device):
+                if (
+                    torch.cuda.is_available()
+                    and torch.cuda.device_count() > 0
+                    and "cuda" in str(self.device)
+                ):
                     _eff_ddp = self.local_rank % torch.cuda.device_count()
                     self.model = torch.nn.parallel.DistributedDataParallel(
                         self.model,
@@ -285,28 +323,47 @@ class ASDAGTrainer:
         self.context_window = self.seq_len
         if hasattr(self.model, "context_window"):
             self.model.context_window = self.context_window
-        if hasattr(self.model, "config") and hasattr(self.model.config, "context_window"):
+        if hasattr(self.model, "config") and hasattr(
+            self.model.config, "context_window"
+        ):
             self.model.config.context_window = self.context_window
         if hasattr(self.model, "config") and hasattr(self.model.config, "max_seq_len"):
             self.model.config.max_seq_len = self.context_window
-
 
         # Configure architectural mixers if requested
         if channel_mixer is not None:
             if hasattr(self.model, "channel_mixer_type"):
                 self.model.channel_mixer_type = channel_mixer
-            if hasattr(self.model, "config") and hasattr(self.model.config, "channel_mixer_type"):
+            if hasattr(self.model, "config") and hasattr(
+                self.model.config, "channel_mixer_type"
+            ):
                 self.model.config.channel_mixer_type = channel_mixer
 
         if time_mixer is not None:
             if hasattr(self.model, "time_mixer_rule"):
                 self.model.time_mixer_rule = time_mixer
-            if hasattr(self.model, "config") and hasattr(self.model.config, "time_mixer_rule"):
+            if hasattr(self.model, "config") and hasattr(
+                self.model.config, "time_mixer_rule"
+            ):
                 self.model.config.time_mixer_rule = time_mixer
 
         # Configure Multi-Token Prediction (MTP) if requested
         from affine_ai.models.hybrid import TorosHybridLanguageModel
-        _unwrap = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+
+        _unwrap = (
+            self.model.module
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+            else self.model
+        )
+        if swa_every_n is not None and swa_every_n:
+            if hasattr(_unwrap, "config"):
+                if hasattr(_unwrap.config, "swa_every_n"):
+                    _unwrap.config.swa_every_n = swa_every_n
+                if swa_window is not None and hasattr(_unwrap.config, "swa_window"):
+                    _unwrap.config.swa_window = swa_window
+            from affine_ai.core.swa import interleave_swa
+            interleave_swa(_unwrap, every_n=swa_every_n,
+                           window=swa_window or 256)
         if isinstance(_unwrap, TorosHybridLanguageModel):
             self.hybrid = _unwrap
         elif getattr(_unwrap, "hybrid", None) is not None:
@@ -320,14 +377,20 @@ class ASDAGTrainer:
             if self.hybrid is not None:
                 if self.use_mtp:
                     self.hybrid.enable_mtp(
-                        num_mtp_heads=self.num_mtp_heads if self.num_mtp_heads is not None else 2,
-                        mtp_lambda=self.mtp_lambda if self.mtp_lambda is not None else 0.3
+                        num_mtp_heads=self.num_mtp_heads
+                        if self.num_mtp_heads is not None
+                        else 2,
+                        mtp_lambda=self.mtp_lambda
+                        if self.mtp_lambda is not None
+                        else 0.3,
                     )
                 else:
                     self.hybrid.disable_mtp()
             elif hasattr(self.model, "use_mtp"):
                 self.model.use_mtp = bool(self.use_mtp)
-                if self.num_mtp_heads is not None and hasattr(self.model, "num_mtp_heads"):
+                if self.num_mtp_heads is not None and hasattr(
+                    self.model, "num_mtp_heads"
+                ):
                     self.model.num_mtp_heads = self.num_mtp_heads
                 if self.mtp_lambda is not None and hasattr(self.model, "mtp_lambda"):
                     self.model.mtp_lambda = self.mtp_lambda
@@ -335,11 +398,16 @@ class ASDAGTrainer:
         if self.device == "cpu":
             try:
                 from affine_ai.core.numa import node_count, interleave_model_weights
+
                 if node_count() > 1:
                     interleave_model_weights(self.model)
             except Exception:
                 pass
-        if compile_model and hasattr(torch, "compile") and not getattr(self, "is_distributed", False):
+        if (
+            compile_model
+            and hasattr(torch, "compile")
+            and not getattr(self, "is_distributed", False)
+        ):
             try:
                 self.model = torch.compile(self.model)
             except Exception:
@@ -364,7 +432,9 @@ class ASDAGTrainer:
         if isinstance(train_data, (PaddedDataLoader, HFStreamDataLoader)):
             self.train_loader = train_data
             self.train_data = None
-        elif isinstance(train_data, (list, tuple)) and not isinstance(train_data, (torch.Tensor, np.ndarray)):
+        elif isinstance(train_data, (list, tuple)) and not isinstance(
+            train_data, (torch.Tensor, np.ndarray)
+        ):
             self.train_loader = PaddedDataLoader(
                 train_data,
                 batch_size=self.batch_size,
@@ -392,7 +462,9 @@ class ASDAGTrainer:
         if isinstance(val_data, (PaddedDataLoader, HFStreamDataLoader)):
             self.val_loader = val_data
             self.val_data = None
-        elif isinstance(val_data, (list, tuple)) and not isinstance(val_data, (torch.Tensor, np.ndarray)):
+        elif isinstance(val_data, (list, tuple)) and not isinstance(
+            val_data, (torch.Tensor, np.ndarray)
+        ):
             self.val_loader = PaddedDataLoader(
                 val_data,
                 batch_size=self.batch_size,
@@ -436,6 +508,7 @@ class ASDAGTrainer:
                 elif self.train_loader is not None:
                     try:
                         from torch.utils.data.distributed import DistributedSampler
+
                         if hasattr(self.train_loader, "data"):
                             _d = self.train_loader.data
                             if isinstance(_d, np.ndarray):
@@ -451,15 +524,27 @@ class ASDAGTrainer:
                                     self.train_loader.stream_len = len(_sharded)
                             elif isinstance(_d, list):
                                 self.train_loader.data = _d[_rank::_ws]
-                        if hasattr(self.train_loader, "data") and isinstance(self.train_loader.data, list) and not getattr(self.train_loader, "is_stream", False):
+                        if (
+                            hasattr(self.train_loader, "data")
+                            and isinstance(self.train_loader.data, list)
+                            and not getattr(self.train_loader, "is_stream", False)
+                        ):
                             try:
                                 _ds_len = len(self.train_loader.data)
+
                                 class _IdxDataset(torch.utils.data.Dataset):
                                     def __len__(self_inner):
                                         return _ds_len
+
                                     def __getitem__(self_inner, idx):
                                         return idx
-                                self.train_sampler = DistributedSampler(_IdxDataset(), num_replicas=_ws, rank=_rank, shuffle=getattr(self.train_loader, "shuffle", True))
+
+                                self.train_sampler = DistributedSampler(
+                                    _IdxDataset(),
+                                    num_replicas=_ws,
+                                    rank=_rank,
+                                    shuffle=getattr(self.train_loader, "shuffle", True),
+                                )
                             except Exception:
                                 self.train_sampler = None
                     except Exception:
@@ -467,12 +552,15 @@ class ASDAGTrainer:
             except Exception:
                 pass
 
-
         # Allocate pinned staging buffers on CPU for zero-copy DMA to CUDA
         if "cuda" in str(self.device):
             try:
-                self._pinned_buf_x = torch.empty((self.batch_size, self.seq_len), dtype=torch.long, pin_memory=True)
-                self._pinned_buf_y = torch.empty((self.batch_size, self.seq_len), dtype=torch.long, pin_memory=True)
+                self._pinned_buf_x = torch.empty(
+                    (self.batch_size, self.seq_len), dtype=torch.long, pin_memory=True
+                )
+                self._pinned_buf_y = torch.empty(
+                    (self.batch_size, self.seq_len), dtype=torch.long, pin_memory=True
+                )
             except Exception:
                 self._pinned_buf_x = None
                 self._pinned_buf_y = None
@@ -481,9 +569,14 @@ class ASDAGTrainer:
             self._pinned_buf_y = None
 
         # Fused / standard AdamW
-        fused = (self.device == "cuda" and hasattr(optim.AdamW, "_fused"))
+        fused = self.device == "cuda" and hasattr(optim.AdamW, "_fused")
         from affine_ai.models.hybrid import TorosHybridLanguageModel
-        _unwrap2 = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+
+        _unwrap2 = (
+            self.model.module
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+            else self.model
+        )
         if isinstance(_unwrap2, TorosHybridLanguageModel):
             self.hybrid = _unwrap2
         elif getattr(_unwrap2, "hybrid", None) is not None:
@@ -495,31 +588,44 @@ class ASDAGTrainer:
 
         if self.hybrid is not None:
             hybrid = self.hybrid
-            can_lpc = self.use_lpc and hasattr(hybrid, 'enable_lpc') and hasattr(hybrid, 'get_default_lpc_optimizers')
-            has_legacy_local = self.use_lpc and getattr(hybrid, 'local_heads', None) is not None
+            can_lpc = (
+                self.use_lpc
+                and hasattr(hybrid, "enable_lpc")
+                and hasattr(hybrid, "get_default_lpc_optimizers")
+            )
+            has_legacy_local = (
+                self.use_lpc and getattr(hybrid, "local_heads", None) is not None
+            )
             if can_lpc:
                 try:
                     try:
                         hybrid.enable_lpc(device=self.device)
                     except TypeError:
                         hybrid.enable_lpc()
-                    has_local_lpc = getattr(hybrid, 'local_heads', None) is not None
+                    has_local_lpc = getattr(hybrid, "local_heads", None) is not None
                 except Exception:
                     has_local_lpc = False
                 if has_local_lpc:
                     lpc_kwargs = {}
-                    if hasattr(hybrid.get_default_lpc_optimizers, '__code__'):
+                    if hasattr(hybrid.get_default_lpc_optimizers, "__code__"):
                         import inspect
+
                         sig = inspect.signature(hybrid.get_default_lpc_optimizers)
-                    if 'capturable' in sig.parameters:
-                        lpc_kwargs['capturable'] = self.use_cuda_graph
+                    if "capturable" in sig.parameters:
+                        lpc_kwargs["capturable"] = self.use_cuda_graph
                     try:
                         self.hybrid_optimizers = hybrid.get_default_lpc_optimizers(
-                            lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, **lpc_kwargs
+                            lr=lr,
+                            weight_decay=weight_decay,
+                            use_muon=self.use_muon,
+                            **lpc_kwargs,
                         )
                     except TypeError:
                         self.hybrid_optimizers = hybrid.get_default_lpc_optimizers(
-                            lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, muon_lr=self.muon_lr
+                            lr=lr,
+                            weight_decay=weight_decay,
+                            use_muon=self.use_muon,
+                            muon_lr=self.muon_lr,
                         )
                     self.lpc_model = None
                     self.lpc_optimizers = None
@@ -528,16 +634,22 @@ class ASDAGTrainer:
                     self.hybrid_optimizers = None
                     self.lpc_model = None
                     self.lpc_optimizers = None
-                    adamw_kwargs = {"lr": lr, "weight_decay": weight_decay, "fused": fused}
+                    adamw_kwargs = {
+                        "lr": lr,
+                        "weight_decay": weight_decay,
+                        "fused": fused,
+                    }
                     if self.use_cuda_graph:
                         adamw_kwargs["capturable"] = True
                     self.optimizer = optim.AdamW(
-                        self.model.parameters(),
-                        **adamw_kwargs
+                        self.model.parameters(), **adamw_kwargs
                     )
             elif has_legacy_local:
                 self.hybrid_optimizers = hybrid.get_default_optimizers(
-                    lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, muon_lr=self.muon_lr
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    use_muon=self.use_muon,
+                    muon_lr=self.muon_lr,
                 )
                 self.lpc_model = None
                 self.lpc_optimizers = None
@@ -550,13 +662,17 @@ class ASDAGTrainer:
                     self.model.parameters(),
                     lr=lr,
                     weight_decay=weight_decay,
-                    fused=fused
+                    fused=fused,
                 )
         elif self.use_lpc:
             from affine_ai.core.lpc import LocalPredictiveLanguageModel
+
             self.lpc_model = LocalPredictiveLanguageModel(self.model).to(self.device)
             self.lpc_optimizers = self.lpc_model.get_default_lpc_optimizers(
-                lr=lr, weight_decay=weight_decay, use_muon=self.use_muon, muon_lr=self.muon_lr
+                lr=lr,
+                weight_decay=weight_decay,
+                use_muon=self.use_muon,
+                muon_lr=self.muon_lr,
             )
             self.hybrid_optimizers = None
             self.optimizer = None
@@ -565,10 +681,7 @@ class ASDAGTrainer:
             self.lpc_optimizers = None
             self.hybrid_optimizers = None
             self.optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-                fused=fused
+                self.model.parameters(), lr=lr, weight_decay=weight_decay, fused=fused
             )
 
         self.loss_fn = nn.CrossEntropyLoss()
@@ -576,23 +689,25 @@ class ASDAGTrainer:
         self.scaler = None
         self.use_amp = False
         try:
-            _model_dtype = getattr(getattr(self.model, 'config', None), 'dtype', None)
+            _model_dtype = getattr(getattr(self.model, "config", None), "dtype", None)
             _is_fp16 = _model_dtype == torch.float16
             if _is_turing() and get_turing_dtype(_model_dtype) == torch.float16:
                 _is_fp16 = True
             if _is_fp16 and "cuda" in str(self.device) and torch.cuda.is_available():
                 if hasattr(torch.amp, "GradScaler"):
-                    self.scaler = torch.amp.GradScaler('cuda')
+                    self.scaler = torch.amp.GradScaler("cuda")
                 else:
                     self.scaler = torch.cuda.amp.GradScaler()
                 self.use_amp = True
                 import warnings
+
                 warnings.warn(
                     "Turing fp16 AMP enabled: using torch.amp.GradScaler for fp16 training on sm_75.",
                     stacklevel=2,
                 )
             elif _is_fp16 and "cuda" in str(self.device):
                 import warnings
+
                 warnings.warn(
                     "FP16 training without CUDA GradScaler (CPU or non-CUDA device); scaler not created.",
                     stacklevel=2,
@@ -604,13 +719,28 @@ class ASDAGTrainer:
     def get_batch(self, split: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
         loader = self.train_loader if split == "train" else self.val_loader
         if loader is not None:
-            if split == "train" and getattr(self, "use_priority_replay", False) and getattr(self, "replay_buffer", None) is not None and getattr(loader, "stream_len", None) is not None and hasattr(loader, "get_batch_by_indices"):
-                max_units = (loader.stream_len - 1) // loader.seq_len if loader.is_stream else len(loader.data)
+            if (
+                split == "train"
+                and getattr(self, "use_priority_replay", False)
+                and getattr(self, "replay_buffer", None) is not None
+                and getattr(loader, "stream_len", None) is not None
+                and hasattr(loader, "get_batch_by_indices")
+            ):
+                max_units = (
+                    (loader.stream_len - 1) // loader.seq_len
+                    if loader.is_stream
+                    else len(loader.data)
+                )
                 if max_units > 0:
-                    n_replay = min(int(self.batch_size * self.replay_ratio), len(self.replay_buffer))
+                    n_replay = min(
+                        int(self.batch_size * self.replay_ratio),
+                        len(self.replay_buffer),
+                    )
                     n_fresh = self.batch_size - n_replay
                     fresh_ix = torch.randint(0, max_units, (n_fresh,)).tolist()
-                    replayed_ix = self.replay_buffer.sample(n_replay) if n_replay > 0 else []
+                    replayed_ix = (
+                        self.replay_buffer.sample(n_replay) if n_replay > 0 else []
+                    )
                     self._last_train_fresh_ix = fresh_ix
                     all_ix = fresh_ix + replayed_ix
                     return loader.get_batch_by_indices(all_ix)
@@ -628,15 +758,22 @@ class ASDAGTrainer:
                 x, y = next(it)
             return x, y
 
-
         data = self.train_data if split == "train" else self.val_data
         if data is None:
             raise ValueError(f"No {split} data available in trainer.")
         high = len(data) - self.seq_len - 1
         if high <= 0:
-            raise ValueError(f"Dataset too small ({len(data)}) for seq_len {self.seq_len}")
-        if split == "train" and getattr(self, "use_priority_replay", False) and getattr(self, "replay_buffer", None) is not None:
-            n_replay = min(int(self.batch_size * self.replay_ratio), len(self.replay_buffer))
+            raise ValueError(
+                f"Dataset too small ({len(data)}) for seq_len {self.seq_len}"
+            )
+        if (
+            split == "train"
+            and getattr(self, "use_priority_replay", False)
+            and getattr(self, "replay_buffer", None) is not None
+        ):
+            n_replay = min(
+                int(self.batch_size * self.replay_ratio), len(self.replay_buffer)
+            )
             n_fresh = self.batch_size - n_replay
             fresh_ix = torch.randint(0, high, (n_fresh,)).tolist()
             replayed_ix = self.replay_buffer.sample(n_replay) if n_replay > 0 else []
@@ -657,7 +794,10 @@ class ASDAGTrainer:
                 idx_next = idx_next.to(data.device, non_blocking=True)
             x = data[idx]
             y = data[idx_next]
-        elif "cuda" in str(self.device) and getattr(self, "_pinned_buf_x", None) is not None:
+        elif (
+            "cuda" in str(self.device)
+            and getattr(self, "_pinned_buf_x", None) is not None
+        ):
             self._pinned_buf_x.copy_(data[idx])
             self._pinned_buf_y.copy_(data[idx_next])
             x = self._pinned_buf_x.to(self.device, non_blocking=True)
@@ -670,12 +810,17 @@ class ASDAGTrainer:
     def get_lr(self, step: int) -> float:
         if step < self.warmup_steps:
             return self.lr * (step + 1) / max(1, self.warmup_steps)
-        progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
+        progress = (step - self.warmup_steps) / max(
+            1, self.max_steps - self.warmup_steps
+        )
         return self.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
-        if getattr(self, "val_loader", None) is None and getattr(self, "val_data", None) is None:
+        if (
+            getattr(self, "val_loader", None) is None
+            and getattr(self, "val_data", None) is None
+        ):
             return {"val_loss": 0.0, "val_bpc": 0.0, "val_ppl": 1.0}
         self.model.eval()
         losses = []
@@ -688,7 +833,7 @@ class ASDAGTrainer:
                 logits = self.model(
                     x,
                     use_quantized_gates=self.use_quantized_gates,
-                    use_shift4_act=self.use_shift4_act
+                    use_shift4_act=self.use_shift4_act,
                 )
                 loss = self.loss_fn(logits.view(-1, self.model.vocab_size), y.view(-1))
                 losses.append(loss.item())
@@ -716,12 +861,18 @@ class ASDAGTrainer:
                 hybrid(x)
                 per_layer = []
                 for blk in blocks:
-                    cm = getattr(blk, "channel_mixer", None) or getattr(blk, "asdag", None)
+                    cm = getattr(blk, "channel_mixer", None) or getattr(
+                        blk, "asdag", None
+                    )
                     rp = getattr(cm, "_last_routing_probs", None)
                     per_layer.append(None if rp is None else rp.detach().float().cpu())
                 counts.append(per_layer)
             for li in range(len(blocks)):
-                parts = [c[li].reshape(-1, c[li].shape[-1]) for c in counts if c[li] is not None]
+                parts = [
+                    c[li].reshape(-1, c[li].shape[-1])
+                    for c in counts
+                    if c[li] is not None
+                ]
                 if not parts:
                     continue
                 p = torch.cat(parts, dim=0)
@@ -739,8 +890,13 @@ class ASDAGTrainer:
                         dead += 1
                     if f > 0:
                         ent -= f * math.log(f)
-                stats[li] = {"top1": top1, "dead": float(dead), "leaves": float(K),
-                             "entropy": ent, "entropy_max": math.log(K)}
+                stats[li] = {
+                    "top1": top1,
+                    "dead": float(dead),
+                    "leaves": float(K),
+                    "entropy": ent,
+                    "entropy_max": math.log(K),
+                }
         finally:
             if was_training:
                 hybrid.train()
@@ -748,7 +904,9 @@ class ASDAGTrainer:
                 hybrid.eval()
         return stats
 
-    def train_step_backpressure(self, step: int, use_sign_backpressure: bool = False) -> float:
+    def train_step_backpressure(
+        self, step: int, use_sign_backpressure: bool = False
+    ) -> float:
         """
         Executes a zero-autograd closed-form local backpressure training step (1.B).
         Eliminates reverse-mode tape memory allocations.
@@ -763,7 +921,7 @@ class ASDAGTrainer:
             x,
             use_quantized_gates=self.use_quantized_gates,
             use_shift4_act=self.use_shift4_act,
-            record_cache=True
+            record_cache=True,
         )
 
         B, T, V = logits.shape
@@ -772,13 +930,17 @@ class ASDAGTrainer:
         # Error for backpressure: (1[target] - probs) / (B*T)
         scale_val = torch.tensor(-1.0, device=probs.device, dtype=probs.dtype)
         logits_error = -probs
-        logits_error.scatter_add_(-1, y.unsqueeze(-1), scale_val.expand_as(y.unsqueeze(-1)))
+        logits_error.scatter_add_(
+            -1, y.unsqueeze(-1), scale_val.expand_as(y.unsqueeze(-1))
+        )
         logits_error = -logits_error / float(B * T)
 
         loss = self.loss_fn(logits.view(-1, V), y.view(-1))
 
         self.optimizer.zero_grad(set_to_none=True)
-        self.model.backward_backpressure(logits_error, use_sign_backpressure=use_sign_backpressure)
+        self.model.backward_backpressure(
+            logits_error, use_sign_backpressure=use_sign_backpressure
+        )
 
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -791,27 +953,60 @@ class ASDAGTrainer:
         if getattr(self, "hybrid", None) is not None:
             lr = self.get_lr(step)
             lr_ratio = lr / max(1e-8, self.lr)
-            if self.use_lpc and self.hybrid_optimizers is not None and hasattr(self.hybrid, 'forward_lpc_step'):
-                for opt in self.hybrid_optimizers:
-                    if hasattr(opt, "muon_opt") and opt.muon_opt:
-                        for pg in opt.muon_opt.param_groups:
-                            pg["lr"] = self.muon_lr * lr_ratio
-                    if hasattr(opt, "adamw_opt") and opt.adamw_opt:
-                        for pg in opt.adamw_opt.param_groups:
-                            pg["lr"] = self.lr * lr_ratio
-                    if not hasattr(opt, "muon_opt"):
-                        for pg in opt.param_groups:
-                            pg["lr"] = lr
+            _graphed = bool(self.use_cuda_graph) and "cuda" in str(self.device)
+            if (
+                self.use_lpc
+                and self.hybrid_optimizers is not None
+                and hasattr(self.hybrid, "forward_lpc_step")
+            ):
+                if _graphed and not getattr(self, "_graph_lr_pinned", False):
+                    # CUDA graphs bake host-side LR floats as launch constants: a
+                    # per-step schedule can never take effect inside replay (all
+                    # steps would silently reuse the capture-step LR). Pin base LRs
+                    # once so warmup, recording, and replay agree (constant-LR).
+                    for opt in self.hybrid_optimizers or []:
+                        if hasattr(opt, "muon_opt") and opt.muon_opt:
+                            for pg in opt.muon_opt.param_groups:
+                                pg["lr"] = self.muon_lr
+                        if hasattr(opt, "adamw_opt") and opt.adamw_opt:
+                            for pg in opt.adamw_opt.param_groups:
+                                pg["lr"] = self.lr
+                        if not hasattr(opt, "muon_opt"):
+                            for pg in opt.param_groups:
+                                pg["lr"] = lr
+                    self._graph_lr_pinned = True
+                if not _graphed:
+                    for opt in self.hybrid_optimizers:
+                        if hasattr(opt, "muon_opt") and opt.muon_opt:
+                            for pg in opt.muon_opt.param_groups:
+                                pg["lr"] = self.muon_lr * lr_ratio
+                        if hasattr(opt, "adamw_opt") and opt.adamw_opt:
+                            for pg in opt.adamw_opt.param_groups:
+                                pg["lr"] = self.lr * lr_ratio
+                        if not hasattr(opt, "muon_opt"):
+                            for pg in opt.param_groups:
+                                pg["lr"] = lr
                 x, y = self.get_batch("train")
                 res = self.hybrid.forward_lpc_step(
-                    x, y, self.hybrid_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss,
+                    x,
+                    y,
+                    self.hybrid_optimizers,
+                    grad_clip=self.grad_clip,
+                    sync_loss=sync_loss,
                     return_sample_loss=self.use_priority_replay,
                     use_cuda_graph=self.use_cuda_graph,
                 )
-                if self.use_priority_replay and self.replay_buffer is not None and "sample_loss" in res and res["sample_loss"] is not None:
+                if (
+                    self.use_priority_replay
+                    and self.replay_buffer is not None
+                    and "sample_loss" in res
+                    and res["sample_loss"] is not None
+                ):
                     n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
                     if n_fresh > 0:
-                        self.replay_buffer.push_candidates(self._last_train_fresh_ix, res["sample_loss"][:n_fresh])
+                        self.replay_buffer.push_candidates(
+                            self._last_train_fresh_ix, res["sample_loss"][:n_fresh]
+                        )
                 return res["loss"]
             else:
                 for param_group in self.optimizer.param_groups:
@@ -823,20 +1018,32 @@ class ASDAGTrainer:
                     self.scaler.scale(loss).backward()
                     if self.grad_clip > 0:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.grad_clip
+                        )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
                     if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.grad_clip
+                        )
                     self.optimizer.step()
                 if self.use_priority_replay and self.replay_buffer is not None:
                     n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
                     if n_fresh > 0:
                         with torch.no_grad():
-                            s_loss = F.cross_entropy(logits.view(-1, 256), y.view(-1), reduction='none').view(x.shape[0], -1).mean(dim=-1)
-                            self.replay_buffer.push_candidates(self._last_train_fresh_ix, s_loss[:n_fresh])
+                            s_loss = (
+                                F.cross_entropy(
+                                    logits.view(-1, 256), y.view(-1), reduction="none"
+                                )
+                                .view(x.shape[0], -1)
+                                .mean(dim=-1)
+                            )
+                            self.replay_buffer.push_candidates(
+                                self._last_train_fresh_ix, s_loss[:n_fresh]
+                            )
                 return loss.item() if sync_loss else loss.detach()
 
         if self.use_backpressure:
@@ -856,7 +1063,9 @@ class ASDAGTrainer:
                     for pg in opt.param_groups:
                         pg["lr"] = lr
             x, y = self.get_batch("train")
-            res = self.lpc_model.forward_lpc_step(x, y, self.lpc_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss)
+            res = self.lpc_model.forward_lpc_step(
+                x, y, self.lpc_optimizers, grad_clip=self.grad_clip, sync_loss=sync_loss
+            )
             return res["loss"]
 
         lr = self.get_lr(step)
@@ -867,7 +1076,7 @@ class ASDAGTrainer:
         logits = self.model(
             x,
             use_quantized_gates=self.use_quantized_gates,
-            use_shift4_act=self.use_shift4_act
+            use_shift4_act=self.use_shift4_act,
         )
         loss = self.loss_fn(logits.view(-1, self.model.vocab_size), y.view(-1))
 
@@ -890,8 +1099,18 @@ class ASDAGTrainer:
             n_fresh = len(getattr(self, "_last_train_fresh_ix", []))
             if n_fresh > 0:
                 with torch.no_grad():
-                    s_loss = F.cross_entropy(logits.view(-1, self.model.vocab_size), y.view(-1), reduction='none').view(x.shape[0], -1).mean(dim=-1)
-                    self.replay_buffer.push_candidates(self._last_train_fresh_ix, s_loss[:n_fresh])
+                    s_loss = (
+                        F.cross_entropy(
+                            logits.view(-1, self.model.vocab_size),
+                            y.view(-1),
+                            reduction="none",
+                        )
+                        .view(x.shape[0], -1)
+                        .mean(dim=-1)
+                    )
+                    self.replay_buffer.push_candidates(
+                        self._last_train_fresh_ix, s_loss[:n_fresh]
+                    )
         return loss.item() if sync_loss else loss.detach()
 
     def train(self, save_path: Optional[str] = None) -> Dict[str, Any]:
@@ -922,20 +1141,34 @@ class ASDAGTrainer:
                     gc.collect()
 
                 if step % self.eval_interval == 0 or step == self.max_steps - 1:
-                    if getattr(self, "is_distributed", False) and not getattr(self, "is_main", True):
+                    if getattr(self, "is_distributed", False) and not getattr(
+                        self, "is_main", True
+                    ):
                         continue
                     eval_metrics = self.evaluate()
                     try:
                         _rh = self.routing_health(n_batches=2)
                         if _rh:
-                            _worst_li = min(_rh, key=lambda li: _rh[li]["entropy"] / max(1e-9, _rh[li]["entropy_max"]))
+                            _worst_li = min(
+                                _rh,
+                                key=lambda li: (
+                                    _rh[li]["entropy"]
+                                    / max(1e-9, _rh[li]["entropy_max"])
+                                ),
+                            )
                             _w = _rh[_worst_li]
-                            print(f"Routing health: worst layer {_worst_li} "
-                                  f"top1={_w['top1']:.2f} dead={int(_w['dead'])}/{int(_w['leaves'])} "
-                                  f"ent={_w['entropy']:.2f}/{_w['entropy_max']:.2f}", flush=True)
-                            if (_w["entropy"] < 0.4 * _w["entropy_max"]
-                                    or _w["dead"] > 0.25 * _w["leaves"]):
+                            print(
+                                f"Routing health: worst layer {_worst_li} "
+                                f"top1={_w['top1']:.2f} dead={int(_w['dead'])}/{int(_w['leaves'])} "
+                                f"ent={_w['entropy']:.2f}/{_w['entropy_max']:.2f}",
+                                flush=True,
+                            )
+                            if (
+                                _w["entropy"] < 0.4 * _w["entropy_max"]
+                                or _w["dead"] > 0.25 * _w["leaves"]
+                            ):
                                 import warnings
+
                                 warnings.warn(
                                     f"Router starvation signs at layer {_worst_li}: "
                                     f"top1={_w['top1']:.2f}, dead={int(_w['dead'])}/{int(_w['leaves'])}. "
@@ -946,23 +1179,43 @@ class ASDAGTrainer:
                         pass
                     if getattr(self, "is_distributed", False) and self.world_size > 1:
                         try:
-                            _t = torch.tensor(eval_metrics["val_loss"], device=self.device if isinstance(self.device, torch.device) else torch.device(self.device) if "cuda" in str(self.device) and torch.cuda.is_available() else torch.device("cpu"))
+                            _t = torch.tensor(
+                                eval_metrics["val_loss"],
+                                device=self.device
+                                if isinstance(self.device, torch.device)
+                                else torch.device(self.device)
+                                if "cuda" in str(self.device)
+                                and torch.cuda.is_available()
+                                else torch.device("cpu"),
+                            )
                             all_reduce_sum(_t)
                             _t = _t / float(self.world_size)
                             eval_metrics["val_loss"] = float(_t.item())
-                            eval_metrics["val_bpc"] = eval_metrics["val_loss"] / math.log(2)
-                            eval_metrics["val_ppl"] = math.exp(min(eval_metrics["val_loss"], 20.0))
+                            eval_metrics["val_bpc"] = eval_metrics[
+                                "val_loss"
+                            ] / math.log(2)
+                            eval_metrics["val_ppl"] = math.exp(
+                                min(eval_metrics["val_loss"], 20.0)
+                            )
                         except Exception:
                             pass
                     if eval_metrics["val_loss"] < best_val_loss:
                         best_val_loss = eval_metrics["val_loss"]
                         if save_path and getattr(self, "is_main", True):
                             import os as _os
+
                             _dir = _os.path.dirname(save_path)
                             if _dir:
                                 _os.makedirs(_dir, exist_ok=True)
                             try:
-                                _state = self.model.module.state_dict() if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model.state_dict()
+                                _state = (
+                                    self.model.module.state_dict()
+                                    if isinstance(
+                                        self.model,
+                                        torch.nn.parallel.DistributedDataParallel,
+                                    )
+                                    else self.model.state_dict()
+                                )
                             except Exception:
                                 _state = self.model.state_dict()
                             torch.save(_state, save_path)
@@ -978,7 +1231,13 @@ class ASDAGTrainer:
         total_time = time.time() - start_time
         if getattr(self, "is_distributed", False) and self.world_size > 1:
             try:
-                _dev = self.device if isinstance(self.device, torch.device) else torch.device(self.device) if "cuda" in str(self.device) and torch.cuda.is_available() else torch.device("cpu")
+                _dev = (
+                    self.device
+                    if isinstance(self.device, torch.device)
+                    else torch.device(self.device)
+                    if "cuda" in str(self.device) and torch.cuda.is_available()
+                    else torch.device("cpu")
+                )
                 _b = torch.tensor(best_val_loss, device=_dev)
                 all_reduce_sum(_b)
                 _b = _b / float(self.world_size)
@@ -989,7 +1248,7 @@ class ASDAGTrainer:
             "best_val_loss": best_val_loss,
             "best_val_bpc": best_val_loss / math.log(2),
             "best_val_ppl": math.exp(min(best_val_loss, 20.0)),
-            "total_time_seconds": total_time
+            "total_time_seconds": total_time,
         }
 
 
@@ -1025,8 +1284,10 @@ def train(
     # Architectural Mixer options
     channel_mixer: Optional[str] = None,
     time_mixer: Optional[str] = None,
+    swa_every_n: Optional[int] = None,
+    swa_window: Optional[int] = None,
     # Priority Replay (AXIOM Info-Gain Selection) options
-    use_priority_replay: bool = True,
+    use_priority_replay: bool = False,
     replay_ratio: float = 0.25,
     replay_buffer_capacity: int = 4000,
     replay_max_replays: int = 3,
@@ -1108,6 +1369,8 @@ def train(
         mtp_lambda=mtp_lambda,
         channel_mixer=channel_mixer,
         time_mixer=time_mixer,
+        swa_every_n=swa_every_n,
+        swa_window=swa_window,
         use_priority_replay=use_priority_replay,
         replay_ratio=replay_ratio,
         replay_buffer_capacity=replay_buffer_capacity,
@@ -1116,5 +1379,3 @@ def train(
         **kwargs,
     )
     return trainer.train(save_path=save_path)
-
-

@@ -311,7 +311,9 @@ class ASDAGLanguageModel(nn.Module):
         use_mtp: bool = True,
         num_mtp_heads: int = 1,
         mtp_lambda: float = 0.3,
-        use_hybrid: bool = True
+        use_hybrid: bool = True,
+        swa_every_n: int = 6,
+        swa_window: int = 256
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -335,6 +337,8 @@ class ASDAGLanguageModel(nn.Module):
                 n_heads=n_heads,
                 target_patch_size=target_patch_size,
                 channel_mixer_type=channel_mixer_type,
+                swa_every_n=swa_every_n,
+                swa_window=swa_window,
                 dtype=dtype
             )
             self.hybrid = TorosHybridLanguageModel(cfg)
@@ -364,6 +368,9 @@ class ASDAGLanguageModel(nn.Module):
             self.lm_head = self.blt.byte_decoder.lm_head
             self.blocks = self.blt.global_blocks
             self.norm_f = self.blt.global_norm
+            if swa_every_n:
+                from affine_ai.core.swa import interleave_swa
+                interleave_swa(self, every_n=swa_every_n, window=swa_window)
             return
 
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
@@ -399,6 +406,9 @@ class ASDAGLanguageModel(nn.Module):
         self.apply(self._init_weights)
         if dtype is not None and dtype != torch.float32:
             self.to(dtype)
+        if swa_every_n:
+            from affine_ai.core.swa import interleave_swa
+            interleave_swa(self, every_n=swa_every_n, window=swa_window)
 
     def get_default_optimizer(
         self,

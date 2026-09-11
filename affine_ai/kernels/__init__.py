@@ -71,6 +71,9 @@ except Exception:
 # Fused Permutation Projection
 triton_fused_perm_proj = _optional_import("affine_ai.kernels.triton_perm_proj", "triton_fused_perm_proj")
 
+# Sliding Window Attention
+sliding_window_attn = _optional_import("affine_ai.kernels.triton_sliding_window", "sliding_window_attn")
+
 if triton_adamw_step is None:
     try:
         import math
@@ -159,7 +162,7 @@ try:
         triton_fused_byte_encoder, TritonByteEncoderFunction,
         triton_patch_mean_pool, triton_patch_weighted_pool,
         triton_bitlinear_swiglu, TritonBitLinearSwiGLUFunction,
-        TritonAdamW, triton_adamw_step, triton_fused_perm_proj,
+        TritonAdamW, triton_adamw_step, triton_fused_perm_proj, sliding_window_attn,
     ]
     TRITON_AVAILABLE = torch.cuda.is_available() and any(s is not None for s in _ALL_TRITON_SYMBOLS)
     # Turing (sm_75) FP16 AMP support: keep Triton but cap SMEM/BLOCK and force fp16
@@ -236,6 +239,7 @@ __all__ = [
     "TritonAdamW",
     "triton_adamw_step",
     "triton_fused_perm_proj",
+    "sliding_window_attn",
     "TRITON_AVAILABLE",
 ]
 

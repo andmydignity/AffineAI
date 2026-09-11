@@ -430,10 +430,9 @@ class TritonTreePermFunction(torch.autograd.Function):
         gr = None
         if ctx.needs_input_grad[0]:
             gr_flat = torch.zeros((B_flat, D), dtype=dtype, device=r_flat.device)
-            # Sentinel -1 (missing edge) inversion via scatter to dummy slot at D (Issue 13)
             temp = torch.full((K, P, D + 1), -1, device=perms_f.device, dtype=torch.int32)
             valid_mask = (perms_f >= 0) & (perms_f < D)
-            target = torch.where(valid_mask, perms_f.long(), torch.tensor(D, device=perms_f.device, dtype=torch.long))
+            target = torch.where(valid_mask, perms_f.long(), D)
             arange_d = torch.arange(D, device=perms_f.device, dtype=torch.int32).expand_as(perms_f)
             temp.scatter_(-1, target, arange_d)
             inv_perms_f = temp[..., :D].contiguous()

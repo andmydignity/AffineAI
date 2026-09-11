@@ -132,13 +132,13 @@ class CUDAGraphRunner:
             for _ in range(self.warmup_iters):
                 _ = self.step_fn(*self.static_inputs)
 
-            # Record graph on the capture stream explicitly
-            if self.graph_pool_handle is not None:
-                with torch.cuda.graph(self.graph, stream=self.stream, pool=self.graph_pool_handle):
-                    self.static_outputs = self.step_fn(*self.static_inputs)
-            else:
-                with torch.cuda.graph(self.graph, stream=self.stream):
-                    self.static_outputs = self.step_fn(*self.static_inputs)
+            # Release unallocated cached memory to prevent allocator over-reservation
+            torch.cuda.empty_cache()
+
+            # Record graph sharing the allocator's memory pool to eliminate duplicate private pool overhead
+            pool = self.graph_pool_handle if self.graph_pool_handle is not None else torch.cuda.graph_pool_handle()
+            with torch.cuda.graph(self.graph, stream=self.stream, pool=pool):
+                self.static_outputs = self.step_fn(*self.static_inputs)
 
         current_stream.wait_stream(self.stream)
         self._is_captured = True

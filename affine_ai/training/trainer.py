@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from typing import Optional, Dict, Any, Union, Tuple
+from typing import Optional, Dict, Any, Union, Tuple, List
 import numpy as np
 
 from affine_ai.models.language_model import ASDAGLanguageModel

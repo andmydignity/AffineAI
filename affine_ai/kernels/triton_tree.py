@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 import warnings
+from typing import Optional, Tuple, Any, List
 
 
 _TURING_CACHE: Optional[bool] = None

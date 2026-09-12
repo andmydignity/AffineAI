@@ -120,6 +120,9 @@ def setup_distributed(backend: str = "nccl") -> None:
             pass
 
 
+init_distributed = setup_distributed
+
+
 def cleanup_distributed() -> None:
     """Destroy process group if initialized."""
     if is_distributed():

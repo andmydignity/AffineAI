@@ -157,8 +157,8 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             bias_tensor = bias.contiguous().reshape(-1)
             stride_b = bias_tensor.stride(0)
         else:
-            bias_tensor = torch.zeros(1, device=x.device, dtype=torch.float32)
-            stride_b = bias_tensor.stride(0)
+            bias_tensor = x_int8
+            stride_b = 0
 
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))  # noqa: E731
 
@@ -174,26 +174,36 @@ class TritonINT8IMMAFunction(torch.autograd.Function):
             HAS_BIAS=has_bias,
         )
 
-        w_q = (w_int8.float() * sw.unsqueeze(-1)).to(weight.dtype)
-        x_q = (x_int8.float() * sx.unsqueeze(-1)).to(x.dtype)
-        ctx.save_for_backward(x_q, w_q, bias if bias is not None else torch.empty(0, device=x.device))
+        ctx.save_for_backward(x_int8, sx, w_int8, sw, bias if has_bias else torch.empty(0, device=x.device))
         ctx.orig_shape = orig_shape
-        ctx.has_bias = bias is not None
-        ctx.K = K
-        ctx.M = M
-        ctx.N = N
+        ctx.has_bias = has_bias
         return out.reshape(*orig_shape[:-1], N)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        x_q, w_q, bias = ctx.saved_tensors
+        if len(ctx.saved_tensors) == 3:
+            x_flat, weight, bias = ctx.saved_tensors
+            orig_shape = ctx.orig_shape
+            go_flat = grad_output.reshape(-1, weight.shape[0]).contiguous()
+            gx = torch.matmul(go_flat, weight.to(go_flat.dtype)).reshape(*orig_shape) if ctx.needs_input_grad[0] else None
+            gw = torch.matmul(go_flat.t(), x_flat.to(go_flat.dtype)) if ctx.needs_input_grad[1] else None
+            gb = go_flat.sum(dim=0) if (bias is not None and ctx.needs_input_grad[2]) else None
+            return gx, gw, gb
+
+        x_int8, sx, w_int8, sw, bias = ctx.saved_tensors
         orig_shape = ctx.orig_shape
-        go_flat = grad_output.reshape(-1, w_q.shape[0]).contiguous()
-        gx = torch.matmul(go_flat, w_q.to(go_flat.dtype)) if ctx.needs_input_grad[0] else None
-        gw = torch.matmul(go_flat.t(), x_q.to(go_flat.dtype)) if ctx.needs_input_grad[1] else None
+        go_flat = grad_output.reshape(-1, w_int8.shape[0]).contiguous()
+        if ctx.needs_input_grad[0]:
+            w_q = (w_int8.float() * sw.unsqueeze(-1)).to(go_flat.dtype)
+            gx = torch.matmul(go_flat, w_q).reshape(*orig_shape)
+        else:
+            gx = None
+        if ctx.needs_input_grad[1]:
+            x_q = (x_int8.float() * sx.unsqueeze(-1)).to(go_flat.dtype)
+            gw = torch.matmul(go_flat.t(), x_q)
+        else:
+            gw = None
         gb = go_flat.sum(dim=0) if (ctx.has_bias and ctx.needs_input_grad[2]) else None
-        if gx is not None:
-            gx = gx.reshape(*orig_shape)
         return gx, gw, gb
 
 

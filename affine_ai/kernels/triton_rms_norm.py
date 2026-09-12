@@ -142,20 +142,27 @@ def _rms_norm_fwd_kernel(
     if D <= BLOCK_SIZE:
         cols = tl.arange(0, BLOCK_SIZE)
         mask = cols < D
-        x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
-        x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
+        if stride_xd == 1:
+            x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
+            x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
+        else:
+            x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
+            x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
         var = tl.sum(x * x, axis=0) / D
         rsqrt = tl.rsqrt(var + eps_val)
         tl.store(Rsqrt_ptr + row_idx, rsqrt)
         if stride_sb == 1:
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 0.0)
         else:
             scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
         y = (x * rsqrt * scale).to(x_dtype)
-        out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
-        tl.store(out_ptrs, y, mask=mask)
+        if stride_od == 1:
+            out_block = tl.make_block_ptr(base=Out_ptr + row_idx * stride_ob, shape=(D,), strides=(stride_od,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
+            tl.store(out_block, y, boundary_check=(0,))
+        else:
+            out_ptrs = Out_ptr + row_idx * stride_ob + cols * stride_od
+            tl.store(out_ptrs, y, mask=mask)
         return
 
     if D <= 2 * BLOCK_SIZE:
@@ -166,9 +173,7 @@ def _rms_norm_fwd_kernel(
 
         if stride_xd == 1:
             x0 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            x0 = tl.where(mask0, x0, 0.0)
             x1 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            x1 = tl.where(mask1, x1, 0.0)
         else:
             x0 = tl.load(X_ptr + row_idx * stride_xb + cols0 * stride_xd, mask=mask0, other=0.0).to(acc_dtype)
             x1 = tl.load(X_ptr + row_idx * stride_xb + cols1 * stride_xd, mask=mask1, other=0.0).to(acc_dtype)
@@ -180,9 +185,7 @@ def _rms_norm_fwd_kernel(
 
         if stride_sb == 1:
             scale0 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            scale0 = tl.where(mask0, scale0, 0.0)
             scale1 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            scale1 = tl.where(mask1, scale1, 0.0)
         else:
             scale0 = tl.load(Scale_ptr + cols0 * stride_sb, mask=mask0, other=0.0).to(acc_dtype)
             scale1 = tl.load(Scale_ptr + cols1 * stride_sb, mask=mask1, other=0.0).to(acc_dtype)
@@ -203,10 +206,8 @@ def _rms_norm_fwd_kernel(
         cols = d_start + tl.arange(0, BLOCK_SIZE)
         mask = cols < D
         if stride_xd == 1:
-            # block_ptr for contiguous row: 1D block of size BLOCK_SIZE starting at d_start
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
-            x = tl.where(cols < D, x, 0.0)
         else:
             x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
             x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
@@ -222,14 +223,12 @@ def _rms_norm_fwd_kernel(
         if stride_xd == 1 and stride_od == 1:
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
-            x = tl.where(cols < D, x, 0.0)
         else:
             x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
             x = tl.load(x_ptrs, mask=mask, other=0.0).to(acc_dtype)
         if stride_sb == 1:
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 0.0)
         else:
             scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=0.0).to(acc_dtype)
         y = (x * rsqrt * scale).to(x_dtype)
@@ -268,13 +267,10 @@ def _rms_norm_bwd_dx_kernel(
         if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1 and stride_dxd == 1:
             dy_block = tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             dy = tl.load(dy_block, boundary_check=(0,)).to(acc_dtype)
-            dy = tl.where(cols < D, dy, 0.0)
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
-            x = tl.where(cols < D, x, 0.0)
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 0.0)
         else:
             dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
             x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
@@ -298,18 +294,12 @@ def _rms_norm_bwd_dx_kernel(
 
         if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1:
             dy0 = tl.load(tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            dy0 = tl.where(mask0, dy0, 0.0)
             x0 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            x0 = tl.where(mask0, x0, 0.0)
             scale0 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            scale0 = tl.where(mask0, scale0, 0.0)
 
             dy1 = tl.load(tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            dy1 = tl.where(mask1, dy1, 0.0)
             x1 = tl.load(tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            x1 = tl.where(mask1, x1, 0.0)
             scale1 = tl.load(tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,)), boundary_check=(0,)).to(acc_dtype)
-            scale1 = tl.where(mask1, scale1, 0.0)
         else:
             dy0 = tl.load(DY_ptr + row_idx * stride_dyb + cols0 * stride_dyd, mask=mask0, other=0.0).to(acc_dtype)
             x0 = tl.load(X_ptr + row_idx * stride_xb + cols0 * stride_xd, mask=mask0, other=0.0).to(acc_dtype)
@@ -342,13 +332,10 @@ def _rms_norm_bwd_dx_kernel(
         if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1:
             dy_block = tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             dy = tl.load(dy_block, boundary_check=(0,)).to(acc_dtype)
-            dy = tl.where(cols < D, dy, 0.0)
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
-            x = tl.where(cols < D, x, 0.0)
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 0.0)
         else:
             dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
             x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
@@ -363,13 +350,10 @@ def _rms_norm_bwd_dx_kernel(
         if stride_dyd == 1 and stride_xd == 1 and stride_sb == 1 and stride_dxd == 1:
             dy_block = tl.make_block_ptr(base=DY_ptr + row_idx * stride_dyb, shape=(D,), strides=(stride_dyd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             dy = tl.load(dy_block, boundary_check=(0,)).to(acc_dtype)
-            dy = tl.where(cols < D, dy, 0.0)
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,)).to(acc_dtype)
-            x = tl.where(cols < D, x, 0.0)
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 0.0)
         else:
             dy = tl.load(DY_ptr + row_idx * stride_dyb + cols * stride_dyd, mask=mask, other=0.0).to(acc_dtype)
             x = tl.load(X_ptr + row_idx * stride_xb + cols * stride_xd, mask=mask, other=0.0).to(acc_dtype)
@@ -385,7 +369,7 @@ def _rms_norm_bwd_dx_kernel(
 
 @triton.autotune(
     configs=_get_dscale_autotune_configs(),
-    key=['D', 'N'],
+    key=['D'],
     prune_configs_by={'prune_dscale_configs': _prune_dscale_configs},
     reset_to_zero=['DScale_ptr']  # R-08: requires zeroed DScale_ptr; autotune reuses buffers, so caller must zero-init (see Python assert)
     # Doc(R-01/R-02): atomic_add for float64 requires single split (num_n_splits==1), else raise. Python guards grid=(cdiv(D,BLOCK),1) for fp64.
@@ -395,7 +379,7 @@ def _rms_norm_bwd_dscale_kernel(
     DY_ptr, X_ptr, Rsqrt_ptr, DScale_ptr,
     stride_dyb, stride_dyd,
     stride_xb, stride_xd,
-    N: tl.constexpr, D: tl.constexpr,
+    N, D: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
     pid_d = tl.program_id(0)
@@ -460,7 +444,7 @@ def _rms_norm_bwd_fused_kernel(
     stride_xb, stride_xd,
     stride_sb,
     stride_dxb, stride_dxd,
-    N: tl.constexpr, D: tl.constexpr,
+    N, D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_ROW: tl.constexpr
 ):
@@ -524,14 +508,8 @@ class TritonRMSNormFunc(torch.autograd.Function):
             )
             scale = scale.to(torch.float16)
         orig_shape = x.shape
-        if not x.is_contiguous():  # R-12: avoid redundant .contiguous()
-            x = x.contiguous()
-        x_flat = x.reshape(-1, orig_shape[-1])
-        if not x_flat.is_contiguous():
-            x_flat = x_flat.contiguous()
-        if not scale.is_contiguous():
-            scale = scale.contiguous()
-        scale_contig = scale.view(-1).contiguous()
+        x_flat = x.reshape(-1, orig_shape[-1]).contiguous()
+        scale_contig = scale.reshape(-1).contiguous()
         N, D = x_flat.shape
         # R-09: N==0 guard: empty batch -> return empty without launching grid (0,)
         if N == 0:
@@ -660,9 +638,7 @@ def _fused_add_rms_norm_fwd_kernel(
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             res_block = tl.make_block_ptr(base=Res_ptr + row_idx * stride_rb, shape=(D,), strides=(stride_rd,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,))
-            x = tl.where(cols < D, x, 0.0)
             res = tl.load(res_block, boundary_check=(0,))
-            res = tl.where(cols < D, res, 0.0)
         else:
             x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
             res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
@@ -680,7 +656,6 @@ def _fused_add_rms_norm_fwd_kernel(
         if stride_sb == 1:
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(0,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 1.0)
         else:
             scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
         y = (res_acc * rsqrt * scale).to(x_dtype)
@@ -700,9 +675,7 @@ def _fused_add_rms_norm_fwd_kernel(
             x_block = tl.make_block_ptr(base=X_ptr + row_idx * stride_xb, shape=(D,), strides=(stride_xd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             res_block = tl.make_block_ptr(base=Res_ptr + row_idx * stride_rb, shape=(D,), strides=(stride_rd,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             x = tl.load(x_block, boundary_check=(0,))
-            x = tl.where(cols < D, x, 0.0)
             res = tl.load(res_block, boundary_check=(0,))
-            res = tl.where(cols < D, res, 0.0)
         else:
             x_ptrs = X_ptr + row_idx * stride_xb + cols * stride_xd
             res_ptrs = Res_ptr + row_idx * stride_rb + cols * stride_rd
@@ -727,13 +700,11 @@ def _fused_add_rms_norm_fwd_kernel(
         if stride_rod == 1:
             res_out_block = tl.make_block_ptr(base=Res_out_ptr + row_idx * stride_rob, shape=(D,), strides=(stride_rod,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             res_acc = tl.load(res_out_block, boundary_check=(0,)).to(acc_dtype)
-            res_acc = tl.where(cols < D, res_acc, 0.0)
         else:
             res_acc = tl.load(Res_out_ptr + row_idx * stride_rob + cols * stride_rod, mask=mask, other=0.0).to(acc_dtype)
         if stride_sb == 1:
             scale_block = tl.make_block_ptr(base=Scale_ptr, shape=(D,), strides=(stride_sb,), offsets=(d_start,), block_shape=(BLOCK_SIZE,), order=(0,))
             scale = tl.load(scale_block, boundary_check=(0,)).to(acc_dtype)
-            scale = tl.where(cols < D, scale, 1.0)
         else:
             scale = tl.load(Scale_ptr + cols * stride_sb, mask=mask, other=1.0).to(acc_dtype)
         y = (res_acc * rsqrt * scale).to(x_dtype)
@@ -768,19 +739,9 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
             scale = scale.to(torch.float16)
         orig_shape = x.shape
         assert residual.shape == orig_shape, f"residual shape mismatch: residual.shape={residual.shape} != x.shape={orig_shape}"
-        if not x.is_contiguous():
-            x = x.contiguous()
-        if not residual.is_contiguous():
-            residual = residual.contiguous()
-        x_flat = x.reshape(-1, orig_shape[-1])
-        if not x_flat.is_contiguous():
-            x_flat = x_flat.contiguous()
-        res_flat = residual.reshape(-1, orig_shape[-1])
-        if not res_flat.is_contiguous():
-            res_flat = res_flat.contiguous()
-        if not scale.is_contiguous():
-            scale = scale.contiguous()
-        scale_contig = scale.view(-1).contiguous()
+        x_flat = x.reshape(-1, orig_shape[-1]).contiguous()
+        res_flat = residual.reshape(-1, orig_shape[-1]).contiguous()
+        scale_contig = scale.reshape(-1).contiguous()
         N, D = x_flat.shape
         if N == 0:  # R-09
             out = torch.empty_like(x_flat)

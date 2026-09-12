@@ -67,49 +67,42 @@ if triton is not None:
         stride_pp, stride_pd,
         stride_bm, stride_bd,
         stride_om, stride_on, stride_od,
-        N: tl.constexpr, D: tl.constexpr, P: tl.constexpr,
+        N, D: tl.constexpr, P: tl.constexpr,
         M: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         pid_n = tl.program_id(0)
         pid_d = tl.program_id(1)
+        pid_m = tl.program_id(2)
 
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
         mask_n = offs_n < N
         mask_d = offs_d < D
 
-        for m_base in range(0, M, 2):
-            acc0 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
-            acc1 = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
 
-            for p in range(P):
-                p_idx = tl.load(Perms + p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
-                tl.device_assert((p_idx >= 0) & (p_idx < D), "perm OOB")
-                x_ptrs = X + offs_n[:, None] * stride_xn + p_idx[None, :] * stride_xd
-                x_val = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
-                if M > m_base + 0:
-                    w0 = tl.load(W + (m_base + 0) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
-                    acc0 = acc0 + x_val * w0[None, :]
-                if M > m_base + 1:
-                    w1 = tl.load(W + (m_base + 1) * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
-                    acc1 = acc1 + x_val * w1[None, :]
+        for p in range(P):
+            p_idx = tl.load(Perms + p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
+            x_ptrs = X + offs_n[:, None] * stride_xn + p_idx[None, :] * stride_xd
+            x_val = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            w = tl.load(W + pid_m * stride_wm + p * stride_wp + offs_d * stride_wd, mask=mask_d, other=0.0).to(tl.float32)
+            acc = acc + x_val * w[None, :]
 
-            if M > m_base + 0:
-                acc = acc0
-                if HAS_BIAS:
-                    bias_val = tl.load(Biases + (m_base + 0) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
-                    acc = acc + bias_val[None, :]
-                Out_block = tl.make_block_ptr(base=Out + (m_base + 0) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
-                tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
-            if M > m_base + 1:
-                acc = acc1
-                if HAS_BIAS:
-                    bias_val = tl.load(Biases + (m_base + 1) * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
-                    acc = acc + bias_val[None, :]
-                Out_block = tl.make_block_ptr(base=Out + (m_base + 1) * stride_om, shape=(N, D), strides=(stride_on, stride_od), offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
-                tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
+        if HAS_BIAS:
+            bias_val = tl.load(Biases + pid_m * stride_bm + offs_d * stride_bd, mask=mask_d, other=0.0).to(tl.float32)
+            acc = acc + bias_val[None, :]
+
+        Out_block = tl.make_block_ptr(
+            base=Out + pid_m * stride_om,
+            shape=(N, D),
+            strides=(stride_on, stride_od),
+            offsets=(pid_n * BLOCK_N, pid_d * BLOCK_D),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0)
+        )
+        tl.store(Out_block, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
 else:
     _fused_perm_proj_fwd_kernel = None  # type: ignore
 
@@ -138,7 +131,6 @@ if triton is not None:
 
         for p in range(P):
             ip_idx = tl.load(InvPerms + p * stride_ipp + offs_d * stride_ipd, mask=mask_d, other=0)
-            tl.device_assert((ip_idx >= 0) & (ip_idx < D), "inv_perm OOB")
             for m in range(M):
                 go_ptrs = GradOut + m * stride_gom + go_base_n + ip_idx[None, :] * stride_god
                 w_val = tl.load(W + m * stride_wm + p * stride_wp + ip_idx * stride_wd, mask=mask_d, other=0.0)
@@ -172,7 +164,6 @@ if triton is not None:
         mask_d = offs_d < D
 
         p_idx = tl.load(Perms + pid_p * stride_pp + offs_d * stride_pd, mask=mask_d, other=0)
-        tl.device_assert((p_idx >= 0) & (p_idx < D), "perm OOB")
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
         n_per_split = tl.cdiv(N, NUM_SPLITS)
@@ -211,33 +202,39 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
         M, P, Dw = w.shape
         if D != Dw:
             raise ValueError(f"Dimension mismatch: x has dim {D}, w has dim {Dw}")
-        if not perms.is_cuda:
-            if torch.any(perms >= D) or torch.any(perms < 0):
-                raise ValueError(f"perms OOB: D={D}, min={int(perms.min())}, max={int(perms.max())}")
-            if torch.any(inv_perms >= D) or torch.any(inv_perms < 0):
-                raise ValueError(f"inv_perms OOB: D={D}, min={int(inv_perms.min())}, max={int(inv_perms.max())}")
-        elif not torch.cuda.is_current_stream_capturing():
-            if bool(torch.any(perms >= D) or torch.any(perms < 0)):
-                raise ValueError(f"perms OOB on CUDA: D={D}")
-            if bool(torch.any(inv_perms >= D) or torch.any(inv_perms < 0)):
-                raise ValueError(f"inv_perms OOB on CUDA: D={D}")
+        def _check_perms(t: torch.Tensor, name: str):
+            if getattr(t, "_perm_validated_dim", None) == D:
+                return
+            if not t.is_cuda:
+                if (t >= D).any() or (t < 0).any():
+                    raise ValueError(f"{name} OOB: D={D}")
+            elif not torch.cuda.is_current_stream_capturing():
+                if ((t < 0) | (t >= D)).any().item():
+                    raise ValueError(f"{name} OOB on CUDA: D={D}")
+            try:
+                t._perm_validated_dim = D
+            except Exception:
+                pass
+
+        _check_perms(perms, "perms")
+        _check_perms(inv_perms, "inv_perms")
 
         w_c = w.contiguous()
-        if perms.dtype == torch.long and perms.is_contiguous():
+        if perms.dtype == torch.int32 and perms.is_contiguous():
             perms_c = perms
         else:
-            perms_c = perms.to(dtype=torch.long).contiguous()
-        if inv_perms.dtype == torch.long and inv_perms.is_contiguous():
+            perms_c = perms.to(dtype=torch.int32).contiguous()
+        if inv_perms.dtype == torch.int32 and inv_perms.is_contiguous():
             inv_perms_c = inv_perms
         else:
-            inv_perms_c = inv_perms.to(dtype=torch.long).contiguous()
+            inv_perms_c = inv_perms.to(dtype=torch.int32).contiguous()
         has_bias = biases is not None
         biases_c = biases.contiguous() if has_bias else torch.empty(0, device=x.device, dtype=x.dtype)
 
         if triton is None or not x.is_cuda or _fused_perm_proj_fwd_kernel is None:
             x_g = torch.gather(
                 x_flat.unsqueeze(1).expand(-1, P, -1), dim=-1,
-                index=perms_c.unsqueeze(0).expand(N, -1, -1)
+                index=perms_c.to(torch.long).unsqueeze(0).expand(N, -1, -1)
             )
             out = (x_g.unsqueeze(0) * w_c.unsqueeze(1)).sum(dim=2)
             if has_bias:
@@ -251,7 +248,11 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
 
         out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
 
-        grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(D, META["BLOCK_D"]))  # noqa: E731
+        grid = lambda META: (
+            triton.cdiv(N, META["BLOCK_N"]),
+            triton.cdiv(D, META["BLOCK_D"]),
+            M,
+        )  # noqa: E731
         _fused_perm_proj_fwd_kernel[grid](
             x_flat, w_c, perms_c, biases_c, out,
             x_flat.stride(0), x_flat.stride(1),
@@ -282,12 +283,13 @@ class _TritonFusedPermProjFunc(torch.autograd.Function):
         if not getattr(ctx, "_used_triton", True) or triton is None or _fused_perm_proj_bwd_gx_kernel is None:
             x_g = torch.gather(
                 x_flat.unsqueeze(1).expand(-1, P, -1), dim=-1,
-                index=perms_c.unsqueeze(0).expand(N, -1, -1)
+                index=perms_c.to(torch.long).unsqueeze(0).expand(N, -1, -1)
             )
             gw = (go_flat.unsqueeze(2) * x_g.unsqueeze(0)).sum(dim=1)
             gx = torch.zeros_like(x_flat)
+            inv_long = inv_perms_c.to(torch.long)
             for p in range(P):
-                gx += (go_flat * w_c[:, p, :].unsqueeze(1)).sum(dim=0).gather(1, inv_perms_c[p].unsqueeze(0).expand(N, -1))
+                gx += (go_flat * w_c[:, p, :].unsqueeze(1)).sum(dim=0).gather(1, inv_long[p].unsqueeze(0).expand(N, -1))
             gx = gx.reshape(ctx.orig_shape)
             gb = go_flat.sum(dim=1) if has_bias else None
             return gx, gw, None, None, gb

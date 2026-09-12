@@ -46,6 +46,7 @@ class ASDAGBlock(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.n_heads = n_heads
         self.channel_mixer_type = channel_mixer_type if channel_mixer_type is not None else getattr(config, 'channel_mixer_type', 'asdag_tree')
         self.norm1 = RMSNorm(config.dim)
         self.time_mixer = NativeASDAGAssociativeMixer(

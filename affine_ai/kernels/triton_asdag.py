@@ -15,21 +15,30 @@ import triton
 import triton.language as tl
 
 
+_TURING_CACHE: Optional[bool] = None
+
+
 def _is_turing(device=None) -> bool:
     """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
+    global _TURING_CACHE
+    if _TURING_CACHE is not None:
+        return _TURING_CACHE
     try:
         from affine_ai.kernels import _IS_TURING as _T
 
-        return bool(_T)
+        _TURING_CACHE = bool(_T)
+        return _TURING_CACHE
     except Exception:
         pass
     try:
         if torch.cuda.is_available():
             dev = device if device is not None else torch.cuda.current_device()
             cap = torch.cuda.get_device_capability(dev)
-            return (7, 5) <= tuple(cap) < (8, 0)
+            _TURING_CACHE = (7, 5) <= tuple(cap) < (8, 0)
+            return _TURING_CACHE
     except Exception:
         pass
+    _TURING_CACHE = False
     return False
 
 
@@ -52,7 +61,7 @@ if _is_turing():
     ]
 
 
-@triton.autotune(configs=_ASDAG_AUTOTUNE_CONFIGS, key=["B_SZ", "DIM"])
+@triton.autotune(configs=_ASDAG_AUTOTUNE_CONFIGS, key=["DIM"])
 @triton.jit
 def _fused_asdag_2d_grid_kernel(
     X_ptr,
@@ -141,7 +150,6 @@ def _fused_asdag_2d_grid_kernel(
             y_v = tl.minimum(tl.maximum(y_v, 0.0), 6.0)
         elif ACTIVATION == 2:
             y_v = tl.where(y_v >= 0.0, 1.0, -1.0)
-            y_v = tl.where(mask_d[None, :], y_v, 0.0)
         out_block_ptr = tl.make_block_ptr(
             base=Leaf_Outs_ptr + pid_k * stride_lok,
             shape=(B_SZ, DIM),

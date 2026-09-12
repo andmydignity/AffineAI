@@ -92,10 +92,12 @@ def _gla_decay_kernel(
     offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
     mask_i = offs_i < T
     mask_j = offs_j < T
+    decay_base = Decay + b * stride_db + h * stride_dh
+    cum_base = Cum + b * stride_cb + h * stride_ch
     if (tile_j * BLOCK_J) >= ((tile_i + 1) * BLOCK):
         val = tl.zeros((BLOCK, BLOCK_J), dtype=tl.float32)
         out_block_ptr = tl.make_block_ptr(
-            base=Decay + b * stride_db + h * stride_dh,
+            base=decay_base,
             shape=(T, T),
             strides=(stride_di, stride_dj),
             offsets=(tile_i * BLOCK, tile_j * BLOCK_J),
@@ -105,7 +107,7 @@ def _gla_decay_kernel(
         tl.store(out_block_ptr, val.to(Decay.dtype.element_ty), boundary_check=(0, 1))
         return
     cum_block_ptr_i = tl.make_block_ptr(
-        base=Cum + b * stride_cb + h * stride_ch,
+        base=cum_base,
         shape=(T,),
         strides=(stride_ct,),
         offsets=(tile_i * BLOCK,),
@@ -113,7 +115,7 @@ def _gla_decay_kernel(
         order=(0,),
     )
     cum_block_ptr_j = tl.make_block_ptr(
-        base=Cum + b * stride_cb + h * stride_ch,
+        base=cum_base,
         shape=(T,),
         strides=(stride_ct,),
         offsets=(tile_j * BLOCK_J,),
@@ -130,7 +132,7 @@ def _gla_decay_kernel(
     val = tl.exp(diff)
     val = tl.where(valid_mask, val, 0.0)
     out_block_ptr = tl.make_block_ptr(
-        base=Decay + b * stride_db + h * stride_dh,
+        base=decay_base,
         shape=(T, T),
         strides=(stride_di, stride_dj),
         offsets=(tile_i * BLOCK, tile_j * BLOCK_J),
@@ -164,8 +166,9 @@ def _gla_decay_kernel_raw(
     tmp = tmp // T_i32
     th = tmp % H_i32
     tb = tmp // H_i32
-    ci = tl.load(Cum + tb * stride_cb + th * stride_ch + ti * stride_ct, mask=mask, other=0.0)
-    cj = tl.load(Cum + tb * stride_cb + th * stride_ch + tj * stride_ct, mask=mask, other=0.0)
+    cum_base = Cum + tb * stride_cb + th * stride_ch
+    ci = tl.load(cum_base + ti * stride_ct, mask=mask, other=0.0)
+    cj = tl.load(cum_base + tj * stride_ct, mask=mask, other=0.0)
     diff = ci - cj
     diff = tl.minimum(diff, 0.0)
     diff = tl.maximum(diff, CLAMP_MIN)
@@ -259,10 +262,7 @@ class TritonGLADecayFunction(torch.autograd.Function):
             gamma_input = gamma
         log_gam = torch.log(gamma_input.float().clamp(min=1e-5, max=1.0))
         cum = torch.cumsum(log_gam, dim=-1)
-        if _is_turing(gamma.device) and gamma.dtype == torch.bfloat16:
-            clamp_min = -11.0
-        else:
-            clamp_min = -11.0 if gamma_input.dtype == torch.float16 else -30.0
+        clamp_min = -11.0 if gamma_input.dtype == torch.float16 else -30.0
         assert gamma_input.ndim == 3, f"gamma must be [B,H,T], got {gamma.shape}"
         if gamma_input.is_cuda and torch.cuda.is_available():
             out = triton_gla_decay_fwd(cum.contiguous(), clamp_min=clamp_min, out_dtype=gamma_input.dtype)
@@ -285,12 +285,16 @@ class TritonGLADecayFunction(torch.autograd.Function):
         clamp_min = getattr(ctx, "clamp_min", -30.0)
         clamp_thresh = math.exp(clamp_min) * 1.0001
         sat_mask = out > clamp_thresh
-        M = torch.where(sat_mask, grad_output * out, torch.zeros_like(out))
+        M = torch.where(sat_mask, grad_output * out, 0.0)
+        del sat_mask
         g_c = M.sum(dim=-1) - M.sum(dim=-2)
+        del M
         g_log_gam = g_c.flip(-1).cumsum(-1).flip(-1)
+        del g_c
         g_gam = g_log_gam / gamma.float().clamp(min=1e-5)
+        del g_log_gam
         mask = (gamma > 1e-5) & (gamma < 1.0)
-        g_gam = torch.where(mask, g_gam, torch.zeros_like(g_gam))
+        g_gam = torch.where(mask, g_gam, 0.0)
         return g_gam.to(gamma.dtype)
 
 

@@ -38,6 +38,10 @@ try:
         get_local_device,
         barrier,
         all_reduce_sum,
+        all_reduce_avg,
+        broadcast_parameters,
+        parse_devices,
+        spawn_multiprocess_training,
     )
 except Exception:  # pragma: no cover
     # Fallback stubs if distributed module missing
@@ -67,6 +71,19 @@ except Exception:  # pragma: no cover
 
     def all_reduce_sum(tensor):  # type: ignore
         return tensor
+
+    def all_reduce_avg(tensor):  # type: ignore
+        return tensor
+
+    def broadcast_parameters(model, root=0):  # type: ignore
+        return None
+
+    def parse_devices(devices=None):  # type: ignore
+        return []
+
+    def spawn_multiprocess_training(worker_fn, devices, *args, **kwargs):  # type: ignore
+        return worker_fn(*args, **kwargs)
+
 
 
 def _is_turing() -> bool:
@@ -184,6 +201,7 @@ class ASDAGTrainer:
         swa_every_n: Optional[int] = None,
         swa_window: Optional[int] = None,
         distributed: Optional[bool] = None,
+        devices: Optional[Union[int, List[int], str]] = None,
     ):
         self.pad_id = pad_id
         self.ignore_index = ignore_index
@@ -295,25 +313,31 @@ class ASDAGTrainer:
         self.model = model.to(self.device)
         if getattr(self, "is_distributed", False) and self.world_size > 1:
             try:
-                if (
-                    torch.cuda.is_available()
-                    and torch.cuda.device_count() > 0
-                    and "cuda" in str(self.device)
-                ):
-                    _eff_ddp = self.local_rank % torch.cuda.device_count()
-                    self.model = torch.nn.parallel.DistributedDataParallel(
-                        self.model,
-                        device_ids=[_eff_ddp],
-                        output_device=_eff_ddp,
-                        find_unused_parameters=False,
-                    )
-                else:
-                    self.model = torch.nn.parallel.DistributedDataParallel(
-                        self.model,
-                        find_unused_parameters=False,
-                    )
+                # DDP is only used for global backprop (use_lpc=False).
+                # For LPC, local chunk backward and optimizers run independently,
+                # with parameter gradients synchronized natively via all-reduce.
+                if not self.use_lpc:
+                    if (
+                        torch.cuda.is_available()
+                        and torch.cuda.device_count() > 0
+                        and "cuda" in str(self.device)
+                    ):
+                        _eff_ddp = self.local_rank % torch.cuda.device_count()
+                        self.model = torch.nn.parallel.DistributedDataParallel(
+                            self.model,
+                            device_ids=[_eff_ddp],
+                            output_device=_eff_ddp,
+                            find_unused_parameters=False,
+                        )
+                    else:
+                        self.model = torch.nn.parallel.DistributedDataParallel(
+                            self.model,
+                            find_unused_parameters=False,
+                        )
             except Exception:
                 pass
+            # Broadcast initial parameters so all workers start with identical weights
+            broadcast_parameters(self.model)
 
         # Context window / max sequence length configuration
         if context_window is not None:
@@ -1141,42 +1165,39 @@ class ASDAGTrainer:
                     gc.collect()
 
                 if step % self.eval_interval == 0 or step == self.max_steps - 1:
-                    if getattr(self, "is_distributed", False) and not getattr(
-                        self, "is_main", True
-                    ):
-                        continue
                     eval_metrics = self.evaluate()
-                    try:
-                        _rh = self.routing_health(n_batches=2)
-                        if _rh:
-                            _worst_li = min(
-                                _rh,
-                                key=lambda li: (
-                                    _rh[li]["entropy"]
-                                    / max(1e-9, _rh[li]["entropy_max"])
-                                ),
-                            )
-                            _w = _rh[_worst_li]
-                            print(
-                                f"Routing health: worst layer {_worst_li} "
-                                f"top1={_w['top1']:.2f} dead={int(_w['dead'])}/{int(_w['leaves'])} "
-                                f"ent={_w['entropy']:.2f}/{_w['entropy_max']:.2f}",
-                                flush=True,
-                            )
-                            if (
-                                _w["entropy"] < 0.4 * _w["entropy_max"]
-                                or _w["dead"] > 0.25 * _w["leaves"]
-                            ):
-                                import warnings
-
-                                warnings.warn(
-                                    f"Router starvation signs at layer {_worst_li}: "
-                                    f"top1={_w['top1']:.2f}, dead={int(_w['dead'])}/{int(_w['leaves'])}. "
-                                    f"Consider expert_bias_rate>0.",
-                                    stacklevel=2,
+                    if getattr(self, "is_main", True):
+                        try:
+                            _rh = self.routing_health(n_batches=2)
+                            if _rh:
+                                _worst_li = min(
+                                    _rh,
+                                    key=lambda li: (
+                                        _rh[li]["entropy"]
+                                        / max(1e-9, _rh[li]["entropy_max"])
+                                    ),
                                 )
-                    except Exception:
-                        pass
+                                _w = _rh[_worst_li]
+                                print(
+                                    f"Routing health: worst layer {_worst_li} "
+                                    f"top1={_w['top1']:.2f} dead={int(_w['dead'])}/{int(_w['leaves'])} "
+                                    f"ent={_w['entropy']:.2f}/{_w['entropy_max']:.2f}",
+                                    flush=True,
+                                )
+                                if (
+                                    _w["entropy"] < 0.4 * _w["entropy_max"]
+                                    or _w["dead"] > 0.25 * _w["leaves"]
+                                ):
+                                    import warnings
+
+                                    warnings.warn(
+                                        f"Router starvation signs at layer {_worst_li}: "
+                                        f"top1={_w['top1']:.2f}, dead={int(_w['dead'])}/{int(_w['leaves'])}. "
+                                        f"Consider expert_bias_rate>0.",
+                                        stacklevel=2,
+                                    )
+                        except Exception:
+                            pass
                     if getattr(self, "is_distributed", False) and self.world_size > 1:
                         try:
                             _t = torch.tensor(
@@ -1252,6 +1273,23 @@ class ASDAGTrainer:
         }
 
 
+def _train_worker_entry(
+    model: Any,
+    train_data: Any,
+    val_data: Optional[Any],
+    train_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Worker entry point for native multi-GPU torch.multiprocessing.spawn."""
+    save_path = train_kwargs.pop("save_path", None)
+    trainer = ASDAGTrainer(
+        model=model,
+        train_data=train_data,
+        val_data=val_data,
+        **train_kwargs,
+    )
+    return trainer.train(save_path=save_path)
+
+
 def train(
     model: Any,
     train_data: Any,
@@ -1267,6 +1305,7 @@ def train(
     eval_iters: int = 20,
     grad_clip: float = 1.0,
     device: Optional[Union[str, torch.device]] = None,
+    devices: Optional[Union[int, List[int], str]] = None,
     save_path: Optional[str] = None,
     use_cuda_graph: bool = True,
     use_muon: bool = True,
@@ -1296,16 +1335,7 @@ def train(
 ) -> Dict[str, Any]:
     """
     High-level, zero-friction training entry point for AffineAI models.
-
-    Automatically handles:
-    - Data ingestion via PaddedDataLoader (guaranteeing invariant static shapes).
-    - Hardware INT8 IMMA Tensor Cores and zero-overhead CUDA Graphs on GPU.
-    - Automatic <|endoftext|> injection into documents and sequences.
-    - Multi-Token Prediction (MTP) heads & loss management.
-    - Channel mixer (ternary_swiglu, asdag_tree, classic_mlp, dense_swiglu) & Time mixer (gla) configuration.
-    - Dynamic Priority Replay (AXIOM info-gain selection) on high-uncertainty sequences.
-    - Muon (for 2D projection weights) + AdamW (for norms, embeddings, 1D vectors).
-    - Periodic evaluation and checkpoint saving.
+    Supports native multi-CUDA execution out of the box.
 
     Parameters:
         model: TorosHybridLanguageModel, ASDAGLanguageModel, or any AffineAI model.
@@ -1322,6 +1352,9 @@ def train(
         eval_iters: Number of batches to evaluate on (default: 20).
         grad_clip: Maximum gradient norm (default: 1.0).
         device: 'cuda', 'cpu', or torch.device (defaults to auto-detect).
+        devices: Multi-CUDA device selector ('auto', 'all', [0, 1], '0,1', count int).
+                 When specified with count > 1, natively spawns multi-GPU training
+                 using torch.multiprocessing.spawn without needing torchrun.
         save_path: Optional file path to save the best model weights.
         use_cuda_graph: True to enable CUDA Graph replay (default: True on CUDA).
         use_muon: True to enable Muon Newton-Schulz optimization (default: True).
@@ -1340,7 +1373,60 @@ def train(
         replay_ratio: Fraction of batch capacity reserved for high-uncertainty replayed sequences (default: 0.25).
         replay_buffer_capacity: Maximum number of active sequence offsets in the replay buffer (default: 4000).
         replay_max_replays: Maximum replays per sequence before retirement (default: 3).
+        distributed: Explicit distributed flag (auto-detected if None).
     """
+    already_distributed = (
+        is_distributed()
+        or ("WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1)
+        or ("RANK" in os.environ)
+    )
+    target_devices = parse_devices(devices) if devices is not None else []
+
+    if len(target_devices) > 1 and not already_distributed:
+        # Native multi-CUDA spawn without external torchrun
+        train_kwargs = dict(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            context_window=context_window,
+            lr=lr,
+            weight_decay=weight_decay,
+            max_steps=max_steps,
+            warmup_steps=warmup_steps,
+            eval_interval=eval_interval,
+            eval_iters=eval_iters,
+            grad_clip=grad_clip,
+            save_path=save_path,
+            use_cuda_graph=use_cuda_graph,
+            use_muon=use_muon,
+            muon_lr=muon_lr,
+            pad_id=pad_id,
+            ignore_index=ignore_index,
+            inject_eos=inject_eos,
+            eos_token=eos_token,
+            as_stream=as_stream,
+            use_mtp=use_mtp,
+            num_mtp_heads=num_mtp_heads,
+            mtp_lambda=mtp_lambda,
+            channel_mixer=channel_mixer,
+            time_mixer=time_mixer,
+            swa_every_n=swa_every_n,
+            swa_window=swa_window,
+            use_priority_replay=use_priority_replay,
+            replay_ratio=replay_ratio,
+            replay_buffer_capacity=replay_buffer_capacity,
+            replay_max_replays=replay_max_replays,
+            distributed=True,
+            **kwargs,
+        )
+        return spawn_multiprocess_training(
+            _train_worker_entry,
+            target_devices,
+            model,
+            train_data,
+            val_data,
+            train_kwargs,
+        )
+
     trainer = ASDAGTrainer(
         model=model,
         train_data=train_data,
@@ -1356,6 +1442,7 @@ def train(
         eval_iters=eval_iters,
         grad_clip=grad_clip,
         device=str(device) if device is not None else None,
+        devices=devices,
         use_cuda_graph=use_cuda_graph,
         use_muon=use_muon,
         muon_lr=muon_lr,
@@ -1379,3 +1466,4 @@ def train(
         **kwargs,
     )
     return trainer.train(save_path=save_path)
+

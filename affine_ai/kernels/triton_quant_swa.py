@@ -68,7 +68,7 @@ if _HAS_TRITON:
 
     @triton.autotune(
         configs=_QUANT_SWA_CONFIGS,
-        key=["D", "WINDOW"],
+        key=["D"],
     )
     @triton.jit
     def _quant_swa_fwd_kernel(
@@ -80,24 +80,23 @@ if _HAS_TRITON:
         stride_vsb, stride_vst,
         stride_ob, stride_ot, stride_od,
         T, D,
-        WINDOW: tl.constexpr,
+        WINDOW,
         SINK: tl.constexpr,
-        SCALE: tl.constexpr,
+        SCALE,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        pid_m = tl.program_id(0).to(tl.int64)
-        pid_bh = tl.program_id(1).to(tl.int64)
-        T_i64 = T
+        pid_m = tl.program_id(0)
+        pid_bh = tl.program_id(1)
 
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         D_HALF: tl.constexpr = BLOCK_D // 2
-        offs_d_half = tl.arange(0, D_HALF).to(tl.int64)
+        offs_d_half = tl.arange(0, D_HALF)
         offs_d_even = offs_d_half * 2
         offs_d_odd = offs_d_half * 2 + 1
 
-        mask_m = offs_m < T_i64
+        mask_m = offs_m < T
         mask_d_half = offs_d_half < (D // 2)
 
         # Load Q (split even and odd channels directly in SRAM)
@@ -113,7 +112,6 @@ if _HAS_TRITON:
 
         m_start = pid_m * BLOCK_M
         win_lo = m_start - WINDOW + 1
-        zero_i64 = tl.zeros([], dtype=tl.int64)
         need_sep_sink = SINK and (win_lo > 1)
 
         # Sink token at position 0
@@ -146,12 +144,12 @@ if _HAS_TRITON:
             acc_odd = tl.where(mask_m[:, None], v0_odd[None, :], 0.0)
             k_start = (win_lo // BLOCK_N) * BLOCK_N
         else:
-            k_start = zero_i64
+            k_start = 0
 
-        k_end = tl.minimum(T_i64, (pid_m + 1) * BLOCK_M)
+        k_end = tl.minimum(T, (pid_m + 1) * BLOCK_M)
         for n_start in range(k_start, k_end, BLOCK_N):
-            offs_n = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
-            mask_n = offs_n < T_i64
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < T
 
             # Load packed K and scale
             k_ptrs = K_pack_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d_half[None, :] * stride_kd
@@ -166,7 +164,7 @@ if _HAS_TRITON:
             k_odd = tl.where(k_high >= 8, k_high - 16, k_high).to(tl.float32) * ks
 
             # Dot products
-            s = (tl.dot(q_even, tl.trans(k_even), allow_tf32=False) + tl.dot(q_odd, tl.trans(k_odd), allow_tf32=False)) * SCALE
+            s = (tl.dot(q_even, tl.trans(k_even), input_precision="ieee") + tl.dot(q_odd, tl.trans(k_odd), input_precision="ieee")) * SCALE
 
             # Masking
             if SINK:
@@ -217,8 +215,8 @@ if _HAS_TRITON:
             v_high = ((v_pack >> 4) & 0x0F).to(tl.int8)
             v_odd = tl.where(v_high >= 8, v_high - 16, v_high).to(tl.float32) * vs
 
-            acc_even = acc_even * alpha[:, None] + tl.dot(p.to(v_even.dtype), v_even, allow_tf32=False)
-            acc_odd = acc_odd * alpha[:, None] + tl.dot(p.to(v_odd.dtype), v_odd, allow_tf32=False)
+            acc_even = acc_even * alpha[:, None] + tl.dot(p.to(v_even.dtype), v_even, input_precision="ieee")
+            acc_odd = acc_odd * alpha[:, None] + tl.dot(p.to(v_odd.dtype), v_odd, input_precision="ieee")
 
             m_i = m_ij
 
@@ -231,8 +229,8 @@ if _HAS_TRITON:
         out_even_ptrs = Out_ptr + pid_bh * stride_ob + offs_m[:, None] * stride_ot + offs_d_even[None, :] * stride_od
         out_odd_ptrs = Out_ptr + pid_bh * stride_ob + offs_m[:, None] * stride_ot + offs_d_odd[None, :] * stride_od
 
-        tl.store(out_even_ptrs, out_even.to(tl.float16), mask=mask_m[:, None] & mask_d_half[None, :])
-        tl.store(out_odd_ptrs, out_odd.to(tl.float16), mask=mask_m[:, None] & mask_d_half[None, :])
+        tl.store(out_even_ptrs, out_even.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d_half[None, :])
+        tl.store(out_odd_ptrs, out_odd.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d_half[None, :])
 
 
 def _eager_quant_swa(

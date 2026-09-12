@@ -50,11 +50,13 @@ def _is_turing(device=None) -> bool:
 if triton is not None:
     @triton.autotune(
         configs=[
+            triton.Config({"BLOCK_M": 16}, num_warps=2),
+            triton.Config({"BLOCK_M": 32}, num_warps=2),
             triton.Config({"BLOCK_M": 64}, num_warps=2),
             triton.Config({"BLOCK_M": 64}, num_warps=4),
             triton.Config({"BLOCK_M": 64}, num_warps=8),
         ],
-        key=["B"],
+        key=["DEPTH", "TOPK"],
     )
     @triton.jit
     def _router_cascade_topk_kernel(
@@ -109,22 +111,23 @@ if triton is not None:
             work = tl.where(valid & mask_m[:, None], leaf, -1.0)
         sel_idx = tl.zeros((BLOCK_M, TOPK), dtype=tl.int32)
         sel_val = tl.full((BLOCK_M, TOPK), -1.0, dtype=tl.float32)
+        order = tl.arange(0, MAXW)[None, :]
         for t in tl.static_range(TOPK):
             best = tl.max(work, axis=1)
             is_best = (work == best[:, None]) & valid & mask_m[:, None]
-            order = tl.arange(0, MAXW)[None, :]
             masked_order = tl.where(is_best, order, MAXW)
             bi = tl.min(masked_order, axis=1).to(tl.int32)
             bi_valid = bi < MAXW
-            sel_idx = tl.where((tl.arange(0, TOPK)[None, :] == t) & mask_m[:, None] & bi_valid[:, None], bi[:, None], sel_idx)
+            t_mask = (tl.arange(0, TOPK)[None, :] == t) & mask_m[:, None] & bi_valid[:, None]
+            sel_idx = tl.where(t_mask, bi[:, None], sel_idx)
             leaf_best = tl.sum(tl.where(order == bi[:, None], leaf, 0.0), axis=1)
-            sel_val = tl.where((tl.arange(0, TOPK)[None, :] == t) & mask_m[:, None] & bi_valid[:, None], leaf_best[:, None], sel_val)
+            sel_val = tl.where(t_mask, leaf_best[:, None], sel_val)
             work = tl.where((tl.arange(0, MAXW)[None, :] == bi[:, None]) & bi_valid[:, None], -1.0, work)
         wsum = tl.sum(sel_val, axis=1)
         wsum = tl.maximum(wsum, 1e-8)
         sel_val = sel_val / wsum[:, None]
         tl.store(TopIdx + offs_m[:, None] * stride_tim + tl.arange(0, TOPK)[None, :] * stride_tik,
-                 sel_idx.to(tl.int64), mask=mask_m[:, None])
+                 sel_idx.to(TopIdx.dtype.element_ty), mask=mask_m[:, None])
         tl.store(TopW + offs_m[:, None] * stride_twm + tl.arange(0, TOPK)[None, :] * stride_twk,
                  sel_val, mask=mask_m[:, None])
 else:

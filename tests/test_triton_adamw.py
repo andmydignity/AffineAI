@@ -148,3 +148,40 @@ def test_triton_adamw_unaligned_sizes():
         opt = TritonAdamW([p], lr=1e-3)
         opt.step()
         assert not torch.isnan(p).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_adamw_capturable_cuda_graph():
+    """Verify capturable=True works under CUDA Graph capture and replays correctly."""
+    torch.manual_seed(42)
+    N = 512
+    p = torch.randn(N, dtype=torch.float32, device="cuda", requires_grad=True)
+    opt = TritonAdamW([p], lr=1e-3, capturable=True)
+    p.grad = torch.randn_like(p)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            opt.step()
+    torch.cuda.current_stream().wait_stream(s)
+
+    assert isinstance(opt.state[p]['step'], torch.Tensor)
+    assert opt.state[p]['step'].item() == 3
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        opt.step()
+
+    p_before = p.clone()
+    g.replay()
+    torch.cuda.synchronize()
+    assert opt.state[p]['step'].item() == 4
+    assert not torch.allclose(p, p_before)
+
+    p_before = p.clone()
+    g.replay()
+    torch.cuda.synchronize()
+    assert opt.state[p]['step'].item() == 5
+    assert not torch.allclose(p, p_before)
+

@@ -38,16 +38,17 @@ if HAS_TRITON:
         mask_k = offs_k < K_words
 
         offs_b = tl.arange(0, 32)
+        offs_k_idx = tl.arange(0, BLOCK_K)[None, :]
         acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.int32)
         for ik in range(BLOCK_K):
             k = pid_k * BLOCK_K + ik
             cols = k * 32 + offs_b
             mask = mask_m[:, None] & (cols[None, :] < D)
             val = tl.load(X_ptr + offs_m[:, None] * stride_xm + cols[None, :] * stride_xd, mask=mask, other=-1.0)
-            is_pos = (val >= 0.0).to(tl.uint32)
+            is_pos = (val >= 0.0).to(tl.int32)
             bits = is_pos << offs_b[None, :]
-            acc_k = tl.sum(bits, axis=1).to(tl.int32)
-            acc = tl.where(tl.arange(0, BLOCK_K)[None, :] == ik, acc_k[:, None], acc)
+            acc_k = tl.sum(bits, axis=1)
+            acc = tl.where(offs_k_idx == ik, acc_k[:, None], acc)
 
         # Coalesced global stores along words (stride_ok == 1)
         out_ptrs = Out_bits_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
@@ -69,9 +70,7 @@ if HAS_TRITON:
         stride_xm, stride_xk,
         stride_wn, stride_wk,
         stride_om, stride_on,
-        M, N,
-        K_WORDS: tl.constexpr,
-        D: tl.constexpr,
+        M, N, K_WORDS, D,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -82,7 +81,7 @@ if HAS_TRITON:
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_m = offs_m < M
         mask_n = offs_n < N
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.uint32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
         rem = D % 32
         for k_base in range(0, K_WORDS, BLOCK_K):
             for ik in range(BLOCK_K):
@@ -91,14 +90,13 @@ if HAS_TRITON:
                     x = tl.load(X_bits_ptr + offs_m[:, None] * stride_xm + k * stride_xk, mask=mask_m[:, None], other=0).to(tl.uint32)
                     w = tl.load(W_bits_ptr + offs_n[None, :] * stride_wn + k * stride_wk, mask=mask_n[None, :], other=0).to(tl.uint32)
                     diff = x ^ w
-                    tail = (k == K_WORDS - 1) and (rem != 0)
-                    if tail:
-                        mask = (tl.full((), 1, dtype=tl.uint32) << rem) - 1
-                        diff = diff & mask
-                    pop = tl.inline_asm_elementwise("popc.b32 $0, $1;", "=r,r", [diff], dtype=tl.int32, is_pure=True, pack=1).to(tl.uint32)
-                    sim = tl.where(tail, rem - 2 * pop, 32 - 2 * pop)
-                    acc += sim.to(tl.uint32)
-        tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, acc.to(tl.int32), mask=mask_m[:, None] & mask_n[None, :])
+                    is_tail = (k == K_WORDS - 1) & (rem != 0)
+                    tail_mask = (tl.full((), 1, dtype=tl.uint32) << rem) - 1
+                    diff = tl.where(is_tail, diff & tail_mask, diff)
+                    pop = tl.inline_asm_elementwise("popc.b32 $0, $1;", "=r,r", [diff], dtype=tl.int32, is_pure=True, pack=1)
+                    sim = tl.where(is_tail, rem - 2 * pop, 32 - 2 * pop)
+                    acc += sim
+        tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, acc, mask=mask_m[:, None] & mask_n[None, :])
 
     @triton.jit
     def _popc_dot_kernel_swar(
@@ -106,9 +104,7 @@ if HAS_TRITON:
         stride_xm, stride_xk,
         stride_wn, stride_wk,
         stride_om, stride_on,
-        M, N,
-        K_WORDS: tl.constexpr,
-        D: tl.constexpr,
+        M, N, K_WORDS, D,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -119,7 +115,7 @@ if HAS_TRITON:
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_m = offs_m < M
         mask_n = offs_n < N
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.uint32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
         rem = D % 32
         for k_base in range(0, K_WORDS, BLOCK_K):
             for ik in range(BLOCK_K):
@@ -128,14 +124,13 @@ if HAS_TRITON:
                     x = tl.load(X_bits_ptr + offs_m[:, None] * stride_xm + k * stride_xk, mask=mask_m[:, None], other=0).to(tl.uint32)
                     w = tl.load(W_bits_ptr + offs_n[None, :] * stride_wn + k * stride_wk, mask=mask_n[None, :], other=0).to(tl.uint32)
                     diff = x ^ w
-                    tail = (k == K_WORDS - 1) and (rem != 0)
-                    if tail:
-                        mask = (tl.full((), 1, dtype=tl.uint32) << rem) - 1
-                        diff = diff & mask
+                    is_tail = (k == K_WORDS - 1) & (rem != 0)
+                    tail_mask = (tl.full((), 1, dtype=tl.uint32) << rem) - 1
+                    diff = tl.where(is_tail, diff & tail_mask, diff)
                     pop = _popcount32_swar(diff)
-                    sim = tl.where(tail, rem - 2 * pop, 32 - 2 * pop)
-                    acc += sim.to(tl.uint32)
-        tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, acc.to(tl.int32), mask=mask_m[:, None] & mask_n[None, :])
+                    sim = tl.where(is_tail, rem - 2 * pop, 32 - 2 * pop)
+                    acc += sim
+        tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, acc, mask=mask_m[:, None] & mask_n[None, :])
 
     def _get_popc_dot_configs():
         return [
@@ -222,14 +217,14 @@ class TritonPopcSignSimilarityFunction(torch.autograd.Function):
         actual_D = D if D is not None else (dim if dim is not None else orig_shape[-1])
 
         if x.is_floating_point():
-            x_sign = torch.where(x >= 0, torch.tensor(1.0, dtype=x.dtype, device=x.device), torch.tensor(-1.0, dtype=x.dtype, device=x.device))
+            x_sign = torch.where(x >= 0, 1.0, -1.0).to(x.dtype)
             x_bits = triton_pack_sign_bits(x)
         else:
             x_bits = x
             x_sign = _unpack_sign_bits_to_sign(x, actual_D).to(torch.float32)
 
         if isinstance(w, torch.Tensor) and w.is_floating_point():
-            w_sign = torch.where(w >= 0, torch.tensor(1.0, dtype=w.dtype, device=w.device), torch.tensor(-1.0, dtype=w.dtype, device=w.device))
+            w_sign = torch.where(w >= 0, 1.0, -1.0).to(w.dtype)
             w_bits = triton_pack_sign_bits(w)
         else:
             w_bits = w
@@ -336,9 +331,7 @@ def triton_popc_sign_similarity(
         x_flat.stride(0), x_flat.stride(1),
         w_flat.stride(0), w_flat.stride(1),
         out.stride(0), out.stride(1),
-        M, N,
-        K_WORDS=K_words,
-        D=actual_D,
+        M, N, K_words, actual_D,
     )
     out_reshaped = out.reshape(*orig_shape[:-1], N)
     if scale is not None:

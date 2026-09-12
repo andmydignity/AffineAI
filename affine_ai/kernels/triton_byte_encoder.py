@@ -228,7 +228,7 @@ if triton is not None:
             triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
             triton.Config({"BLOCK_M": 32, "BLOCK_D": 128}, num_warps=8),
         ],
-        key=["M", "D_DIM"],
+        key=["D_DIM"],
     )
     @triton.jit
     def _patch_mean_pool_fwd_kernel(
@@ -263,6 +263,14 @@ if triton is not None:
             tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
+    _POOL_BWD_CONFIGS = [
+        triton.Config({"BLOCK_M": 8, "BLOCK_D": 32}, num_warps=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_D": 32}, num_warps=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_D": 64}, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
+    ]
+
+    @triton.autotune(configs=_POOL_BWD_CONFIGS, key=["D_DIM"])
     @triton.jit
     def _patch_mean_pool_bwd_kernel(
         dOut_ptr, dX_ptr,
@@ -345,15 +353,12 @@ class _TritonPatchMeanPoolFunc(torch.autograd.Function):
                 dx = torch.repeat_interleave(scaled_dout, P, dim=1)[:, :T, :]
             return dx, None
         dx = torch.empty((B, T, D), device=dout.device, dtype=ctx.dtype)
-        BLOCK_M = 8 if M <= 8 else 16
-        BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
-        grid = (triton.cdiv(M, BLOCK_M), B)
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), B)
         _patch_mean_pool_bwd_kernel[grid](
             dout, dx,
             dout.stride(0), dout.stride(1), dout.stride(2),
             dx.stride(0), dx.stride(1), dx.stride(2),
             B, M, T, P=P, D_DIM=D,
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
         return dx, None
 
@@ -367,6 +372,14 @@ def triton_patch_mean_pool(h_byte: torch.Tensor, patch_size: int) -> torch.Tenso
 
 
 if triton is not None:
+    _WEIGHTED_POOL_FWD_CONFIGS = [
+        triton.Config({"BLOCK_M": 8, "BLOCK_D": 32}, num_warps=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_D": 32}, num_warps=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_D": 64}, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_D": 64}, num_warps=4),
+    ]
+
+    @triton.autotune(configs=_WEIGHTED_POOL_FWD_CONFIGS, key=["D_DIM"])
     @triton.jit
     def _patch_weighted_pool_fwd_kernel(
         X_ptr, Logits_ptr, Out_ptr, Weights_ptr,
@@ -410,7 +423,7 @@ if triton is not None:
 
             acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
             for p in range(P):
-                w_p = tl.sum(tl.where(offs_p[None, :] == p, w, 0.0), axis=1)
+                w_p = tl.load(Weights_ptr + pid_b * stride_wb + offs_m * stride_wm + p * stride_wp, mask=mask_m, other=0.0)
                 t = offs_m * P + p
                 mask_t = mask_m & (t < T)
                 x_ptrs = X_ptr + pid_b * stride_xb + t[:, None] * stride_xt + offs_d[None, :] * stride_xd
@@ -448,9 +461,7 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
         P_POW2 = triton.next_power_of_2(P)
         weights = torch.empty((B, M, P_POW2), device=x.device, dtype=torch.float32)
 
-        BLOCK_M = 8 if M <= 8 else 16
-        BLOCK_D = min(triton.next_power_of_2(D), 64 if _is_turing() else 128)
-        grid = (triton.cdiv(M, BLOCK_M), B)
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), B)
 
         _patch_weighted_pool_fwd_kernel[grid](
             x, logits, out, weights,
@@ -459,7 +470,6 @@ class _TritonPatchWeightedPoolFunc(torch.autograd.Function):
             out.stride(0), out.stride(1), out.stride(2),
             weights.stride(0), weights.stride(1), weights.stride(2),
             B, M, T, P=P, P_POW2=P_POW2, D_DIM=D,
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
 
         ctx.save_for_backward(x, weights)

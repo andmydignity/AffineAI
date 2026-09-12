@@ -18,21 +18,30 @@ import triton.language as tl
 import warnings
 
 
+_TURING_CACHE: Optional[bool] = None
+
+
 def _is_turing(device=None) -> bool:
     """Turing sm_75 detection: 64KB SMEM, FP16-only, no BF16."""
+    global _TURING_CACHE
+    if _TURING_CACHE is not None:
+        return _TURING_CACHE
     try:
         from affine_ai.kernels import _IS_TURING as _T
 
-        return bool(_T)
+        _TURING_CACHE = bool(_T)
+        return _TURING_CACHE
     except Exception:
         pass
     try:
         if torch.cuda.is_available():
             dev = device if device is not None else torch.cuda.current_device()
             cap = torch.cuda.get_device_capability(dev)
-            return (7, 5) <= tuple(cap) < (8, 0)
+            _TURING_CACHE = (7, 5) <= tuple(cap) < (8, 0)
+            return _TURING_CACHE
     except Exception:
         pass
+    _TURING_CACHE = False
     return False
 
 
@@ -44,14 +53,25 @@ _TREE_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_B": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
 ]
 
+_GW_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_B": 32, "BLOCK_D": 32}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_B": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_B": 32, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_B": 64, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+]
+
 if _is_turing():
     _TREE_AUTOTUNE_CONFIGS = [
         c for c in _TREE_AUTOTUNE_CONFIGS
         if c.kwargs.get("BLOCK_B", 32) <= 64 and c.kwargs.get("BLOCK_D", 32) <= 64 and c.num_warps <= 4
     ]
+    _GW_AUTOTUNE_CONFIGS = [
+        c for c in _GW_AUTOTUNE_CONFIGS
+        if c.kwargs.get("BLOCK_B", 32) <= 32 and c.kwargs.get("BLOCK_D", 32) <= 32 and c.num_warps <= 2
+    ]
 
 
-@triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["B_ROWS", "D_DIM"])
+@triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["D_DIM"])
 @triton.jit
 def _tree_perm_fwd_kernel(
     R, W, B, P, TI, TW, Y,
@@ -62,7 +82,7 @@ def _tree_perm_fwd_kernel(
     stride_tbt, stride_tbk,
     stride_twb, stride_twk,
     stride_ym, stride_yd,
-    B_ROWS: tl.constexpr, K_LEAVES: tl.constexpr, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
+    B_ROWS, K_LEAVES: tl.constexpr, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """
@@ -89,13 +109,11 @@ def _tree_perm_fwd_kernel(
     for tk in range(TOPK):
         ki = tl.load(TI + offs_b * stride_tbt + tk * stride_tbk, mask=mask_b, other=0, eviction_policy="evict_last")
         tw = tl.load(TW + offs_b * stride_twb + tk * stride_twk, mask=mask_b, other=0.0, eviction_policy="evict_last")
-        ki = tl.where(mask_b, ki, 0)
-        tw = tl.where(mask_b, tw, 0.0)
         acc = tl.load(
             B + ki[:, None] * stride_bk + offs_d[None, :] * stride_bd,
             mask=mask, other=0.0,
             eviction_policy="evict_first",
-        )
+        ).to(tl.float32)
         for p in range(P_NUM):
             pm_raw = tl.load(
                 P + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd,
@@ -109,15 +127,14 @@ def _tree_perm_fwd_kernel(
                 mask=mask & is_valid, other=0.0,
                 eviction_policy="evict_first",
             )
-            w = tl.where(is_valid, w, 0.0)
             xv = tl.load(
                 R + offs_b[:, None] * stride_rm + pm * stride_rd,
                 mask=mask & is_valid, other=0.0,
                 eviction_policy="evict_last",
             )
-            acc += w * xv
+            acc += (w * xv).to(tl.float32)
         acc = tl.minimum(tl.maximum(acc, 0.0), 6.0)
-        acc_total += acc * tw[:, None]
+        acc_total += acc * tw[:, None].to(tl.float32)
 
     # Y store via block_ptr for coalesced store when stride_yd==1 (contiguous D)
     y_block_ptr = tl.make_block_ptr(
@@ -169,7 +186,7 @@ def triton_tree_perm_fwd(r_in, w_perm, bias, perms, top_idx, top_w):
     return out
 
 
-@triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["B_ROWS", "D_DIM"])
+@triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["D_DIM"])
 @triton.jit
 def _tree_perm_bwd_dprim_kernel(
     R, W, Bias, Perms, TopIdx, TopW, GO,
@@ -183,7 +200,7 @@ def _tree_perm_bwd_dprim_kernel(
     stride_gom, stride_god,
     stride_dpm, stride_dptk, stride_dpd,
     stride_actm, stride_acttk, stride_actd,
-    B_ROWS: tl.constexpr, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
+    B_ROWS, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
     STORE_ACT: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
@@ -210,27 +227,23 @@ def _tree_perm_bwd_dprim_kernel(
         order=(1, 0),
     )
     go_val = tl.load(go_block_ptr, boundary_check=(0, 1))
-    # fallback manual: go_val = tl.load(GO + offs_b[:, None] * stride_gom + offs_d[None, :] * stride_god, mask=mask, other=0.0)
 
     for tk in range(TOPK):
         ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=0)
         tw = tl.load(TopW + offs_b * stride_twm + tk * stride_twtk, mask=mask_b, other=0.0)
-        tw = tl.where(mask_b, tw, 0.0)
-        ki = tl.where(mask_b, ki, 0)
 
-        acc = tl.load(Bias + ki[:, None] * stride_bk + offs_d[None, :] * stride_bd, mask=mask, other=0.0, eviction_policy="evict_first")
+        acc = tl.load(Bias + ki[:, None] * stride_bk + offs_d[None, :] * stride_bd, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
         for p in range(P_NUM):
             pm_raw = tl.load(Perms + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd, mask=mask, other=-1, eviction_policy="evict_first")
             is_valid = (pm_raw >= 0) & (pm_raw < D_DIM)
             pm = tl.where(is_valid, pm_raw, 0)
             w = tl.load(W + ki[:, None] * stride_wk + p * stride_wp + offs_d[None, :] * stride_wd, mask=mask & is_valid, other=0.0, eviction_policy="evict_first")
-            w = tl.where(is_valid, w, 0.0)
             xv = tl.load(R + offs_b[:, None] * stride_rm + pm * stride_rd, mask=mask & is_valid, other=0.0, eviction_policy="evict_last")
-            acc += w * xv
+            acc += (w * xv).to(tl.float32)
 
         # relu6 derivative strict >/< : 0 outside (0,6), 1 inside; matches forward clamp
         mask_relu = (acc > 0.0) & (acc < 6.0)
-        dp = go_val * tw[:, None] * tl.where(mask_relu, 1.0, 0.0)
+        dp = go_val.to(tl.float32) * tw[:, None].to(tl.float32) * tl.where(mask_relu, 1.0, 0.0)
         tl.store(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + offs_d[None, :] * stride_dpd, dp.to(D_PRIM.dtype.element_ty), mask=mask)
 
         if STORE_ACT:
@@ -238,7 +251,7 @@ def _tree_perm_bwd_dprim_kernel(
             tl.store(ACT + offs_b[:, None] * stride_actm + tk * stride_acttk + offs_d[None, :] * stride_actd, act.to(ACT.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["B_ROWS", "D_DIM"])
+@triton.autotune(configs=_TREE_AUTOTUNE_CONFIGS, key=["D_DIM"])
 @triton.jit
 def _tree_perm_bwd_dx_kernel(
     D_PRIM, W, InvPerms, TopIdx, GR,
@@ -247,7 +260,7 @@ def _tree_perm_bwd_dx_kernel(
     stride_pk, stride_pp, stride_pd,
     stride_tbm, stride_tbtk,
     stride_grm, stride_grd,
-    B_ROWS: tl.constexpr, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
+    B_ROWS, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """
@@ -264,15 +277,13 @@ def _tree_perm_bwd_dx_kernel(
     acc = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
     for tk in range(TOPK):
         ki = tl.load(TopIdx + offs_b * stride_tbm + tk * stride_tbtk, mask=mask_b, other=0, eviction_policy="evict_last")
-        ki = tl.where(mask_b, ki, 0)
         for p in range(P_NUM):
             src_raw = tl.load(InvPerms + ki[:, None] * stride_pk + p * stride_pp + offs_d[None, :] * stride_pd, mask=mask, other=-1, eviction_policy="evict_first")
             is_valid = (src_raw >= 0) & (src_raw < D_DIM)
             src = tl.where(is_valid, src_raw, 0)
             dp = tl.load(D_PRIM + offs_b[:, None] * stride_dpm + tk * stride_dptk + src * stride_dpd, mask=mask & is_valid, other=0.0, eviction_policy="evict_last")
             w = tl.load(W + ki[:, None] * stride_wk + p * stride_wp + src * stride_wd, mask=mask & is_valid, other=0.0, eviction_policy="evict_first")
-            w = tl.where(is_valid, w, 0.0)
-            acc += dp * w
+            acc += (dp * w).to(tl.float32)
     gr_block_ptr = tl.make_block_ptr(
         base=GR,
         shape=(B_ROWS, D_DIM),
@@ -284,6 +295,7 @@ def _tree_perm_bwd_dx_kernel(
     tl.store(gr_block_ptr, acc.to(GR.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.autotune(configs=_GW_AUTOTUNE_CONFIGS, key=["D_DIM"])
 @triton.jit
 def _tree_perm_bwd_gw_kernel(
     D_PRIM, R, Perms, TopIdx, GW,
@@ -292,7 +304,7 @@ def _tree_perm_bwd_gw_kernel(
     stride_pk, stride_pp, stride_pd,
     stride_tbm, stride_tbtk,
     stride_gwk, stride_gwp, stride_gwd,
-    B_ROWS: tl.constexpr, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
+    B_ROWS, D_DIM: tl.constexpr, P_NUM: tl.constexpr, TOPK: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     assert BLOCK_B <= 64 and BLOCK_D <= 64
@@ -408,13 +420,7 @@ class TritonTreePermFunction(torch.autograd.Function):
         gw = None
         if ctx.needs_input_grad[1]:
             gw = torch.zeros(w_perm.shape, dtype=dtype, device=w_perm.device)
-            BD_GW = 64
-            BM_GW = 64
-            if _is_turing(r_in.device):
-                BD_GW = 32
-                BM_GW = 32
-            num_warps_gw = max(1, min(4, BD_GW // 32))
-            grid_gw = (K, P, (D + BD_GW - 1) // BD_GW)
+            grid_gw = lambda META: (K, P, (D + META["BLOCK_D"] - 1) // META["BLOCK_D"])
             _tree_perm_bwd_gw_kernel[grid_gw](
                 d_prim, r_flat, perms_f, top_idx_flat, gw,
                 d_prim.stride(0), d_prim.stride(1), d_prim.stride(2),
@@ -423,7 +429,6 @@ class TritonTreePermFunction(torch.autograd.Function):
                 top_idx_flat.stride(0), top_idx_flat.stride(1),
                 gw.stride(0), gw.stride(1), gw.stride(2),
                 B_flat, D, P, Tk,
-                BLOCK_B=BM_GW, BLOCK_D=BD_GW, num_warps=num_warps_gw,
             )
             gw = gw.to(w_perm.dtype)
 

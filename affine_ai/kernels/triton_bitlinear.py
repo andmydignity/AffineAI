@@ -73,13 +73,6 @@ def _turing_prune_configs(configs):
 _swiglu_autotune_configs = _turing_prune_configs(_swiglu_autotune_configs)
 
 
-def _sigmoid_fallback(x):
-    try:
-        return tl.sigmoid(x)
-    except Exception:
-        return 1.0 / (1.0 + tl.exp(-x))
-
-
 @triton.autotune(configs=_swiglu_autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
 def _swiglu_down_fwd_kernel(
@@ -88,7 +81,6 @@ def _swiglu_down_fwd_kernel(
     stride_wdk, stride_wdn,
     stride_outm, stride_outk,
     stride_hm, stride_hn,
-    Gamma_d,
     M, N, K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -110,12 +102,8 @@ def _swiglu_down_fwd_kernel(
     mask_m = offs_m < M
     mask_k = offs_k < K
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-    gamma_d = Gamma_d
 
     for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
-
         gv_gate_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, n_start), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
         gv_val_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, n_start + N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
         gate = tl.load(gv_gate_ptr, boundary_check=(0, 1))
@@ -133,9 +121,11 @@ def _swiglu_down_fwd_kernel(
 
         w_ptr = tl.make_block_ptr(base=W_D, shape=(K, N), strides=(stride_wdk, stride_wdn), offsets=(pid_k * BLOCK_K, n_start), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))
         wd = tl.load(w_ptr, boundary_check=(0, 1))
-        acc += tl.dot(h_act, tl.trans(wd.to(tl.float32)), out_dtype=tl.float32, input_precision="ieee")
+        if wd.dtype == tl.float32:
+            acc += tl.dot(h_act, tl.trans(wd), out_dtype=tl.float32, input_precision="ieee")
+        else:
+            acc += tl.dot(h_act.to(wd.dtype), tl.trans(wd), out_dtype=tl.float32)
 
-    acc = acc * gamma_d
     out_ptrs = OUT + offs_m[:, None] * stride_outm + offs_k[None, :] * stride_outk
     tl.store(out_ptrs, acc.to(OUT.dtype.element_ty), mask=mask_m[:, None] & mask_k[None, :])
 
@@ -148,7 +138,6 @@ def _swiglu_bwd_kernel(
     stride_wdk, stride_wdn,
     stride_gvm, stride_gvn,
     stride_ggvm, stride_ggvn,
-    Gamma_d,
     M, N, K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -168,21 +157,17 @@ def _swiglu_bwd_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    gamma_d = Gamma_d
-
     # Accumulate g_hact in SRAM via Tensor Cores: GO @ W_D
     g_hact = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < K
-
         go_ptr = tl.make_block_ptr(base=GO, shape=(M, K), strides=(stride_gom, stride_gok), offsets=(pid_m * BLOCK_M, k_start), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
         go = tl.load(go_ptr, boundary_check=(0, 1))
         wd_ptr = tl.make_block_ptr(base=W_D, shape=(K, N), strides=(stride_wdk, stride_wdn), offsets=(k_start, pid_n * BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))
         wd = tl.load(wd_ptr, boundary_check=(0, 1))
-        g_hact += tl.dot(go.to(tl.float32), wd.to(tl.float32), out_dtype=tl.float32, input_precision="ieee")
-
-    g_hact = g_hact * gamma_d
+        if go.dtype == tl.float32 or wd.dtype == tl.float32:
+            g_hact += tl.dot(go.to(tl.float32), wd.to(tl.float32), out_dtype=tl.float32, input_precision="ieee")
+        else:
+            g_hact += tl.dot(go, wd, out_dtype=tl.float32)
 
     # Load gate & val in SRAM
     gv_gate_ptr = tl.make_block_ptr(base=GV, shape=(M, 2 * N), strides=(stride_gvm, stride_gvn), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
@@ -254,7 +239,6 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             w_d_q.stride(0), w_d_q.stride(1),
             out.stride(0), out.stride(1),
             0, 0,
-            1.0,
             M, N, K,
             HAS_STORE=False,
         )
@@ -291,7 +275,6 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
             w_d_q.stride(0), w_d_q.stride(1),
             gv.stride(0), gv.stride(1),
             g_gv.stride(0), g_gv.stride(1),
-            1.0,
             M, N, K,
         )
 

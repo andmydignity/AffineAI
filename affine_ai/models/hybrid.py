@@ -203,6 +203,27 @@ def compute_document_reset_mask(
     return byte_reset, patch_reset
 
 
+def _sync_opt_grads(opt: Any) -> None:
+    """All-reduce parameter gradients across workers in distributed training."""
+    try:
+        from affine_ai.training.distributed import is_distributed, get_world_size, all_reduce_avg
+        if is_distributed() and get_world_size() > 1:
+            opts = []
+            if hasattr(opt, "param_groups"):
+                opts.append(opt)
+            if getattr(opt, "muon_opt", None) is not None:
+                opts.append(opt.muon_opt)
+            if getattr(opt, "adamw_opt", None) is not None:
+                opts.append(opt.adamw_opt)
+            for sub_opt in opts:
+                for pg in getattr(sub_opt, "param_groups", []):
+                    for p in pg.get("params", []):
+                        if p.grad is not None:
+                            all_reduce_avg(p.grad.data)
+    except Exception:
+        pass
+
+
 class TorosHybridLanguageModel(nn.Module):
     """
     Stripped Toros-Hybrid: patch-latent encoder + causal byte decoder.
@@ -659,9 +680,11 @@ class TorosHybridLanguageModel(nn.Module):
                 bwd_done_event.record(torch.cuda.current_stream())
                 with torch.cuda.stream(opt_stream):
                     opt_stream.wait_event(bwd_done_event)
+                    _sync_opt_grads(opt_i)
                     opt_i.step()
                     opt_i.zero_grad(set_to_none=True)
             else:
+                _sync_opt_grads(opt_i)
                 opt_i.step()
                 opt_i.zero_grad(set_to_none=is_cuda)
 
@@ -677,6 +700,7 @@ class TorosHybridLanguageModel(nn.Module):
                 enc_params = [p for pg in opt_enc.param_groups for p in pg['params'] if p.grad is not None]
                 if enc_params:
                     torch.nn.utils.clip_grad_norm_(enc_params, grad_clip, foreach=True)
+            _sync_opt_grads(opt_enc)
             opt_enc.step()
             opt_enc.zero_grad(set_to_none=is_cuda)
 
@@ -757,6 +781,7 @@ class TorosHybridLanguageModel(nn.Module):
             final_params = [p for pg in opt_final.param_groups for p in pg['params'] if p.grad is not None]
             if final_params:
                 torch.nn.utils.clip_grad_norm_(final_params, grad_clip, foreach=True)
+        _sync_opt_grads(opt_final)
         opt_final.step()
         opt_final.zero_grad(set_to_none=is_cuda)
         if sync_loss:

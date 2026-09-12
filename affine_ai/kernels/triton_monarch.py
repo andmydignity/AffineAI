@@ -97,6 +97,22 @@ except Exception:
     pass
 
 
+_MONARCH_DIAG_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_N": 32, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 32, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_D": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_N": 128, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+]
+if _is_turing():
+    _MONARCH_DIAG_AUTOTUNE_CONFIGS = [
+        c for c in _MONARCH_DIAG_AUTOTUNE_CONFIGS
+        if c.kwargs.get("BLOCK_N", 32) <= 64 and c.kwargs.get("BLOCK_D", 32) <= 64 and c.num_warps <= 4
+    ]
+
+
 @triton.autotune(configs=_MONARCH_AUTOTUNE_CONFIGS, key=["N", "D"])
 @triton.jit
 def _monarch_chain_fwd_kernel(
@@ -109,12 +125,9 @@ def _monarch_chain_fwd_kernel(
 ):
     """
     Fused Monarch chain: Y[m,d]=Bias[d]+W[d]*X[m,P[d]]. BLOCK_M/D tiles cover (N,D).
-    Early-exit when pid_d*BLOCK_D >= D (fully masked D tail) avoids useless loads.
     """
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
-    if pid_d * BLOCK_D >= D:
-        return
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
@@ -203,8 +216,6 @@ def _fused_monarch_chain_fwd_kernel(
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
     br = tl.program_id(2)
-    if pid_d * BLOCK_D >= D:
-        return
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
@@ -265,7 +276,14 @@ def _fused_monarch_chain_fwd_kernel(
     # fallback manual: tl.store(Y + br * stride_ym + offs_m[:, None] * stride_yn + offs_d[None, :] * stride_yd, y, mask=mask_m[:, None] & mask_d[None, :])
 
 
-def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def triton_monarch_chain_fwd(
+    x: torch.Tensor,
+    diagonals: torch.Tensor,
+    perms: torch.Tensor,
+    bias: torch.Tensor,
+    W: Optional[torch.Tensor] = None,
+    P: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Monarch chain forward: composes diagonals/perms into monomial W,P then fused kernel.
     Tail-mask subtlety: blocked loads use boundary_check + early-exit on fully masked D tail;
@@ -287,7 +305,8 @@ def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: to
             h = h[:, perms_long[s]] * diagonals[s + 1]
         return h + bias
 
-    W, P = precompute_monarch_composed_single(diagonals, perms)
+    if W is None or P is None:
+        W, P = precompute_monarch_composed_single(diagonals, perms)
     out = torch.empty((N, D), device=x.device, dtype=x.dtype)
     grid = lambda META: (triton.cdiv(N, META["BLOCK_M"]), triton.cdiv(D, META["BLOCK_D"]))
     _monarch_chain_fwd_kernel[grid](
@@ -300,7 +319,14 @@ def triton_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: to
     return out
 
 
-def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, perms: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def triton_fused_monarch_chain_fwd(
+    x: torch.Tensor,
+    diagonals: torch.Tensor,
+    perms: torch.Tensor,
+    bias: torch.Tensor,
+    W: Optional[torch.Tensor] = None,
+    P: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Fused multi-branch Monarch chain forward. Tail-mask subtlety same as single-branch:
     masked D lanes are other=0 with boundary_check, fully masked tail block early-exits.
@@ -321,7 +347,8 @@ def triton_fused_monarch_chain_fwd(x: torch.Tensor, diagonals: torch.Tensor, per
             h = h[:, :, perms_long[s]] * diagonals[:, s + 1].unsqueeze(1)
         return h + bias.unsqueeze(1)
 
-    W, P = precompute_monarch_composed_fused(diagonals, perms)
+    if W is None or P is None:
+        W, P = precompute_monarch_composed_fused(diagonals, perms)
     out = torch.empty((M, N, D), device=x.device, dtype=x.dtype)
     grid = lambda META: (triton.cdiv(N, META["BLOCK_M"]), triton.cdiv(D, META["BLOCK_D"]), M)
     _fused_monarch_chain_fwd_kernel[grid](
@@ -388,14 +415,13 @@ def precompute_monarch_bwd_scales_fused(diagonals: torch.Tensor, perms: torch.Te
 def _monarch_chain_bwd_gx_kernel(
     GradOut, W, P_inv, GX,
     stride_gom, stride_god,
+    stride_wd,
     stride_gxm, stride_gxd,
     N, D,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
-    if pid_d * BLOCK_D >= D:
-        return
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
@@ -411,7 +437,7 @@ def _monarch_chain_bwd_gx_kernel(
     )
     p_inv = tl.load(p_inv_ptr, boundary_check=(0,))
 
-    w = tl.load(W + p_inv, mask=mask_d, other=0.0)
+    w = tl.load(W + p_inv * stride_wd, mask=mask_d, other=0.0)
     go = tl.load(
         GradOut + offs_m[:, None] * stride_gom + p_inv[None, :] * stride_god,
         mask=mask_m[:, None] & mask_d[None, :],
@@ -430,6 +456,7 @@ def _monarch_chain_bwd_gx_kernel(
     tl.store(gx_block_ptr, gx.to(GX.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.autotune(configs=_MONARCH_DIAG_AUTOTUNE_CONFIGS, key=["N", "D"])
 @triton.jit
 def _monarch_chain_bwd_diag_kernel(
     GradOut, X, W_scale, P_in, P_out, GDiag,
@@ -444,8 +471,6 @@ def _monarch_chain_bwd_diag_kernel(
 ):
     pid_s = tl.program_id(0)
     pid_d = tl.program_id(1)
-    if pid_d * BLOCK_D >= D:
-        return
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
 
@@ -477,8 +502,6 @@ def _fused_monarch_chain_bwd_gx_kernel(
 ):
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
-    if pid_d * BLOCK_D >= D:
-        return
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = offs_m < N
@@ -516,6 +539,7 @@ def _fused_monarch_chain_bwd_gx_kernel(
     tl.store(gx_block_ptr, acc.to(GX.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.autotune(configs=_MONARCH_DIAG_AUTOTUNE_CONFIGS, key=["N", "D"])
 @triton.jit
 def _fused_monarch_chain_bwd_diag_kernel(
     GradOut, X, W_scale, P_in, P_out, GDiag,
@@ -531,8 +555,6 @@ def _fused_monarch_chain_bwd_diag_kernel(
     br = tl.program_id(0)
     pid_s = tl.program_id(1)
     pid_d = tl.program_id(2)
-    if pid_d * BLOCK_D >= D:
-        return
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
 
@@ -577,9 +599,14 @@ class TritonMonarchChainFunction(torch.autograd.Function):
                 if not torch.equal(inv_perms[s].gather(0, perms[s]), arange):
                     raise AssertionError(f"perms/inv_perms not bijective at stage {s}")
 
-        out = triton_monarch_chain_fwd(x_flat, diagonals, perms, bias)
+        if not x_flat.is_cuda or not torch.cuda.is_available():
+            out = triton_monarch_chain_fwd(x_flat, diagonals, perms, bias)
+            ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, None, None)
+        else:
+            W, P = precompute_monarch_composed_single(diagonals, perms)
+            out = triton_monarch_chain_fwd(x_flat, diagonals, perms, bias, W=W, P=P)
+            ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, W, P)
 
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
         ctx.num_stages = num_stages
         ctx.orig_shape = orig_shape
         ctx.orig_dtype = x.dtype
@@ -588,7 +615,7 @@ class TritonMonarchChainFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
+        x_flat, diagonals, perms, inv_perms, W, P = ctx.saved_tensors
         num_stages = ctx.num_stages
         go_flat = grad_out.reshape(-1, grad_out.shape[-1]).to(diagonals.dtype)
         g_bias = go_flat.sum(0).to(ctx.bias_dtype)
@@ -613,7 +640,6 @@ class TritonMonarchChainFunction(torch.autograd.Function):
             return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
 
         N, D = x_flat.shape
-        W, P = precompute_monarch_composed_single(diagonals, perms)
         P_inv = torch.argsort(P).to(torch.int32).contiguous()
 
         gx = torch.empty((N, D), device=x_flat.device, dtype=diagonals.dtype)
@@ -621,14 +647,14 @@ class TritonMonarchChainFunction(torch.autograd.Function):
         _monarch_chain_bwd_gx_kernel[grid_gx](
             go_flat, W, P_inv, gx,
             go_flat.stride(0), go_flat.stride(1),
+            W.stride(0),
             gx.stride(0), gx.stride(1),
             N, D,
         )
 
         W_scale, P_in, P_out = precompute_monarch_bwd_scales_single(diagonals, perms, inv_perms)
         g_diagonals = torch.empty_like(diagonals)
-        BD = 64 if _is_turing() else 64
-        grid_diag = (num_stages, triton.cdiv(D, BD))
+        grid_diag = lambda META: (num_stages, triton.cdiv(D, META["BLOCK_D"]))
         _monarch_chain_bwd_diag_kernel[grid_diag](
             go_flat, x_flat, W_scale, P_in, P_out, g_diagonals,
             go_flat.stride(0), go_flat.stride(1),
@@ -638,7 +664,6 @@ class TritonMonarchChainFunction(torch.autograd.Function):
             P_out.stride(0), P_out.stride(1),
             g_diagonals.stride(0), g_diagonals.stride(1),
             N, D,
-            BLOCK_N=64, BLOCK_D=BD,
         )
 
         return gx.to(ctx.orig_dtype).reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
@@ -668,9 +693,14 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
                 if not torch.equal(inv_perms[s].gather(0, perms[s]), arange):
                     raise AssertionError(f"perms/inv_perms not bijective at stage {s}")
 
-        out = triton_fused_monarch_chain_fwd(x_flat, diagonals, perms, bias) # [M, N, dim]
+        if not x_flat.is_cuda or not torch.cuda.is_available():
+            out = triton_fused_monarch_chain_fwd(x_flat, diagonals, perms, bias) # [M, N, dim]
+            ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, None, None)
+        else:
+            W, P = precompute_monarch_composed_fused(diagonals, perms)
+            out = triton_fused_monarch_chain_fwd(x_flat, diagonals, perms, bias, W=W, P=P)
+            ctx.save_for_backward(x_flat, diagonals, perms, inv_perms, W, P)
 
-        ctx.save_for_backward(x_flat, diagonals, perms, inv_perms)
         ctx.num_branches = num_branches
         ctx.num_stages = num_stages
         ctx.orig_shape = orig_shape
@@ -680,7 +710,7 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outs):
-        x_flat, diagonals, perms, inv_perms = ctx.saved_tensors
+        x_flat, diagonals, perms, inv_perms, W, P = ctx.saved_tensors
         num_branches = ctx.num_branches
         num_stages = ctx.num_stages
         g_stack = torch.stack([g.reshape(-1, g.shape[-1]).to(diagonals.dtype) for g in grad_outs], dim=0) # [M, N, dim]
@@ -706,7 +736,6 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
             return gx.reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias
 
         N, D = x_flat.shape
-        W, P = precompute_monarch_composed_fused(diagonals, perms)
         P_inv = torch.argsort(P).to(torch.int32).contiguous()
 
         gx = torch.empty((N, D), device=x_flat.device, dtype=diagonals.dtype)
@@ -721,8 +750,7 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
 
         W_scale, P_in, P_out = precompute_monarch_bwd_scales_fused(diagonals, perms, inv_perms)
         g_diagonals = torch.empty_like(diagonals)
-        BD = 64 if _is_turing() else 64
-        grid_diag = (num_branches, num_stages, triton.cdiv(D, BD))
+        grid_diag = lambda META: (num_branches, num_stages, triton.cdiv(D, META["BLOCK_D"]))
         _fused_monarch_chain_bwd_diag_kernel[grid_diag](
             g_stack, x_flat, W_scale, P_in, P_out, g_diagonals,
             g_stack.stride(0), g_stack.stride(1), g_stack.stride(2),
@@ -732,7 +760,6 @@ class TritonFusedMonarchChainFunction(torch.autograd.Function):
             P_out.stride(0), P_out.stride(1),
             g_diagonals.stride(0), g_diagonals.stride(1), g_diagonals.stride(2),
             N, D,
-            BLOCK_N=64, BLOCK_D=BD,
         )
 
         return gx.to(ctx.orig_dtype).reshape(*ctx.orig_shape), g_diagonals, None, None, g_bias

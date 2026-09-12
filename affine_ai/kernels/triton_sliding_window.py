@@ -44,9 +44,10 @@ def _prune_swa_configs(configs, named_args, **kwargs):
         pruned = [
             c
             for c in configs
-            if c.kwargs.get("BLOCK_D", 64) <= 64
-            and c.kwargs.get("BLOCK_M", 64) <= 32
+            if c.kwargs.get("BLOCK_M", 64) <= 32
+            and c.kwargs.get("BLOCK_N", 64) <= 32
             and c.num_warps <= 4
+            and (c.kwargs.get("BLOCK_D", 64) <= 64 or (D is not None and D > 64))
         ]
         if pruned:
             return pruned
@@ -86,17 +87,16 @@ def _swa_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_m = tl.program_id(0).to(tl.int64)
-    pid_bh = tl.program_id(1).to(tl.int64)
-    T_i64 = T
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
-    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
-    mask_m = offs_m < T_i64
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < T
     mask_d = offs_d < D
 
-    q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+    q_ptrs = Q_ptr + pid_bh.to(tl.int64) * stride_qb + offs_m[:, None].to(tl.int64) * stride_qt + offs_d[None, :].to(tl.int64) * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
     m_i = tl.full([BLOCK_M], -1e30, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -104,34 +104,33 @@ def _swa_fwd_kernel(
 
     m_start = pid_m * BLOCK_M
     win_lo = m_start - WINDOW + 1
-    zero_i64 = tl.zeros([], dtype=tl.int64)
-    need_sep_sink = SINK and (win_lo > 1)
+    need_sep_sink = SINK and (win_lo >= BLOCK_N)
 
     if need_sep_sink:
-        k0_ptrs = K_ptr + pid_bh * stride_kb + 0 * stride_kt + offs_d * stride_kd
-        k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-        dot0 = tl.sum(q * k0[None, :], axis=1) * SCALE
+        k0_ptrs = K_ptr + pid_bh.to(tl.int64) * stride_kb + 0 * stride_kt + offs_d.to(tl.int64) * stride_kd
+        k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0)
+        dot0 = tl.sum(q.to(tl.float32) * k0.to(tl.float32)[None, :], axis=1) * SCALE
         m_i = tl.where(mask_m, dot0, -1e30)
         l_i = tl.where(mask_m, 1.0, 0.0)
-        v0_ptrs = V_ptr + pid_bh * stride_vb + 0 * stride_vt + offs_d * stride_vd
-        v0 = tl.load(v0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-        acc = tl.where(mask_m[:, None], v0[None, :], 0.0)
+        v0_ptrs = V_ptr + pid_bh.to(tl.int64) * stride_vb + 0 * stride_vt + offs_d.to(tl.int64) * stride_vd
+        v0 = tl.load(v0_ptrs, mask=mask_d, other=0.0)
+        acc = tl.where(mask_m[:, None], v0.to(tl.float32)[None, :], 0.0)
         k_start = (win_lo // BLOCK_N) * BLOCK_N
     else:
-        k_start = zero_i64
+        k_start = 0
 
-    k_end = tl.minimum(T_i64, (pid_m + 1) * BLOCK_M)
+    k_end = tl.minimum(T, (pid_m + 1) * BLOCK_M)
     for n_start in range(k_start, k_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
-        mask_n = offs_n < T_i64
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < T
 
-        k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        k_ptrs = K_ptr + pid_bh.to(tl.int64) * stride_kb + offs_n[:, None].to(tl.int64) * stride_kt + offs_d[None, :].to(tl.int64) * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
-        v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+        v_ptrs = V_ptr + pid_bh.to(tl.int64) * stride_vb + offs_n[:, None].to(tl.int64) * stride_vt + offs_d[None, :].to(tl.int64) * stride_vd
         v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
-        s = tl.dot(q, tl.trans(k), allow_tf32=False) * SCALE
+        s = tl.dot(q, tl.trans(k)) * SCALE
 
         if SINK:
             if need_sep_sink:
@@ -175,11 +174,11 @@ def _swa_fwd_kernel(
     inv_l = 1.0 / tl.maximum(l_i, 1e-12)
     out = acc * inv_l[:, None]
 
-    out_ptrs = Out_ptr + pid_bh * stride_ob + offs_m[:, None] * stride_ot + offs_d[None, :] * stride_od
+    out_ptrs = Out_ptr + pid_bh.to(tl.int64) * stride_ob + offs_m[:, None].to(tl.int64) * stride_ot + offs_d[None, :].to(tl.int64) * stride_od
     tl.store(out_ptrs, out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
     lse = tl.where(mask_m, m_i + tl.log(tl.maximum(l_i, 1e-12)), -1e30)
-    lse_ptrs = LSE_ptr + pid_bh * stride_lb + offs_m * stride_lt
+    lse_ptrs = LSE_ptr + pid_bh.to(tl.int64) * stride_lb + offs_m.to(tl.int64) * stride_lt
     tl.store(lse_ptrs, lse, mask=mask_m)
 
 
@@ -206,61 +205,59 @@ def _swa_bwd_dq_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_m = tl.program_id(0).to(tl.int64)
-    pid_bh = tl.program_id(1).to(tl.int64)
-    T_i64 = T
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
-    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
-    mask_m = offs_m < T_i64
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < T
     mask_d = offs_d < D
 
-    q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+    q_ptrs = Q_ptr + pid_bh.to(tl.int64) * stride_qb + offs_m[:, None].to(tl.int64) * stride_qt + offs_d[None, :].to(tl.int64) * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
-    do_ptrs = dO_ptr + pid_bh * stride_dob + offs_m[:, None] * stride_dot + offs_d[None, :] * stride_dod
-    do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+    do_ptrs = dO_ptr + pid_bh.to(tl.int64) * stride_dob + offs_m[:, None].to(tl.int64) * stride_dot + offs_d[None, :].to(tl.int64) * stride_dod
+    do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
-    lse_ptrs = LSE_ptr + pid_bh * stride_lb + offs_m * stride_lt
+    lse_ptrs = LSE_ptr + pid_bh.to(tl.int64) * stride_lb + offs_m.to(tl.int64) * stride_lt
     lse = tl.load(lse_ptrs, mask=mask_m, other=0.0)
 
-    delta_ptrs = Delta_ptr + pid_bh * stride_delb + offs_m * stride_delt
+    delta_ptrs = Delta_ptr + pid_bh.to(tl.int64) * stride_delb + offs_m.to(tl.int64) * stride_delt
     delta = tl.load(delta_ptrs, mask=mask_m, other=0.0)
 
     dq = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
     m_start = pid_m * BLOCK_M
     win_lo = m_start - WINDOW + 1
-    zero_i64 = tl.zeros([], dtype=tl.int64)
-    need_sep_sink = SINK and (win_lo > 1)
+    need_sep_sink = SINK and (win_lo >= BLOCK_N)
 
     if need_sep_sink:
-        k0_ptrs = K_ptr + pid_bh * stride_kb + 0 * stride_kt + offs_d * stride_kd
-        k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-        v0_ptrs = V_ptr + pid_bh * stride_vb + 0 * stride_vt + offs_d * stride_vd
-        v0 = tl.load(v0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+        k0_ptrs = K_ptr + pid_bh.to(tl.int64) * stride_kb + 0 * stride_kt + offs_d.to(tl.int64) * stride_kd
+        k0 = tl.load(k0_ptrs, mask=mask_d, other=0.0)
+        v0_ptrs = V_ptr + pid_bh.to(tl.int64) * stride_vb + 0 * stride_vt + offs_d.to(tl.int64) * stride_vd
+        v0 = tl.load(v0_ptrs, mask=mask_d, other=0.0)
 
-        s0 = tl.sum(q * k0[None, :], axis=1) * SCALE
+        s0 = tl.sum(q.to(tl.float32) * k0.to(tl.float32)[None, :], axis=1) * SCALE
         p0 = tl.where(mask_m, tl.exp(s0 - lse), 0.0)
-        dp0 = tl.sum(do * v0[None, :], axis=1)
+        dp0 = tl.sum(do.to(tl.float32) * v0.to(tl.float32)[None, :], axis=1)
         ds0 = p0 * (dp0 - delta) * SCALE
-        dq += ds0[:, None] * k0[None, :]
+        dq += ds0[:, None] * k0.to(tl.float32)[None, :]
         k_start = (win_lo // BLOCK_N) * BLOCK_N
     else:
-        k_start = zero_i64
+        k_start = 0
 
-    k_end = tl.minimum(T_i64, (pid_m + 1) * BLOCK_M)
+    k_end = tl.minimum(T, (pid_m + 1) * BLOCK_M)
     for n_start in range(k_start, k_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
-        mask_n = offs_n < T_i64
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < T
 
-        k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        k_ptrs = K_ptr + pid_bh.to(tl.int64) * stride_kb + offs_n[:, None].to(tl.int64) * stride_kt + offs_d[None, :].to(tl.int64) * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
-        v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        v_ptrs = V_ptr + pid_bh.to(tl.int64) * stride_vb + offs_n[:, None].to(tl.int64) * stride_vt + offs_d[None, :].to(tl.int64) * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
-        s = tl.dot(q, tl.trans(k), allow_tf32=False) * SCALE
+        s = tl.dot(q, tl.trans(k)) * SCALE
 
         if SINK:
             if need_sep_sink:
@@ -290,11 +287,11 @@ def _swa_bwd_dq_kernel(
             )
 
         p = tl.where(attn_mask, tl.exp(s - lse[:, None]), 0.0)
-        dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+        dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - delta[:, None]) * SCALE
-        dq += tl.dot(ds, k, allow_tf32=False)
+        dq += tl.dot(ds.to(k.dtype), k)
 
-    dq_ptrs = dQ_ptr + pid_bh * stride_dqb + offs_m[:, None] * stride_dqt + offs_d[None, :] * stride_dqd
+    dq_ptrs = dQ_ptr + pid_bh.to(tl.int64) * stride_dqb + offs_m[:, None].to(tl.int64) * stride_dqt + offs_d[None, :].to(tl.int64) * stride_dqd
     tl.store(dq_ptrs, dq.to(dQ_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
@@ -322,51 +319,49 @@ def _swa_bwd_dkv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_n = tl.program_id(0).to(tl.int64)
-    pid_bh = tl.program_id(1).to(tl.int64)
-    zero_i64 = tl.zeros([], dtype=tl.int64)
-    T_i64 = zero_i64 + T
+    pid_n = tl.program_id(0)
+    pid_bh = tl.program_id(1)
 
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
-    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
-    mask_n = offs_n < T_i64
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_n = offs_n < T
     mask_d = offs_d < D
 
-    k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
-    k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+    k_ptrs = K_ptr + pid_bh.to(tl.int64) * stride_kb + offs_n[:, None].to(tl.int64) * stride_kt + offs_d[None, :].to(tl.int64) * stride_kd
+    k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
-    v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
-    v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+    v_ptrs = V_ptr + pid_bh.to(tl.int64) * stride_vb + offs_n[:, None].to(tl.int64) * stride_vt + offs_d[None, :].to(tl.int64) * stride_vd
+    v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
     dk = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
 
     n_start = pid_n * BLOCK_N
     if pid_n == 0 and SINK:
-        q_start = zero_i64
-        q_end = T_i64
+        q_start = 0
+        q_end = T
     else:
         q_start = (n_start // BLOCK_M) * BLOCK_M
         n_max = (pid_n + 1) * BLOCK_N - 1
-        q_end = tl.minimum(T_i64, ((n_max + WINDOW + BLOCK_M - 1) // BLOCK_M) * BLOCK_M)
+        q_end = tl.minimum(T, ((n_max + WINDOW + BLOCK_M - 1) // BLOCK_M) * BLOCK_M)
 
     for m_start in range(q_start, q_end, BLOCK_M):
-        offs_m = m_start + tl.arange(0, BLOCK_M).to(tl.int64)
-        mask_m = offs_m < T_i64
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < T
 
-        q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
-        q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        q_ptrs = Q_ptr + pid_bh.to(tl.int64) * stride_qb + offs_m[:, None].to(tl.int64) * stride_qt + offs_d[None, :].to(tl.int64) * stride_qd
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
-        do_ptrs = dO_ptr + pid_bh * stride_dob + offs_m[:, None] * stride_dot + offs_d[None, :] * stride_dod
-        do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        do_ptrs = dO_ptr + pid_bh.to(tl.int64) * stride_dob + offs_m[:, None].to(tl.int64) * stride_dot + offs_d[None, :].to(tl.int64) * stride_dod
+        do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
-        lse_ptrs = LSE_ptr + pid_bh * stride_lb + offs_m * stride_lt
+        lse_ptrs = LSE_ptr + pid_bh.to(tl.int64) * stride_lb + offs_m.to(tl.int64) * stride_lt
         lse = tl.load(lse_ptrs, mask=mask_m, other=0.0)
 
-        delta_ptrs = Delta_ptr + pid_bh * stride_delb + offs_m * stride_delt
+        delta_ptrs = Delta_ptr + pid_bh.to(tl.int64) * stride_delb + offs_m.to(tl.int64) * stride_delt
         delta = tl.load(delta_ptrs, mask=mask_m, other=0.0)
 
-        s = tl.dot(k, tl.trans(q), allow_tf32=False) * SCALE
+        s = tl.dot(k, tl.trans(q)) * SCALE
 
         if SINK:
             attn_mask = (
@@ -387,16 +382,16 @@ def _swa_bwd_dkv_kernel(
             )
 
         p = tl.where(attn_mask, tl.exp(s - lse[None, :]), 0.0)
-        dp = tl.dot(v, tl.trans(do), allow_tf32=False)
+        dp = tl.dot(v, tl.trans(do))
         ds = p * (dp - delta[None, :]) * SCALE
 
-        dk += tl.dot(ds, q, allow_tf32=False)
-        dv += tl.dot(p, do, allow_tf32=False)
+        dk += tl.dot(ds.to(q.dtype), q)
+        dv += tl.dot(p.to(do.dtype), do)
 
-    dk_ptrs = dK_ptr + pid_bh * stride_dkb + offs_n[:, None] * stride_dkt + offs_d[None, :] * stride_dkd
+    dk_ptrs = dK_ptr + pid_bh.to(tl.int64) * stride_dkb + offs_n[:, None].to(tl.int64) * stride_dkt + offs_d[None, :].to(tl.int64) * stride_dkd
     tl.store(dk_ptrs, dk.to(dK_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
-    dv_ptrs = dV_ptr + pid_bh * stride_dvb + offs_n[:, None] * stride_dvt + offs_d[None, :] * stride_dvd
+    dv_ptrs = dV_ptr + pid_bh.to(tl.int64) * stride_dvb + offs_n[:, None].to(tl.int64) * stride_dvt + offs_d[None, :].to(tl.int64) * stride_dvd
     tl.store(dv_ptrs, dv.to(dV_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
 
@@ -646,7 +641,7 @@ def sliding_window_attn(
     if q.shape != k.shape or q.shape != v.shape:
         raise ValueError(f"q/k/v shape mismatch: {q.shape} vs {k.shape} vs {v.shape}")
 
-    if not q.is_cuda:
+    if not q.is_cuda or q.shape[-1] > 256:
         return _eager_swa(q, k, v, window, sink, scale)
 
     if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):

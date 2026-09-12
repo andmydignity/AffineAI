@@ -22,6 +22,16 @@ except Exception:
     tl = None  # type: ignore
 
 
+_CAUSAL_CONV_CONFIGS = [
+    triton.Config({"BLOCK_T": 32, "BLOCK_D": 32}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_T": 64, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_T": 64, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_T": 128, "BLOCK_D": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_T": 128, "BLOCK_D": 64}, num_warps=4, num_stages=2),
+]
+
+
+@triton.autotune(configs=_CAUSAL_CONV_CONFIGS, key=["T", "D"])
 @triton.jit
 def _causal_conv1d_fwd_kernel(
     X, W, Bias, Out,
@@ -49,8 +59,9 @@ def _causal_conv1d_fwd_kernel(
     for k in range(K):
         # Causal delay: token at offs_t needs input from offs_t - (K - 1 - k)
         t_in = offs_t - (K - 1 - k)
-        mask = (t_in >= 0) & (t_in < T) & (offs_t < T)
-        x_ptrs = X + pid_b * stride_xb + t_in[:, None] * stride_xt + offs_d[None, :] * stride_xd
+        mask = (t_in >= 0) & (offs_t < T)
+        t_in_clamped = tl.maximum(t_in, 0)
+        x_ptrs = X + pid_b * stride_xb + t_in_clamped[:, None] * stride_xt + offs_d[None, :] * stride_xd
         w_ptrs = W + offs_d * K + k
         x_val = tl.load(x_ptrs, mask=mask[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         w_val = tl.load(w_ptrs, mask=mask_d, other=0.0).to(tl.float32)
@@ -61,6 +72,7 @@ def _causal_conv1d_fwd_kernel(
     tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=mask_out)
 
 
+@triton.autotune(configs=_CAUSAL_CONV_CONFIGS, key=["T", "D"])
 @triton.jit
 def _causal_conv1d_bwd_dx_kernel(
     dY, W, dX,
@@ -84,8 +96,9 @@ def _causal_conv1d_bwd_dx_kernel(
     for k in range(K):
         # Anti-causal future gradient: output at offs_t + (K - 1 - k) was influenced by input at offs_t
         t_out = offs_t + (K - 1 - k)
-        mask = (t_out >= 0) & (t_out < T) & (offs_t < T)
-        dy_ptrs = dY + pid_b * stride_dyb + t_out[:, None] * stride_dyt + offs_d[None, :] * stride_dyd
+        mask = (t_out < T) & (offs_t < T)
+        t_out_clamped = tl.minimum(t_out, T - 1)
+        dy_ptrs = dY + pid_b * stride_dyb + t_out_clamped[:, None] * stride_dyt + offs_d[None, :] * stride_dyd
         w_ptrs = W + offs_d * K + k
         dy_val = tl.load(dy_ptrs, mask=mask[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         w_val = tl.load(w_ptrs, mask=mask_d, other=0.0).to(tl.float32)
@@ -96,6 +109,7 @@ def _causal_conv1d_bwd_dx_kernel(
     tl.store(dx_ptrs, acc.to(dX.dtype.element_ty), mask=mask_dx)
 
 
+@triton.autotune(configs=_CAUSAL_CONV_CONFIGS, key=["T", "D"], reset_to_zero=["dW"])
 @triton.jit
 def _causal_conv1d_bwd_dw_fused_kernel(
     dY, X, dW,
@@ -121,8 +135,9 @@ def _causal_conv1d_bwd_dw_fused_kernel(
 
     for k in range(K):
         t_in = offs_t - (K - 1 - k)
-        mask_in = (t_in >= 0) & (t_in < T) & mask_t
-        x_ptrs = X + pid_b * stride_xb + t_in[:, None] * stride_xt + offs_d[None, :] * stride_xd
+        mask_in = (t_in >= 0) & mask_t
+        t_in_clamped = tl.maximum(t_in, 0)
+        x_ptrs = X + pid_b * stride_xb + t_in_clamped[:, None] * stride_xt + offs_d[None, :] * stride_xd
         x = tl.load(x_ptrs, mask=mask_in[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         dw_k = tl.sum(dy * x, axis=0)
         dw_ptrs = dW + offs_d * stride_dwd + k * stride_dwk
@@ -146,11 +161,9 @@ class TritonCausalConv1dFunction(torch.autograd.Function):
 
         B, T, D = x.shape
         K = w.shape[-1]
-        w_flat = w.view(D, K)
+        w_flat = w.reshape(D, K)
         out = torch.empty_like(x)
-        BLOCK_T = 64
-        BLOCK_D = 32
-        grid = (triton.cdiv(T, BLOCK_T), triton.cdiv(D, BLOCK_D), B)
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(D, META["BLOCK_D"]), B)
         has_bias = bias is not None
 
         _causal_conv1d_fwd_kernel[grid](
@@ -158,7 +171,7 @@ class TritonCausalConv1dFunction(torch.autograd.Function):
             x.stride(0), x.stride(1), x.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
             B, T, D,
-            HAS_BIAS=has_bias, K=K, BLOCK_T=BLOCK_T, BLOCK_D=BLOCK_D
+            HAS_BIAS=has_bias, K=K,
         )
 
         ctx.save_for_backward(x, w_flat)
@@ -199,31 +212,31 @@ class TritonCausalConv1dFunction(torch.autograd.Function):
         dbias = dy.sum(dim=(0, 1)).to(w.dtype) if (ctx.has_bias and ctx.needs_input_grad[2]) else None
         dw = None
 
-        BLOCK_T = 64
-        BLOCK_D = 32
         if dx is not None:
-            grid_dx = (triton.cdiv(T, BLOCK_T), triton.cdiv(D, BLOCK_D), B)
+            grid_dx = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(D, META["BLOCK_D"]), B)
             _causal_conv1d_bwd_dx_kernel[grid_dx](
                 dy, w, dx,
                 dy.stride(0), dy.stride(1), dy.stride(2),
                 dx.stride(0), dx.stride(1), dx.stride(2),
                 B, T, D,
-                K=K, BLOCK_T=BLOCK_T, BLOCK_D=BLOCK_D
+                K=K,
             )
 
         if ctx.needs_input_grad[1]:
             # Accumulate weight gradients in FP32 to avoid catastrophic precision loss in atomicAdd
             dw_fp32 = torch.zeros(D, K, device=w.device, dtype=torch.float32)
-            grid_dw = (triton.cdiv(D, BLOCK_D), triton.cdiv(T, BLOCK_T), B)
+            grid_dw = lambda META: (triton.cdiv(D, META["BLOCK_D"]), triton.cdiv(T, META["BLOCK_T"]), B)
             _causal_conv1d_bwd_dw_fused_kernel[grid_dw](
                 dy, x, dw_fp32,
                 dy.stride(0), dy.stride(1), dy.stride(2),
                 x.stride(0), x.stride(1), x.stride(2),
                 dw_fp32.stride(0), dw_fp32.stride(1),
                 B, T, D,
-                K=K, BLOCK_T=BLOCK_T, BLOCK_D=BLOCK_D
+                K=K,
             )
             dw = dw_fp32.to(w.dtype).view(ctx.w_shape)
+
+        return dx, dw, dbias
 
         return dx, dw, dbias
 

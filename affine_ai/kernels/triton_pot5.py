@@ -41,13 +41,22 @@ except ImportError:
     HAS_TRITON = False
 
 
+_TURING_CACHE: Optional[bool] = None
+
+
 def _is_turing() -> bool:
+    global _TURING_CACHE
+    if _TURING_CACHE is not None:
+        return _TURING_CACHE
     if not torch.cuda.is_available():
+        _TURING_CACHE = False
         return False
     try:
         cap = torch.cuda.get_device_capability()
-        return (7, 5) <= tuple(cap) < (8, 0)
+        _TURING_CACHE = (7, 5) <= tuple(cap) < (8, 0)
+        return _TURING_CACHE
     except Exception:
+        _TURING_CACHE = False
         return False
 
 
@@ -190,6 +199,8 @@ if HAS_TRITON:
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         alpha = tl.load(Alpha)
+        t_high = alpha * 0.75
+        t_low = alpha * 0.25
 
         for k in range(0, K, BLOCK_K):
             x_ptr = tl.make_block_ptr(base=X, shape=(M, K), strides=(stride_xm, stride_xk), offsets=(pid_m * BLOCK_M, k), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
@@ -201,7 +212,7 @@ if HAS_TRITON:
             # Unified α thresholds (0.25α/0.75α) — cross-ref _pot5_thresholds; online path
             w_abs = tl.abs(w)
             w_sign = tl.where(w > 0, 1.0, tl.where(w < 0, -1.0, 0.0))
-            w_eff = tl.where(w_abs > (alpha * 0.75), w_sign, tl.where(w_abs > (alpha * 0.25), w_sign * 0.5, 0.0))
+            w_eff = tl.where(w_abs > t_high, w_sign, tl.where(w_abs > t_low, w_sign * 0.5, 0.0))
 
             # Single Tensor Core / SIMT dot product (halves instruction count & register pressure)
             acc += tl.dot(x, tl.trans(w_eff.to(x.dtype)), out_dtype=tl.float32)
@@ -318,6 +329,8 @@ if HAS_TRITON:
 
         acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
         alpha = tl.load(Alpha_d)
+        t_high = alpha * 0.75
+        t_low = alpha * 0.25
 
         for n_start in range(0, N, BLOCK_N):
             offs_n = n_start + tl.arange(0, BLOCK_N)
@@ -333,17 +346,17 @@ if HAS_TRITON:
             sig = tl.sigmoid(gate)
             act = (gate * sig) * val
 
-            # Load W_down tile
-            wd_ptrs = W_D + offs_k[None, :] * stride_wdk + offs_n[:, None] * stride_wdn
-            wd = tl.load(wd_ptrs, mask=mask_k[None, :] & mask_n[:, None], other=0.0).to(tl.float32)
+            # Load W_down tile coalesced along contiguous dim N (stride_wdn == 1)
+            wd_ptrs = W_D + offs_k[:, None] * stride_wdk + offs_n[None, :] * stride_wdn
+            wd = tl.load(wd_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
 
             wd_abs = tl.abs(wd)
             wd_sign = tl.where(wd > 0, 1.0, tl.where(wd < 0, -1.0, 0.0))
             # Unified α thresholds (0.25α/0.75α) — cross-ref _pot5_thresholds
-            wd_eff = tl.where(wd_abs > (alpha * 0.75), wd_sign, tl.where(wd_abs > (alpha * 0.25), wd_sign * 0.5, 0.0))
+            wd_eff = tl.where(wd_abs > t_high, wd_sign, tl.where(wd_abs > t_low, wd_sign * 0.5, 0.0))
 
-            # Scalar W_D loads documented: ALU-bound (abs/sign/where) dominates, block_ptr not beneficial
-            acc += tl.dot(act.to(W_D.dtype.element_ty), wd_eff.to(W_D.dtype.element_ty), out_dtype=tl.float32)
+            # Transpose [BLOCK_K, BLOCK_N] -> [BLOCK_N, BLOCK_K] in registers for dot
+            acc += tl.dot(act.to(W_D.dtype.element_ty), tl.trans(wd_eff.to(W_D.dtype.element_ty)), out_dtype=tl.float32)
 
         out = acc * alpha
         out_ptrs = OUT + offs_m[:, None] * stride_outm + offs_k[None, :] * stride_outk
@@ -682,13 +695,15 @@ if HAS_TRITON:
             triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=3),
             triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
         ],
-        key=['M', 'N'],
+        key=['M', 'N', 'K'],
     )
     @triton.jit
     def _pot5_bitpacked_gemm_fwd_kernel(
         X, W_nz, W_mag, W_sign, Y, Alpha,
         stride_xm, stride_xk,
-        stride_wn, stride_wkw,
+        stride_wnz_n, stride_wnz_kw,
+        stride_wmag_n, stride_wmag_kw,
+        stride_wsign_n, stride_wsign_kw,
         stride_ym, stride_yn,
         M, N, K,
         BLOCK_M: tl.constexpr,
@@ -708,6 +723,7 @@ if HAS_TRITON:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         lane = tl.arange(0, BLOCK_K)
+        lane_u = lane[None, :].to(tl.uint32)
 
         mask_m = offs_m < M
         mask_n = offs_n < N
@@ -724,16 +740,16 @@ if HAS_TRITON:
             x_ptrs = X + offs_m[:, None] * stride_xm + kk[None, :] * stride_xk
             x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
 
-            # Load 3 bitplane words for BLOCK_N rows: [BLOCK_N]
-            w_nz_word = tl.load(W_nz + offs_n * stride_wn + k_word * stride_wkw, mask=mask_n, other=0)
-            w_mag_word = tl.load(W_mag + offs_n * stride_wn + k_word * stride_wkw, mask=mask_n, other=0)
-            w_sign_word = tl.load(W_sign + offs_n * stride_wn + k_word * stride_wkw, mask=mask_n, other=0)
+            # Load 3 bitplane words for BLOCK_N rows with respective strides: [BLOCK_N]
+            w_nz_word = tl.load(W_nz + offs_n * stride_wnz_n + k_word * stride_wnz_kw, mask=mask_n, other=0)
+            w_mag_word = tl.load(W_mag + offs_n * stride_wmag_n + k_word * stride_wmag_kw, mask=mask_n, other=0)
+            w_sign_word = tl.load(W_sign + offs_n * stride_wsign_n + k_word * stride_wsign_kw, mask=mask_n, other=0)
 
             # In-register bit decompression across 32 lanes: [BLOCK_N, 32]
-            # Fix: use logical shift via uint32 (arithmetic >> would sign-extend bit31)
-            nz = ((w_nz_word[:, None].to(tl.uint32) >> lane[None, :].to(tl.uint32)) & 1).to(tl.float32)
-            mag = ((w_mag_word[:, None].to(tl.uint32) >> lane[None, :].to(tl.uint32)) & 1).to(tl.float32)
-            sign = ((w_sign_word[:, None].to(tl.uint32) >> lane[None, :].to(tl.uint32)) & 1).to(tl.float32)
+            # Logical shift via uint32 (arithmetic >> would sign-extend bit31)
+            nz = ((w_nz_word[:, None].to(tl.uint32) >> lane_u) & 1).to(tl.float32)
+            mag = ((w_mag_word[:, None].to(tl.uint32) >> lane_u) & 1).to(tl.float32)
+            sign = ((w_sign_word[:, None].to(tl.uint32) >> lane_u) & 1).to(tl.float32)
 
             # Synthesize 5-state weights {-1.0, -0.5, 0.0, +0.5, +1.0}
             w_eff = nz * (0.5 + 0.5 * mag) * (1.0 - 2.0 * sign)
@@ -805,6 +821,8 @@ def triton_pot5_bitpacked_linear(
             x_2d, w_nz_bits, w_mag_bits, w_sign_bits, y, alpha,
             x_2d.stride(0), x_2d.stride(1),
             w_nz_bits.stride(0), w_nz_bits.stride(1),
+            w_mag_bits.stride(0), w_mag_bits.stride(1),
+            w_sign_bits.stride(0), w_sign_bits.stride(1),
             y.stride(0), y.stride(1),
             M, N, K_padded,
             BLOCK_K=_prune_turing_block(32),

@@ -22,18 +22,34 @@ except Exception:
 
 def _rope_tables(T: int, D: int, device: torch.device, dtype: torch.dtype,
                  base: float = 10000.0):
-    inv = 1.0 / (base ** (torch.arange(0, D, 2, device=device).float() / D))
+    d_rot = D - (D % 2)
+    if d_rot <= 0:
+        return torch.ones((T, 0), device=device, dtype=dtype), torch.zeros((T, 0), device=device, dtype=dtype)
+    inv = 1.0 / (base ** (torch.arange(0, d_rot, 2, device=device).float() / d_rot))
     t = torch.arange(T, device=device).float()
     freqs = torch.outer(t, inv)
     return torch.cos(freqs).to(dtype), torch.sin(freqs).to(dtype)
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
+    D = x.shape[-1]
+    d_rot = cos.shape[-1] * 2
+    if d_rot == 0:
+        return x
+    if d_rot == D:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x1 * sin + x2 * cos
+        return torch.stack([o1, o2], dim=-1).flatten(-2)
+    x_rot = x[..., :d_rot]
+    x_pass = x[..., d_rot:]
+    x1 = x_rot[..., ::2]
+    x2 = x_rot[..., 1::2]
     o1 = x1 * cos - x2 * sin
     o2 = x1 * sin + x2 * cos
-    return torch.stack([o1, o2], dim=-1).flatten(-2)
+    o_rot = torch.stack([o1, o2], dim=-1).flatten(-2)
+    return torch.cat([o_rot, x_pass], dim=-1)
 
 
 class SlidingWindowAttentionMixer(nn.Module):

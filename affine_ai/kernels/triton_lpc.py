@@ -207,8 +207,15 @@ def _triton_lpc_bwd_dh_kernel(
             for d_k in range(0, D, BLOCK_D):
                 offs_dk = d_k + tl.arange(0, BLOCK_D)
                 mask_dk = offs_dk < D
-                h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
-                w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+                if stride_hd == 1 and stride_wd == 1:
+                    H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(pid_m * BLOCK_M, d_k), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
+                    h_k = tl.load(H_block, boundary_check=(0, 1))
+                    W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_k), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+                    w_k = tl.load(W_block, boundary_check=(0, 1))
+                else:
+                    h_k = tl.load(H_ptr + offs_m[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_m[:, None] & mask_dk[None, :], other=0.0)
+                    w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+
                 if IS_TURING:
                     logits += tl.dot(h_k.to(tl.float16), tl.trans(w_k).to(tl.float16), allow_tf32=False)
                 else:
@@ -220,15 +227,24 @@ def _triton_lpc_bwd_dh_kernel(
             dlogits = tl.where(valid_mask[:, None] & mask_v[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
             scaled_fp32 = dlogits * grad_scale
 
-            w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+            if stride_wd == 1:
+                W_d_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(v_start, d_start), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+                w_d = tl.load(W_d_block, boundary_check=(0, 1))
+            else:
+                w_d = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_d[None, :] * stride_wd, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+
             if IS_TURING:
                 dh_contrib = tl.dot(scaled_fp32.to(tl.float16), w_d.to(tl.float16), allow_tf32=False)
             else:
                 dh_contrib = tl.dot(scaled_fp32, w_d.to(tl.float32), allow_tf32=False)
             dh_acc += dh_contrib
 
-        dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
-        tl.store(dh_ptrs, dh_acc, mask=mask_m[:, None] & mask_d[None, :])
+        if stride_dhd == 1 and stride_dhb == D:
+            dh_block = tl.make_block_ptr(base=DH_ptr, shape=(N, D), strides=(stride_dhb, stride_dhd), offsets=(pid_m * BLOCK_M, d_start), block_shape=(BLOCK_M, BLOCK_D), order=(1, 0))
+            tl.store(dh_block, dh_acc.to(DH_ptr.dtype.element_ty), boundary_check=(0, 1))
+        else:
+            dh_ptrs = DH_ptr + offs_m[:, None] * stride_dhb + offs_d[None, :] * stride_dhd
+            tl.store(dh_ptrs, dh_acc.to(DH_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 @triton.autotune(
@@ -281,8 +297,15 @@ def _triton_lpc_bwd_dw_kernel(
             for d_k in range(0, D, BLOCK_D):
                 offs_dk = d_k + tl.arange(0, BLOCK_D)
                 mask_dk = offs_dk < D
-                w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
-                h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
+                if stride_wd == 1 and stride_hd == 1:
+                    W_block = tl.make_block_ptr(base=W_ptr, shape=(V, D), strides=(stride_wv, stride_wd), offsets=(pid_v * BLOCK_V, d_k), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+                    w_k = tl.load(W_block, boundary_check=(0, 1))
+                    H_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(n_start, d_k), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+                    h_k = tl.load(H_block, boundary_check=(0, 1))
+                else:
+                    w_k = tl.load(W_ptr + offs_v[:, None] * stride_wv + offs_dk[None, :] * stride_wd, mask=mask_v[:, None] & mask_dk[None, :], other=0.0)
+                    h_k = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_dk[None, :] * stride_hd, mask=mask_n[:, None] & mask_dk[None, :], other=0.0)
+
                 if IS_TURING:
                     logits += tl.dot(w_k.to(tl.float16), tl.trans(h_k).to(tl.float16), allow_tf32=False)
                 else:
@@ -294,15 +317,24 @@ def _triton_lpc_bwd_dw_kernel(
             dlogits = tl.where(mask_v[:, None] & valid_mask[None, :], p - tl.where(is_target, 1.0, 0.0), 0.0)
             scaled_fp32 = dlogits * grad_scale
 
-            h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            if stride_hd == 1:
+                H_d_block = tl.make_block_ptr(base=H_ptr, shape=(N, D), strides=(stride_hb, stride_hd), offsets=(n_start, d_start), block_shape=(BLOCK_N, BLOCK_D), order=(1, 0))
+                h_d = tl.load(H_d_block, boundary_check=(0, 1))
+            else:
+                h_d = tl.load(H_ptr + offs_n[:, None] * stride_hb + offs_d[None, :] * stride_hd, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+
             if IS_TURING:
                 dw_contrib = tl.dot(scaled_fp32.to(tl.float16), h_d.to(tl.float16), allow_tf32=False)
             else:
                 dw_contrib = tl.dot(scaled_fp32, h_d.to(tl.float32), allow_tf32=False)
             dw_tile += dw_contrib
 
-        dw_ptrs = DW_ptr + pid_split * stride_split + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
-        tl.store(dw_ptrs, dw_tile, mask=mask_v[:, None] & mask_d[None, :])
+        if stride_dwd == 1 and stride_dwv == D:
+            dw_block = tl.make_block_ptr(base=DW_ptr + pid_split * stride_split, shape=(V, D), strides=(stride_dwv, stride_dwd), offsets=(pid_v * BLOCK_V, d_start), block_shape=(BLOCK_V, BLOCK_D), order=(1, 0))
+            tl.store(dw_block, dw_tile.to(DW_ptr.dtype.element_ty), boundary_check=(0, 1))
+        else:
+            dw_ptrs = DW_ptr + pid_split * stride_split + offs_v[:, None] * stride_dwv + offs_d[None, :] * stride_dwd
+            tl.store(dw_ptrs, dw_tile.to(DW_ptr.dtype.element_ty), mask=mask_v[:, None] & mask_d[None, :])
 
 
 class _TritonFusedLPCHeadFunc(torch.autograd.Function):
@@ -406,7 +438,7 @@ class _TritonFusedLPCHeadFunc(torch.autograd.Function):
             calc_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
             split_n = min(16, triton.cdiv(N, 256)) if N >= 256 else 1
             if split_n > 1:
-                dw_split = torch.empty((split_n, V, D), dtype=calc_dtype, device=weight.device)
+                dw_split = torch.zeros((split_n, V, D), dtype=calc_dtype, device=weight.device)
                 dw_target = dw_split
                 stride_split = dw_split.stride(0)
             else:

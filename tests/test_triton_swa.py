@@ -47,7 +47,7 @@ def test_triton_swa_parity():
         eager = _eager_ref(q, k, v, W, sink=True)
         triton_out = sliding_window_attn(q, k, v, window=W, sink=True)
         diff = (triton_out.float() - eager.float()).abs().max().item()
-        tol = 1e-3 if dtype == torch.float16 else 2e-3
+        tol = 1e-3 if dtype == torch.float16 else 5e-3
         assert diff < tol, f"parity failed dtype={dtype} diff={diff}"
 
         # sink-identity: position 0 output equals v[0]

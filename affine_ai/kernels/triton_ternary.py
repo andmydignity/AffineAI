@@ -79,7 +79,21 @@ def _turing_prune_gemm_configs(configs):
         else:
             warnings.warn(f"Turing sm_75: pruning BLOCK config {c.kwargs} > Turing limit", stacklevel=2)
     return pruned if pruned else configs
-_ternary_gemm_configs=_turing_prune_gemm_configs(_ternary_gemm_configs)
+@triton.jit
+def _nearbyint(x):
+    """Cross-platform nearbyint (rounds to nearest even integer on CUDA, ROCm/HIP, and fallback)."""
+    if hasattr(tl.extra, "cuda"):
+        return tl.extra.cuda.libdevice.nearbyint(x)
+    elif hasattr(tl.extra, "hip"):
+        return tl.extra.hip.libdevice.nearbyint(x)
+    else:
+        f = tl.math.floor(x)
+        diff = x - f
+        is_half = diff == 0.5
+        is_odd = (f % 2.0) != 0.0
+        up = (diff > 0.5) | (is_half & is_odd)
+        return f + tl.where(up, 1.0, 0.0)
+
 
 @triton.jit
 def _row_amax_kernel(
@@ -136,7 +150,7 @@ def _ternary_fwd_kernel(
             mask=mask_m[:, None] & mask_k[None, :], other=0.0,
         )
         v = x * sc[:, None]
-        xq = tl.clamp(tl.extra.cuda.libdevice.nearbyint(v), -127.0, 127.0)
+        xq = tl.clamp(_nearbyint(v), -127.0, 127.0)
         w = tl.load(
             W + offs_n[:, None] * stride_wn + kk[None, :] * stride_wk,
             mask=mask_n[:, None] & mask_k[None, :], other=0.0,
@@ -219,7 +233,7 @@ def _quantize_x_kernel(
         mask=mask_m[:, None] & mask_k[None, :], other=0.0,
     )
     v = x * sc[:, None]
-    xq = tl.clamp(tl.extra.cuda.libdevice.nearbyint(v), -127.0, 127.0) / sc[:, None]
+    xq = tl.clamp(_nearbyint(v), -127.0, 127.0) / sc[:, None]
     tl.store(
         XQ + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk,
         xq, mask=mask_m[:, None] & mask_k[None, :],
@@ -340,7 +354,7 @@ def _ternary_twin_fwd_kernel(
             mask=mask_m[:, None] & mask_k[None, :], other=0.0,
         )
         v = x * sc[:, None]
-        xq = tl.clamp(tl.extra.cuda.libdevice.nearbyint(v), -127.0, 127.0)
+        xq = tl.clamp(_nearbyint(v), -127.0, 127.0)
         if is_w1:
             w = tl.load(W1 + offs_n_mod[:, None] * stride_wm + kk[None, :] * stride_wk, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
         elif is_w2:
@@ -624,11 +638,14 @@ def triton_ternary_linear_gw(go, x, amax, N, K, x_q=None):
         else:
             raise ValueError("Either x_q or both (x, amax) must be provided to triton_ternary_linear_gw.")
     gw = torch.empty((N, K), device=go.device, dtype=torch.float32)
-    _ternary_gw_kernel_fast[_grid(N, K, 32, 64)](
+    bm = _prune_turing_block(64)
+    bn = _prune_turing_block(32)
+    bk = _prune_turing_block_k(64)
+    _ternary_gw_kernel_fast[_grid(N, K, bn, bk)](
         go, x_q, gw,
         go.stride(0), go.stride(1), x_q.stride(0), x_q.stride(1),
         gw.stride(0), gw.stride(1),
-        M, N, K, BLOCK_M=_prune_turing_block(64), BLOCK_N=_prune_turing_block(32), BLOCK_K=_prune_turing_block_k(64),
+        M, N, K, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
         num_warps=4, num_stages=2)
     return gw
 
@@ -686,28 +703,23 @@ def _pack_2bit_kernel(
     stride_wm, stride_wk,
     stride_pm, stride_pk,
     Rows, Cols,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_w = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_p = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = offs_m < Rows
-    mask_p = offs_p < (Cols // 16)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    # Manual pointer arithmetic: load W slice via explicit pointers (fixes w_tile[:, idx-vector] gather)
-    for i in range(16):
-        shift = (i // 4) * 8 + (3 - (i % 4)) * 2
-        cols = pid_n * BLOCK_N * 16 + tl.arange(0, BLOCK_N) * 16 + i
-        mask_col = cols < Cols
-        w_ptrs = W_ptr + offs_m[:, None] * stride_wm + cols[None, :] * stride_wk
-        w = tl.load(w_ptrs, mask=mask_m[:, None] & mask_col[None, :], other=0.0)
-        code = tl.where(w == 1.0, 1, tl.where(w == -1.0, 2, 0)).to(tl.int32)
-        acc = acc | (code << shift)
-    tl.store(
-        Packed_ptr + offs_m[:, None] * stride_pm + offs_p[None, :] * stride_pk,
-        acc, mask=mask_m[:, None] & mask_p[None, :],
-    )
+    offs_k = pid_w * BLOCK_W * 16 + tl.arange(0, BLOCK_W * 16)
+    mask = (offs_m[:, None] < Rows) & (offs_k[None, :] < Cols)
+    w = tl.load(W_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk, mask=mask, other=0.0)
+    code = tl.where(w == 1.0, 1, tl.where(w == -1.0, 2, 0)).to(tl.int32)
+    w_3d = tl.reshape(code, (BLOCK_M, BLOCK_W, 16))
+    lane = tl.arange(0, 16)
+    shift = (lane // 4) * 8 + (3 - (lane % 4)) * 2
+    shifted = w_3d << shift[None, None, :]
+    acc = tl.sum(shifted, axis=2)
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_out = (offs_m[:, None] < Rows) & (offs_w[None, :] < (Cols // 16))
+    tl.store(Packed_ptr + offs_m[:, None] * stride_pm + offs_w[None, :] * stride_pk, acc, mask=mask_out)
 
 
 def triton_pack_ternary_2bit(w_ternary: torch.Tensor) -> torch.Tensor:
@@ -724,14 +736,14 @@ def triton_pack_ternary_2bit(w_ternary: torch.Tensor) -> torch.Tensor:
     try:
         packed = torch.empty((Rows, Cols // 16), dtype=torch.int32, device=w_ternary.device)
         BLOCK_M = 32
-        BLOCK_N = 32
-        grid = ((Rows + BLOCK_M - 1) // BLOCK_M, (Cols // 16 + BLOCK_N - 1) // BLOCK_N)
+        BLOCK_W = 16
+        grid = ((Rows + BLOCK_M - 1) // BLOCK_M, ((Cols // 16) + BLOCK_W - 1) // BLOCK_W)
         _pack_2bit_kernel[grid](
             w_ternary, packed,
             w_ternary.stride(0), w_ternary.stride(1),
             packed.stride(0), packed.stride(1),
             Rows, Cols,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            BLOCK_M=BLOCK_M, BLOCK_W=BLOCK_W,
             num_warps=4,
         )
         return packed

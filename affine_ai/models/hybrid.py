@@ -44,6 +44,23 @@ def _is_turing() -> bool:
     return False
 
 
+def _is_sm89_or_higher() -> bool:
+    try:
+        from affine_ai.kernels.triton_quant_swa import is_sm89_or_higher
+        return is_sm89_or_higher()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            return tuple(cap) >= (8, 9)
+    except Exception:
+        pass
+    return False
+
+_is_sm90_or_higher = _is_sm89_or_higher
+
+
 def get_turing_dtype(dtype=None):
     """Returns torch.float16 on Turing / pre-Ampere (cap < 8.0), else passed dtype."""
     try:
@@ -74,7 +91,7 @@ class TorosHybridConfig:
     csa_every_n: int = 4
     csa_group_size: int = 4
     csa_window: int = 256
-    csa_kv_quant: str = "int4"
+    csa_kv_quant: str = "auto"
     use_tree_sga: bool = True
     gen_loss_weight: float = 1.0
     use_conv_prefix: bool = True
@@ -106,6 +123,7 @@ class TorosHybridConfig:
     max_seq_len: int = 2048
     decoder_channel_mixer: str = "swiglu"
     lpc_chunk_size: int = 4
+    use_fp8: Optional[bool] = None
     dtype: Any = torch.bfloat16
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
@@ -127,6 +145,15 @@ class TorosHybridConfig:
 
         if getattr(self, "d_byte", None) is None:
             self.d_byte = self.dim // 2
+
+        # Auto-enable FP8 by default on SM89+ (Ada, Hopper & Blackwell)
+        if self.use_fp8 is None:
+            self.use_fp8 = _is_sm89_or_higher()
+
+        if self.csa_kv_quant == "auto":
+            self.csa_kv_quant = "fp8" if self.use_fp8 else "int4"
+        elif self.use_fp8 and "csa_kv_quant" not in kwargs:
+            self.csa_kv_quant = "fp8"
 
 
 # Keep a module-level alias for old imports: TorosHybridConfig fields are superset-compat.
@@ -267,6 +294,28 @@ class TorosHybridLanguageModel(nn.Module):
             conv_kernel_size=getattr(self.config, 'conv_kernel_size', 4),
             dtype=self.config.dtype
         )
+        if getattr(self.config, "use_fp8", None) is None:
+            self.config.use_fp8 = _is_sm89_or_higher()
+
+        if getattr(self.config, "csa_kv_quant", "auto") == "auto":
+            self.config.csa_kv_quant = "fp8" if self.config.use_fp8 else "int4"
+
+        if getattr(self.config, "use_fp8", False):
+            if torch.cuda.is_available():
+                try:
+                    _cap = tuple(torch.cuda.get_device_capability())
+                    if _cap < (8, 9):
+                        import warnings
+                        warnings.warn(
+                            f"Hardware capability {_cap} < (8, 9). Native FP8 Tensor Cores "
+                            "require Ada (sm_89), Hopper (sm_90), or Blackwell (sm_100+). Running in hybrid FP8 emulation mode.",
+                            stacklevel=2,
+                        )
+                except Exception:
+                    pass
+            if getattr(self.config, "csa_kv_quant", "auto") in ("auto", "int4"):
+                self.config.csa_kv_quant = "fp8"
+
         self.context_encoder = TorosEncoder(jepa_cfg)
 
         self.byte_decoder = ByteLocalDecoder(
@@ -275,7 +324,8 @@ class TorosHybridLanguageModel(nn.Module):
             d_model=self.config.dim,
             conv_kernel_size=getattr(self.config, 'conv_kernel_size', 8),
             channel_mixer_type=getattr(self.config, 'decoder_channel_mixer', 'swiglu'),
-            dtype=self.config.dtype
+            dtype=self.config.dtype,
+            use_fp8=getattr(self.config, 'use_fp8', False),
         )
         self.sos_patch = nn.Parameter(torch.zeros(1, 1, self.config.dim))
         nn.init.normal_(self.sos_patch, mean=0.0, std=0.02)

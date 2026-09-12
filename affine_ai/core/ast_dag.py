@@ -54,7 +54,7 @@ class ASDAGConfig:
     time_mixer_rule: str = "gla"  # "gla" (accumulative) or "delta" (error-corrective)
     use_conv_prefix: bool = True
     conv_kernel_size: int = 8
-    use_fp8: bool = False   # simulated FP8 off by default on Ampere
+    use_fp8: Optional[bool] = None   # None -> auto: enabled on sm90+
     expert_bias_rate: float = 0.02  # Subtree threshold & expert bias balancing rate
     balance_loss_weight: float = 0.0  # Deprecated: superseded by expert_bias_rate
     dtype: Any = torch.bfloat16
@@ -325,7 +325,7 @@ class ASTDAGNode(nn.Module):
         event_delta_threshold: float = 0.05,
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
-        use_fp8: bool = False   # simulated FP8 off by default on Ampere,
+        use_fp8: Optional[bool] = None,
     ):
         super().__init__()
         self.node_id = node_id
@@ -343,6 +343,12 @@ class ASTDAGNode(nn.Module):
         self.use_shift4_activations = use_shift4_activations
         self.use_power_of_two_gates = use_power_of_two_gates
         self.event_delta_threshold = event_delta_threshold
+        if use_fp8 is None:
+            try:
+                from affine_ai.kernels.triton_quant_swa import is_sm89_or_higher
+                use_fp8 = is_sm89_or_higher()
+            except Exception:
+                use_fp8 = False
         self.use_fp8 = use_fp8
 
         # Structured Sparsity Configuration
@@ -934,7 +940,7 @@ class ASTDAGLayer(nn.Module):
         balance_loss_weight: float = 0.0,
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
-        use_fp8: bool = False,   # simulated FP8 off by default on Ampere
+        use_fp8: Optional[bool] = None,
         expert_bias_rate: float = 0.02,  # Subtree threshold & expert bias balancing rate
     ):
         super().__init__()
@@ -957,6 +963,13 @@ class ASTDAGLayer(nn.Module):
                 leaf_mode = "low_rank"
             else:
                 leaf_mode = "full"
+
+        if use_fp8 is None:
+            try:
+                from affine_ai.kernels.triton_quant_swa import is_sm89_or_higher
+                use_fp8 = is_sm89_or_higher()
+            except Exception:
+                use_fp8 = False
 
         self.dim = dim
         self.out_features = out_features if out_features is not None else dim

@@ -123,15 +123,27 @@ class TernaryBitLinearSwiGLU(nn.Module):
         self,
         dim: int,
         expand: int = 2,
-        dtype: Any = torch.bfloat16
+        dtype: Any = torch.bfloat16,
+        use_fp8: Optional[bool] = None,
     ):
         super().__init__()
         self.dim = dim
+        if use_fp8 is None:
+            try:
+                from affine_ai.kernels.triton_quant_swa import is_sm89_or_higher
+                use_fp8 = is_sm89_or_higher()
+            except Exception:
+                use_fp8 = False
+        self.use_fp8 = use_fp8
         self.hidden_dim = expand * dim
         self.w_gate_val = BitLinear(dim, 2 * self.hidden_dim, bias=False, dtype=dtype)
         self.w_down = BitLinear(self.hidden_dim, dim, bias=False, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_fp8:
+            from affine_ai.core.ast_dag import quantize_fp8_hybrid
+            x = quantize_fp8_hybrid(x)
+
         if not x.is_cuda:
             from affine_ai.core.cpp_ops import asdag_cpu_bitlinear_swiglu
             return asdag_cpu_bitlinear_swiglu(x, self.w_gate_val.weight, self.w_down.weight)

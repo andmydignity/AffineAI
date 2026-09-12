@@ -288,6 +288,17 @@ class TritonBitLinearSwiGLUFunction(torch.autograd.Function):
         return g_x, g_w_gate_val, g_w_down, None, None
 
 
+def _is_hopper_or_higher(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        dev = device if device is not None else torch.cuda.current_device()
+        cap = torch.cuda.get_device_capability(dev)
+        return cap >= (8, 9)
+    except Exception:
+        return False
+
+
 def triton_bitlinear_swiglu(
     x: torch.Tensor,
     w_gate_val: torch.Tensor,
@@ -297,8 +308,16 @@ def triton_bitlinear_swiglu(
 ) -> torch.Tensor:
     """
     High-Performance Fused BitLinear SwiGLU on CUDA with Intra-Kernel SRAM Fusion.
+    Hopper sm_90+ & Blackwell: Native FP8 Tensor Cores.
     Turing sm_75: fp16 AMP, acc fp32.
     """
+    is_fp8 = hasattr(torch, "float8_e4m3fn") and (x.dtype == torch.float8_e4m3fn)
+    if is_fp8:
+        if not _is_hopper_or_higher(x.device):
+            # Promote FP8 to FP16 on pre-Hopper architectures to prevent Triton compiler type errors
+            x_f16 = x.to(torch.float16)
+            out = TritonBitLinearSwiGLUFunction.apply(x_f16, w_gate_val.to(torch.float16), w_down.to(torch.float16), gamma_gv, gamma_d)
+            return out.to(torch.float8_e4m3fn)
     if _is_turing():
         if x.dtype == torch.bfloat16:
             warnings.warn("Turing sm_75: bf16 -> fp16 (bitlinear api, acc fp32)", stacklevel=2)

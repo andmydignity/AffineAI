@@ -27,6 +27,11 @@ from affine_ai.kernels.triton_quant_swa import (
     pack_int4_kv,
     unpack_int4_kv,
     quantized_sliding_window_attn,
+    pack_fp8_kv,
+    unpack_fp8_kv,
+    fp8_sliding_window_attn,
+    is_sm89_or_higher,
+    is_sm90_or_higher,
 )
 
 
@@ -39,6 +44,10 @@ class SharedKVEntry:
     k_scale: Optional[torch.Tensor] = None
     v_pack: Optional[torch.Tensor] = None
     v_scale: Optional[torch.Tensor] = None
+    k_fp8: Optional[torch.Tensor] = None
+    k_fp8_scale: Optional[torch.Tensor] = None
+    v_fp8: Optional[torch.Tensor] = None
+    v_fp8_scale: Optional[torch.Tensor] = None
     leaf_indices: Optional[torch.Tensor] = None
     step: int = 0
 
@@ -46,7 +55,7 @@ class SharedKVEntry:
 class CompressedSparseAttentionMixer(nn.Module):
     """
     Compressed Sparse Attention 2 (CSA2) time mixer with cross-layer reuse,
-    ASDAG tree-sparse global attention (Tree-SGA), and INT4 quantized caching.
+    ASDAG tree-sparse global attention (Tree-SGA), and INT4/FP8 quantized caching.
     """
     def __init__(
         self,
@@ -55,7 +64,7 @@ class CompressedSparseAttentionMixer(nn.Module):
         n_kv_heads: Optional[int] = None,
         window: int = 256,
         mode: str = "full",  # "full", "reindex", "reuse"
-        kv_quant: str = "int4",  # "none", "int4"
+        kv_quant: str = "auto",  # "auto", "none", "int4", "fp8"
         shared_source: Optional["CompressedSparseAttentionMixer"] = None,
         use_tree_sga: bool = True,
         global_topk: int = 64,
@@ -67,7 +76,9 @@ class CompressedSparseAttentionMixer(nn.Module):
         super().__init__()
         assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
         assert mode in ("full", "reindex", "reuse"), f"Unknown CSA mode: {mode}"
-        assert kv_quant in ("none", "int4"), f"Unsupported kv_quant: {kv_quant}"
+        if kv_quant == "auto":
+            kv_quant = "fp8" if is_sm89_or_higher() else "int4"
+        assert kv_quant in ("none", "int4", "fp8"), f"Unsupported kv_quant: {kv_quant}"
 
         self.d_model = d_model
         self.n_heads = n_heads
@@ -201,12 +212,15 @@ class CompressedSparseAttentionMixer(nn.Module):
                 k0 = torch.cat([kc, k], dim=2)
                 v0 = torch.cat([vc, v], dim=2)
 
-            # Quantize to INT4 if requested
+            # Quantize to INT4 or FP8 if requested
             k_pack, k_scale = None, None
             v_pack, v_scale = None, None
             if self.kv_quant == "int4":
                 k_pack, k_scale = pack_int4_kv(k0)
                 v_pack, v_scale = pack_int4_kv(v0)
+            elif self.kv_quant == "fp8":
+                k_pack, k_scale = pack_fp8_kv(k0)
+                v_pack, v_scale = pack_fp8_kv(v0)
 
             # Cache shared entry for downstream reindex/reuse layers
             self._shared_entry = SharedKVEntry(
@@ -269,6 +283,23 @@ class CompressedSparseAttentionMixer(nn.Module):
             else:
                 kp, ks, vp, vs = k_pack, k_scale, v_pack, v_scale
             y = quantized_sliding_window_attn(q, kp, ks, vp, vs, window=W, sink=self.sink, scale=scale)
+        # Fast path: FP8 Quantized SWA
+        elif (
+            self.kv_quant == "fp8"
+            and k_pack is not None
+            and v_pack is not None
+            and not self.use_tree_sga
+            and state is None
+            and reset_mask is None
+        ):
+            if rep > 1:
+                kp = k_pack.repeat_interleave(rep, dim=1)
+                ks = k_scale.repeat_interleave(rep, dim=1)
+                vp = v_pack.repeat_interleave(rep, dim=1)
+                vs = v_scale.repeat_interleave(rep, dim=1)
+            else:
+                kp, ks, vp, vs = k_pack, k_scale, v_pack, v_scale
+            y = fp8_sliding_window_attn(q, kp, ks, vp, vs, window=W, sink=self.sink, scale=scale)
 
         # Fast path: Float Triton SWA
         elif (

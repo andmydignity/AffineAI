@@ -114,6 +114,13 @@ quantized_sliding_window_attn = _optional_import("affine_ai.kernels.triton_quant
 pack_int4_kv = _optional_import("affine_ai.kernels.triton_quant_swa", "pack_int4_kv")
 unpack_int4_kv = _optional_import("affine_ai.kernels.triton_quant_swa", "unpack_int4_kv")
 
+# Quantized FP8 Sliding Window Attention & Capability Helpers
+pack_fp8_kv = _optional_import("affine_ai.kernels.triton_quant_swa", "pack_fp8_kv")
+unpack_fp8_kv = _optional_import("affine_ai.kernels.triton_quant_swa", "unpack_fp8_kv")
+fp8_sliding_window_attn = _optional_import("affine_ai.kernels.triton_quant_swa", "fp8_sliding_window_attn")
+is_sm89_or_higher = _optional_import("affine_ai.kernels.triton_quant_swa", "is_sm89_or_higher")
+is_sm90_or_higher = _optional_import("affine_ai.kernels.triton_quant_swa", "is_sm90_or_higher")
+
 if triton_adamw_step is None:
     try:
         import math

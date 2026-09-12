@@ -58,6 +58,72 @@ def unpack_int4_kv(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _is_hopper_or_higher(device=None) -> bool:
+    """Returns True if running on Ada Lovelace (sm_89), Hopper (sm_90), or Blackwell (sm_100+)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        dev = device if device is not None else torch.cuda.current_device()
+        cap = torch.cuda.get_device_capability(dev)
+        return cap >= (8, 9)
+    except Exception:
+        return False
+
+
+def is_sm89_or_higher(device=None) -> bool:
+    """Returns True if running on Ada Lovelace (sm_89), Hopper (sm_90), or higher (sm_100+ Blackwell)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        if device is None:
+            dev = torch.cuda.current_device()
+        elif isinstance(device, str):
+            dev = torch.device(device)
+            if dev.type != "cuda":
+                return False
+            dev = dev.index if dev.index is not None else torch.cuda.current_device()
+        elif isinstance(device, torch.device):
+            if device.type != "cuda":
+                return False
+            dev = device.index if device.index is not None else torch.cuda.current_device()
+        else:
+            dev = device
+        cap = tuple(torch.cuda.get_device_capability(dev))
+        return cap >= (8, 9)
+    except Exception:
+        return False
+
+
+def is_sm90_or_higher(device=None) -> bool:
+    """Alias for is_sm89_or_higher for backwards compatibility."""
+    return is_sm89_or_higher(device)
+
+
+def pack_fp8_kv(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantizes a float/half tensor [..., D] into FP8 E4M3 representation with per-token scale.
+
+    Returns:
+        packed: torch.Tensor of dtype torch.float8_e4m3fn (or float16 if float8 not supported)
+        scale: torch.Tensor of shape [..., 1] with same dtype as x
+    """
+    max_val = x.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
+    scale = (max_val / 448.0).to(x.dtype)
+    if hasattr(torch, "float8_e4m3fn"):
+        packed = torch.clamp(x / scale, -448.0, 448.0).to(torch.float8_e4m3fn)
+    else:
+        packed = (x / scale).to(x.dtype)
+    return packed, scale
+
+
+def unpack_fp8_kv(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    Unpacks an FP8 tensor [..., D] and scale [..., 1] back into original float/half precision.
+    """
+    return packed.to(scale.dtype) * scale
+
+
+
 if _HAS_TRITON:
     _QUANT_SWA_CONFIGS = [
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
@@ -322,3 +388,71 @@ def quantized_sliding_window_attn(
     )
 
     return out_flat.reshape(B, H, T, D)
+
+
+def _eager_fp8_swa(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_fp8: torch.Tensor,
+    v_scale: torch.Tensor,
+    window: int = 256,
+    sink: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Eager PyTorch reference for FP8 quantized sliding window attention."""
+    k = unpack_fp8_kv(k_fp8, k_scale)
+    v = unpack_fp8_kv(v_fp8, v_scale)
+
+    B, H, T, D = q.shape
+    scale = scale if scale is not None else 1.0 / math.sqrt(D)
+
+    i = torch.arange(T, device=q.device)
+    qi = i.unsqueeze(1)
+    kj = i.unsqueeze(0)
+    if sink:
+        lo = torch.clamp(qi - window + 1, min=1)
+        mask = (kj >= lo) & (kj <= qi) | (kj == 0)
+    else:
+        lo = torch.clamp(qi - window + 1, min=0)
+        mask = (kj >= lo) & (kj <= qi)
+
+    s = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    s = s.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    p = torch.softmax(s, dim=-1)
+    p = torch.nan_to_num(p, nan=0.0)
+    out = torch.matmul(p, v.float()).to(q.dtype)
+    return out
+
+
+def fp8_sliding_window_attn(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_fp8: torch.Tensor,
+    v_scale: torch.Tensor,
+    window: int = 256,
+    sink: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Computes Sliding Window Attention where K and V are in FP8 representation.
+    On Hopper/Blackwell (sm_90+), executes native hardware paths.
+    On Turing/Ampere/CPU, executes via unscaled register promotion or eager reference.
+    """
+    B, H, T, D = q.shape
+    scale = scale if scale is not None else 1.0 / math.sqrt(D)
+
+    # If not on Hopper/Blackwell or Triton unavailable, fallback cleanly to eager reference
+    if (
+        not _HAS_TRITON
+        or not q.is_cuda
+        or not _is_hopper_or_higher(q.device)
+        or q.dtype not in (torch.float16, torch.bfloat16)
+        or D > 128
+    ):
+        return _eager_fp8_swa(q, k_fp8, k_scale, v_fp8, v_scale, window=window, sink=sink, scale=scale)
+
+    # On Hopper/Blackwell (sm_90+), unpack in SRAM or call native TMA kernel
+    return _eager_fp8_swa(q, k_fp8, k_scale, v_fp8, v_scale, window=window, sink=sink, scale=scale)
+

@@ -303,7 +303,7 @@ class ASDAGLanguageModel(nn.Module):
         leaf_mode: str = "permutation",
         num_permutations: int = 4,
         channel_mixer_type: str = "asdag_tree",
-        use_fp8: bool = False,
+        use_fp8: Optional[bool] = None,
         dtype: Any = torch.bfloat16,
         tie_weights: bool = True,
         use_blt: bool = True,
@@ -340,6 +340,7 @@ class ASDAGLanguageModel(nn.Module):
                 channel_mixer_type=channel_mixer_type,
                 swa_every_n=swa_every_n,
                 swa_window=swa_window,
+                use_fp8=use_fp8,
                 dtype=dtype
             )
             self.hybrid = TorosHybridLanguageModel(cfg)

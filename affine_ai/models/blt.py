@@ -230,7 +230,8 @@ class ByteLocalDecoder(nn.Module):
         num_leaves: int = 8,
         top_k: int = 2,
         channel_mixer_type: str = "swiglu",
-        dtype: Any = torch.bfloat16
+        dtype: Any = torch.bfloat16,
+        use_fp8: Optional[bool] = None,
     ):
         super().__init__()
         dtype = _resolve_cuda_dtype(dtype)
@@ -242,6 +243,13 @@ class ByteLocalDecoder(nn.Module):
         self.num_leaves = num_leaves
         self.top_k = top_k
         self.channel_mixer_type = channel_mixer_type
+        if use_fp8 is None:
+            try:
+                from affine_ai.kernels.triton_quant_swa import is_sm89_or_higher
+                use_fp8 = is_sm89_or_higher()
+            except Exception:
+                use_fp8 = False
+        self.use_fp8 = use_fp8
         
         self.patch_to_byte = BitLinear(d_model, d_byte, bias=False, dtype=dtype)
         self.fusion = BitLinear(2 * d_byte, d_byte, bias=False, dtype=dtype)
@@ -263,7 +271,7 @@ class ByteLocalDecoder(nn.Module):
         # Stage 3: Channel Mixer (Ternary SwiGLU or ASDAG Sparse Tree Layer)
         if channel_mixer_type == "swiglu":
             from affine_ai.core.bitlinear import TernaryBitLinearSwiGLU
-            self.asdag = TernaryBitLinearSwiGLU(dim=d_byte, expand=2, dtype=dtype)
+            self.asdag = TernaryBitLinearSwiGLU(dim=d_byte, expand=2, dtype=dtype, use_fp8=use_fp8)
         else:
             asdag_cfg = ASDAGConfig(
                 dim=d_byte,

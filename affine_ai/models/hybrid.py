@@ -61,7 +61,7 @@ def get_turing_dtype(dtype=None):
 @dataclass
 class TorosHybridConfig:
     dim: int = 136
-    d_byte: int = 64
+    d_byte: Optional[int] = None
     n_encoder_layers: int = 4
     n_heads: int = 4
     target_patch_size: int = 16
@@ -70,9 +70,15 @@ class TorosHybridConfig:
     time_mixer_rule: str = "gla"
     swa_every_n: int = 6
     swa_window: int = 256
+    use_csa: bool = True
+    csa_every_n: int = 4
+    csa_group_size: int = 4
+    csa_window: int = 256
+    csa_kv_quant: str = "int4"
+    use_tree_sga: bool = True
     gen_loss_weight: float = 1.0
     use_conv_prefix: bool = True
-    conv_kernel_size: int = 4
+    conv_kernel_size: int = 8
     use_dense_readout: bool = True
     # Stripped JEPA/System-2 fields kept for checkpoint compat (ignored):
     # n_predictor_layers, jepa_loss_weight, sigreg_*, mask_* are deprecated.
@@ -98,6 +104,8 @@ class TorosHybridConfig:
     mtp_lambda: float = 0.3
     context_window: int = 2048
     max_seq_len: int = 2048
+    decoder_channel_mixer: str = "swiglu"
+    lpc_chunk_size: int = 4
     dtype: Any = torch.bfloat16
 
     # Back-compat: ignore unknown kwargs from old checkpoints (e.g. n_predictor_layers)
@@ -116,6 +124,9 @@ class TorosHybridConfig:
                 setattr(self, f.name, f.default_factory())  # type: ignore
             else:
                 raise TypeError(f"Missing required field: {f.name}")
+
+        if getattr(self, "d_byte", None) is None:
+            self.d_byte = self.dim // 2
 
 
 # Keep a module-level alias for old imports: TorosHybridConfig fields are superset-compat.
@@ -241,6 +252,8 @@ class TorosHybridLanguageModel(nn.Module):
             vocab_size=256,
             d_byte=self.config.d_byte,
             d_model=self.config.dim,
+            conv_kernel_size=getattr(self.config, 'conv_kernel_size', 8),
+            channel_mixer_type=getattr(self.config, 'decoder_channel_mixer', 'swiglu'),
             dtype=self.config.dtype
         )
         self.sos_patch = nn.Parameter(torch.zeros(1, 1, self.config.dim))
@@ -289,7 +302,17 @@ class TorosHybridLanguageModel(nn.Module):
             )
         if self.config.dtype is not None and self.config.dtype != torch.float32:
             self.to(self.config.dtype)
-        if getattr(self.config, "swa_every_n", 0):
+        if getattr(self.config, "use_csa", True):
+            from affine_ai.core.csa import interleave_csa
+            interleave_csa(
+                self,
+                every_n=int(getattr(self.config, "csa_every_n", 4)),
+                group_size=int(getattr(self.config, "csa_group_size", 4)),
+                window=int(getattr(self.config, "csa_window", getattr(self.config, "swa_window", 256))),
+                kv_quant=getattr(self.config, "csa_kv_quant", "int4"),
+                use_tree_sga=getattr(self.config, "use_tree_sga", True),
+            )
+        elif getattr(self.config, "swa_every_n", 0):
             from affine_ai.core.swa import interleave_swa
             interleave_swa(self, every_n=int(self.config.swa_every_n),
                            window=int(getattr(self.config, "swa_window", 256)))
@@ -400,13 +423,17 @@ class TorosHybridLanguageModel(nn.Module):
         return optimizers
 
     def enable_lpc(self, dtype: Any = None, device: Optional[str] = None):
-        if getattr(self, 'local_heads', None) is not None and len(self.local_heads) == len(self.context_encoder.blocks):
+        import math
+        chunk_size = max(1, int(getattr(self.config, 'lpc_chunk_size', 4)))
+        n_blocks = len(self.context_encoder.blocks)
+        n_chunks = math.ceil(n_blocks / chunk_size)
+        if getattr(self, 'local_heads', None) is not None and len(self.local_heads) == n_chunks:
             return self.local_heads
         from affine_ai.core.lpc import LocalPredictiveHead
         d = dtype if dtype is not None else self.config.dtype
         self.local_heads = nn.ModuleList([
             LocalPredictiveHead(self.config.dim, 256, dtype=d)
-            for _ in range(len(self.context_encoder.blocks))
+            for _ in range(n_chunks)
         ])
         if d is not None and d != torch.float32:
             self.local_heads.to(d)
@@ -432,8 +459,12 @@ class TorosHybridLanguageModel(nn.Module):
         muon_momentum: float = 0.95,
         capturable: Optional[bool] = None,
     ) -> List[Any]:
+        import math
         self.enable_lpc()
         assert self.local_heads is not None
+        chunk_size = max(1, int(getattr(self.config, 'lpc_chunk_size', 4)))
+        n_blocks = len(self.context_encoder.blocks)
+        n_chunks = math.ceil(n_blocks / chunk_size)
         if capturable is None:
             try:
                 capturable = next(self.parameters()).is_cuda
@@ -442,8 +473,10 @@ class TorosHybridLanguageModel(nn.Module):
         optimizers: List[Any] = []
         if use_muon:
             from affine_ai.optim.muon import HybridMuonAdamW
-            for i, block in enumerate(self.context_encoder.blocks):
-                mods = [block, self.local_heads[i]]
+            for c in range(n_chunks):
+                start = c * chunk_size
+                end = min(start + chunk_size, n_blocks)
+                mods = list(self.context_encoder.blocks[start:end]) + [self.local_heads[c]]
                 optimizers.append(HybridMuonAdamW(
                     nn.ModuleList(mods),
                     muon_lr=muon_lr,
@@ -477,8 +510,13 @@ class TorosHybridLanguageModel(nn.Module):
         adamw_kwargs: Dict[str, Any] = {"lr": lr, "weight_decay": weight_decay}
         if capturable:
             adamw_kwargs["capturable"] = True
-        for i, block in enumerate(self.context_encoder.blocks):
-            params = list(block.parameters()) + list(self.local_heads[i].parameters())
+        for c in range(n_chunks):
+            start = c * chunk_size
+            end = min(start + chunk_size, n_blocks)
+            params = []
+            for blk in self.context_encoder.blocks[start:end]:
+                params.extend(list(blk.parameters()))
+            params.extend(list(self.local_heads[c].parameters()))
             optimizers.append(torch.optim.AdamW(params, **adamw_kwargs))
         enc_params = list(self.context_encoder.byte_encoder.parameters()) + list(self.context_encoder.patcher.parameters())
         optimizers.append(torch.optim.AdamW(enc_params, **adamw_kwargs))
@@ -586,19 +624,28 @@ class TorosHybridLanguageModel(nn.Module):
         curr_h = latent_patches
         layer_losses: List[Any] = []
         n_blocks = len(self.context_encoder.blocks)
-        has_enc_tail = len(optimizers) == n_blocks + 2
+        chunk_size = max(1, int(getattr(self.config, 'lpc_chunk_size', 4)))
+        n_chunks = len(self.local_heads)
+        has_enc_tail = len(optimizers) == n_chunks + 2
         if has_enc_tail:
-            optimizers[n_blocks].zero_grad(set_to_none=is_cuda)
-        for idx, block in enumerate(self.context_encoder.blocks):
-            if idx == 0:
-                next_h = block(curr_h, reset_mask=patch_reset_mask)
+            optimizers[n_chunks].zero_grad(set_to_none=is_cuda)
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, n_blocks)
+            chunk_blocks = self.context_encoder.blocks[start:end]
+
+            if chunk_idx == 0:
+                h_blk = curr_h
             else:
                 curr_h = curr_h.detach()
-                curr_h_in = curr_h.requires_grad_(True)
-                next_h = block(curr_h_in, reset_mask=patch_reset_mask)
-            h_sub = next_h[:, ::stride] if stride > 1 else next_h
-            _, loss_i = self.local_heads[idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
-            opt_i = optimizers[idx]
+                h_blk = curr_h.requires_grad_(True)
+
+            for block in chunk_blocks:
+                h_blk = block(h_blk, reset_mask=patch_reset_mask)
+
+            h_sub = h_blk[:, ::stride] if stride > 1 else h_blk
+            _, loss_i = self.local_heads[chunk_idx](h_sub, targets=sub_targets, ignore_index=ignore_index)
+            opt_i = optimizers[chunk_idx]
             loss_opt = loss_i
 
             opt_i.zero_grad(set_to_none=is_cuda)
@@ -619,13 +666,13 @@ class TorosHybridLanguageModel(nn.Module):
                 opt_i.zero_grad(set_to_none=is_cuda)
 
             layer_losses.append(loss_i.item() if sync_loss else loss_i.detach())
-            curr_h = next_h.detach() if idx == 0 else next_h
+            curr_h = h_blk.detach() if chunk_idx == 0 else h_blk
 
         if is_cuda and use_async_pipelining and opt_stream is not None:
             torch.cuda.current_stream().wait_stream(opt_stream)
 
         if has_enc_tail:
-            opt_enc = optimizers[n_blocks]
+            opt_enc = optimizers[n_chunks]
             if grad_clip > 0:
                 enc_params = [p for pg in opt_enc.param_groups for p in pg['params'] if p.grad is not None]
                 if enc_params:
@@ -657,7 +704,7 @@ class TorosHybridLanguageModel(nn.Module):
                 loss_final = F.cross_entropy(logits.view(-1, 256), targets.view(-1), ignore_index=ignore_index)
             if mtp_loss is not None:
                 loss_final = loss_final + mtp_loss
-        elif use_fused:
+        elif use_fused and hasattr(self.byte_decoder, 'gate_proj'):
             try:
                 from affine_ai.core.cpp_ops import asdag_cpu_blt_2layer_decoder_loss
                 loss_final = asdag_cpu_blt_2layer_decoder_loss(
@@ -949,6 +996,7 @@ class TorosHybridLanguageModel(nn.Module):
             and self.config.unlikelihood_weight <= 0.0
             and not h_byte.is_cuda
             and torch.is_grad_enabled()
+            and hasattr(self.byte_decoder, 'gate_proj')
         )
         use_triton_fused_dec = (
             targets is not None
@@ -1066,6 +1114,7 @@ class TorosHybridLanguageModel(nn.Module):
                 "patch_h_byte": torch.zeros(B, 0, d_byte, device=byte_ids.device, dtype=ref_dtype),
                 "patch_boundary": torch.zeros(B, 0, 1, device=byte_ids.device, dtype=ref_dtype),
                 "conv_hist": torch.zeros(B, 0, d_byte, device=byte_ids.device, dtype=ref_dtype),
+                "dec_conv_hist": torch.zeros(B, 0, d_byte, device=byte_ids.device, dtype=ref_dtype),
                 "h_cache": None,
                 "n_patches": 0,
             }
@@ -1161,12 +1210,21 @@ class TorosHybridLanguageModel(nn.Module):
             else self.sos_patch.expand(B, 1, -1)
         )                                                                   # [B, M+1, dim]
         pa = j.clamp(max=grid.shape[1] - 1).unsqueeze(0).expand(B, T).contiguous()
+        dec_conv_hist = gen_state.get("dec_conv_hist", None)
         if return_hidden:
-            logits, h_decoded = self.byte_decoder(h_byte_new, grid, pa, return_hidden=True)
+            res = self.byte_decoder(
+                h_byte_new, grid, pa, return_hidden=True, conv_state=dec_conv_hist, return_conv_state=True
+            )
+            logits, h_decoded, next_dec_hist = res
+            gen_state["dec_conv_hist"] = next_dec_hist
             if return_state:
                 return logits, h_decoded, gen_state
             return logits, h_decoded, None
-        logits = self.byte_decoder(h_byte_new, grid, pa)
+        res = self.byte_decoder(
+            h_byte_new, grid, pa, conv_state=dec_conv_hist, return_conv_state=True
+        )
+        logits, next_dec_hist = res
+        gen_state["dec_conv_hist"] = next_dec_hist
         if return_state:
             return logits, gen_state
         return logits, None

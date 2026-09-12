@@ -53,9 +53,9 @@ class ASDAGConfig:
     mlp_hidden_dim: int = 84
     time_mixer_rule: str = "gla"  # "gla" (accumulative) or "delta" (error-corrective)
     use_conv_prefix: bool = True
-    conv_kernel_size: int = 4
+    conv_kernel_size: int = 8
     use_fp8: bool = False   # simulated FP8 off by default on Ampere
-    expert_bias_rate: float = 1e-3  # DeepSeek auxiliary-loss-free expert bias rate
+    expert_bias_rate: float = 0.02  # Subtree threshold & expert bias balancing rate
     balance_loss_weight: float = 0.0  # Deprecated: superseded by expert_bias_rate
     dtype: Any = torch.bfloat16
 
@@ -765,12 +765,28 @@ class HierarchicalSignRouter(nn.Module):
         self.hyperplanes = nn.Parameter(
             torch.randn(self.num_internal_nodes, dim) * (1.0 / math.sqrt(dim))
         )
-        self.biases = nn.Parameter(torch.zeros(self.num_internal_nodes))
+        self.biases = nn.Parameter(torch.zeros(self.num_internal_nodes), requires_grad=False)
+        self.register_buffer("running_mean", torch.zeros(dim), persistent=True)
+
+    def center_inputs(self, x_flat: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            with torch.no_grad():
+                bm = x_flat.detach().mean(dim=0)
+                if hasattr(self, "running_mean") and self.running_mean is not None:
+                    self.running_mean.lerp_(bm.to(self.running_mean.dtype), 0.02)
+            return x_flat - bm.unsqueeze(0).to(x_flat.dtype)
+        else:
+            if x_flat.shape[0] > 1:
+                return x_flat - x_flat.mean(dim=0, keepdim=True)
+            if hasattr(self, "running_mean") and self.running_mean is not None:
+                return x_flat - self.running_mean.unsqueeze(0).to(x_flat.dtype)
+            return x_flat
 
     def route_tokens(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x_flat.shape[0]
+        x_c = self.center_inputs(x_flat)
         W_route = ternarize(self.hyperplanes)
-        node_logits = F.linear(x_flat, W_route, self.biases)
+        node_logits = F.linear(x_c, W_route, self.biases)
 
         logit_root = node_logits[:, 0:1]
         p_right = torch.sigmoid(logit_root * 2.0)
@@ -796,18 +812,61 @@ class HierarchicalSignRouter(nn.Module):
             routing_probs = leaf_probs
         return routing_probs, node_logits
 
+    def update_subtree_balance_from_logits(self, node_logits: torch.Tensor, gamma: float = 0.01) -> None:
+        """
+        Updates internal tree decision node biases based on empirical left vs right subtree traffic.
+        delta_b_j = gamma * err_j
+        Maintains 50/50 branching across all depths without dead subtrees.
+        Biases are clamped to [-1.5, 1.5] to maintain linear sigmoid regime.
+        """
+        if gamma <= 0.0:
+            return
+        with torch.no_grad():
+            B = node_logits.shape[0]
+            z0 = node_logits[:, 0]
+            pr0 = torch.sigmoid(z0 * 2.0)
+            pl0 = 1.0 - pr0
+            err0 = (pl0 - pr0).mean()
+            self.biases.data[0].add_(gamma * err0).clamp_(-1.5, 1.5)
+
+            cur = torch.stack([pl0, pr0], dim=-1)
+            min_traffic = max(1.0, B * 0.01)
+            for depth in range(1, self.tree_depth):
+                start_node = (1 << depth) - 1
+                num_nodes = 1 << depth
+                level_logits = node_logits[:, start_node:start_node + num_nodes]
+                pr = torch.sigmoid(level_logits * 2.0)
+                pl = 1.0 - pr
+                diff = pl - pr
+
+                # Normalized conditional error: traffic-weighted difference divided by node traffic
+                num = (cur * diff).sum(dim=0)
+                den = cur.sum(dim=0) + 1e-5
+                cond_err = num / den
+
+                # Unconditional error across all tokens: prevents starved subtrees from freezing
+                uncond_err = diff.mean(dim=0)
+
+                # Smooth blend: conditional for healthy traffic, unconditional for starved branches
+                alpha = (den / min_traffic).clamp(0.0, 1.0)
+                err_d = alpha * cond_err + (1.0 - alpha) * uncond_err
+
+                self.biases.data[start_node:start_node + num_nodes].add_(gamma * err_d).clamp_(-1.5, 1.5)
+                cur = torch.stack([cur * pl, cur * pr], dim=-1).view(B, -1)
+
     def route_tokens_popc(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if not x_flat.is_cuda:
             return self.route_tokens(x_flat)
+        x_c = self.center_inputs(x_flat)
         try:
             from affine_ai.kernels.triton_popc import triton_pack_sign_bits, triton_popc_sign_similarity
             W_route = ternarize(self.hyperplanes)
             if (W_route == 0).any():
-                node_logits = F.linear(x_flat, W_route, self.biases)
+                node_logits = F.linear(x_c, W_route, self.biases)
             else:
                 active = W_route[W_route != 0]
                 alpha = active.abs().mean().item() if active.numel() else 1.0 / math.sqrt(self.dim)
-                x_bits = triton_pack_sign_bits(x_flat)
+                x_bits = triton_pack_sign_bits(x_c)
                 w_bits = triton_pack_sign_bits(self.hyperplanes)
                 sim = triton_popc_sign_similarity(x_bits, w_bits, scale=alpha)
                 node_logits = sim + self.biases.unsqueeze(0)
@@ -876,7 +935,7 @@ class ASTDAGLayer(nn.Module):
         leaf_mode: Optional[str] = None,
         num_permutations: int = 4,
         use_fp8: bool = False,   # simulated FP8 off by default on Ampere
-        expert_bias_rate: float = 1e-3,  # DeepSeek auxiliary-loss-free expert bias rate
+        expert_bias_rate: float = 0.02,  # Subtree threshold & expert bias balancing rate
     ):
         super().__init__()
         if isinstance(dim, ASDAGConfig):
@@ -891,7 +950,7 @@ class ASTDAGLayer(nn.Module):
             leaf_mode = cfg.leaf_mode
             num_permutations = cfg.num_permutations
             use_fp8 = cfg.use_fp8
-            expert_bias_rate = getattr(cfg, "expert_bias_rate", 1e-3)
+            expert_bias_rate = getattr(cfg, "expert_bias_rate", 0.02)
 
         if leaf_mode is None:
             if rank is not None:
@@ -1107,13 +1166,15 @@ class ASTDAGLayer(nn.Module):
         leaves = self.leaves
         self._sync_router()
 
+        node_logits = None
         _fused_route = (self.use_hierarchical_routing and x_flat.is_cuda
             and self.top_k is not None and self.top_k < self.router.num_leaves)
         if _fused_route:
             try:
                 from affine_ai.kernels.triton_router import triton_router_topk
+                x_c = self.router.center_inputs(x_flat)
                 top_indices, top_weights = triton_router_topk(
-                    x_flat, self.router.hyperplanes, self.router.biases,
+                    x_c, self.router.hyperplanes, self.router.biases,
                     self.router.tree_depth, self.top_k, self.router.num_leaves,
                     expert_bias=getattr(self, "expert_bias", None))
                 routing_probs = torch.zeros(
@@ -1122,7 +1183,7 @@ class ASTDAGLayer(nn.Module):
             except Exception:
                 _fused_route = False
         if self.use_hierarchical_routing and not _fused_route:
-            routing_probs, _ = self.router.route_tokens(x_flat)
+            routing_probs, node_logits = self.router.route_tokens(x_flat)
         elif not self.use_hierarchical_routing:
             r_w = quantize_fp8_hybrid(self.router_weights) if self.use_fp8 else self.router_weights
             logits = F.linear(x_flat, r_w, self.router_biases)
@@ -1153,21 +1214,25 @@ class ASTDAGLayer(nn.Module):
             routing_probs = quantize_fp8_hybrid(routing_probs).to(x_flat.dtype)
             top_weights = quantize_fp8_hybrid(top_weights).to(x_flat.dtype)
 
-        # DeepSeek Auxiliary-Loss-Free Expert Bias update:
-        # Online feedback controller adjusting leaf bias outside autograd (CUDA graph compatible)
+        # Dynamic Load Balancing Update (Subtree Node Threshold Balancing for Trees, Flat Bias for Linear)
         self._last_balance_loss = None
         _bias_rate = float(getattr(self, "expert_bias_rate", 0.0) or 0.0)
-        if (self.training and _bias_rate > 0.0 and hasattr(self, "expert_bias")
-                and self.expert_bias is not None and top_indices is not None):
+        if self.training and _bias_rate > 0.0:
             with torch.no_grad():
-                K = self.expert_bias.shape[0]
-                flat_idx = top_indices.reshape(-1)
-                counts = torch.zeros(K, device=self.expert_bias.device, dtype=torch.float32)
-                counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
-                avg_count = counts.mean()
-                # DeepSeek update: b_i += gamma * sign(avg_count - count_i)
-                self.expert_bias.add_(_bias_rate * torch.sign(avg_count - counts))
-                self.expert_bias.sub_(self.expert_bias.mean())
+                if self.use_hierarchical_routing and hasattr(self, "router") and self.router is not None:
+                    if node_logits is None:
+                        x_c = self.router.center_inputs(x_flat)
+                        W_route = ternarize(self.router.hyperplanes)
+                        node_logits = F.linear(x_c, W_route, self.router.biases)
+                    self.router.update_subtree_balance_from_logits(node_logits, gamma=_bias_rate)
+                elif hasattr(self, "expert_bias") and self.expert_bias is not None and top_indices is not None:
+                    K = self.expert_bias.shape[0]
+                    flat_idx = top_indices.reshape(-1)
+                    counts = torch.zeros(K, device=self.expert_bias.device, dtype=torch.float32)
+                    counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+                    avg_count = counts.mean()
+                    self.expert_bias.add_(_bias_rate * torch.sign(avg_count - counts))
+                    self.expert_bias.sub_(self.expert_bias.mean())
 
         first_leaf = leaves[0] if leaves else self.root
         r_in = quantize_shift4(root_out) if (use_shift4_act or first_leaf.use_shift4_activations) else root_out
@@ -1456,9 +1521,15 @@ class ASTDAGLayer(nn.Module):
             routing_probs = F.softmax(logits, dim=-1)
 
         if self.top_k is not None and self.top_k < routing_probs.shape[-1]:
-            top_vals, top_indices = torch.topk(routing_probs, k=self.top_k, dim=-1)
-            sparse_probs = torch.zeros_like(routing_probs).scatter_(-1, top_indices, top_vals)
-            routing_probs = sparse_probs / sparse_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            if hasattr(self, "expert_bias") and self.expert_bias is not None:
+                biased_scores = routing_probs + self.expert_bias.to(routing_probs.device).float().unsqueeze(0)
+            else:
+                biased_scores = routing_probs
+            top_vals_b, top_indices = torch.topk(biased_scores, k=self.top_k, dim=-1)
+            unbiased_selected = routing_probs.gather(-1, top_indices)
+            top_weights = unbiased_selected / unbiased_selected.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            sparse_probs = torch.zeros_like(routing_probs).scatter_(-1, top_indices, top_weights)
+            routing_probs = sparse_probs
 
         if self.use_fp8:
             routing_probs = quantize_fp8_hybrid(routing_probs).to(x_flat.dtype)

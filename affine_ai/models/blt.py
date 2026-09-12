@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from affine_ai.core.ast_dag import ASDAGConfig
+from affine_ai.core.ast_dag import ASDAGConfig, AdaptiveSparseTreeDAGLayer
 from affine_ai.core.bitlinear import BitLinear
 from affine_ai.core.norm import RMSNorm
 from affine_ai.models.language_model import ASDAGBlock
@@ -34,7 +34,7 @@ class ByteLocalEncoder(nn.Module):
         self,
         vocab_size: int = 256,
         d_byte: int = 64,
-        kernel_size: int = 4,
+        kernel_size: int = 8,
         dtype: Any = torch.bfloat16,
         use_bitlinear: bool = False
     ):
@@ -136,7 +136,7 @@ class EntropyPatcher(nn.Module):
     """
     def __init__(
         self,
-        d_byte: int = 64,
+        d_byte: Optional[int] = None,
         d_model: int = 96,
         max_patch_size: int = 32,
         min_patch_size: int = 2,
@@ -144,8 +144,9 @@ class EntropyPatcher(nn.Module):
         dtype: Any = torch.bfloat16
     ):
         super().__init__()
-        self.d_byte = d_byte
         self.d_model = d_model
+        self.d_byte = d_byte if d_byte is not None else (d_model // 2)
+        d_byte = self.d_byte
         self.max_patch_size = max_patch_size
         self.min_patch_size = min_patch_size
         self.target_patch_size = target_patch_size
@@ -212,29 +213,67 @@ class EntropyPatcher(nn.Module):
 
 class ByteLocalDecoder(nn.Module):
     """
-    2-Layer Residual Gated Local Byte Decoder:
+    ASDAG Gated Local Byte Decoder:
     Deep non-linear feature fusion for sub-byte spelling and syntax prediction.
+    Stages:
+      1. Latent patch to byte projection + concat([h_byte, patch_h]) fusion.
+      2. Causal Depthwise Conv1D (K=8) for local n-gram context.
+      3. ASDAG Sparse Tree Layer (K=8 leaves, Top-2 active dispatch).
+      4. Language model head projection to byte vocabulary.
     """
     def __init__(
         self,
         vocab_size: int = 256,
-        d_byte: int = 64,
+        d_byte: Optional[int] = None,
         d_model: int = 96,
+        conv_kernel_size: int = 8,
+        num_leaves: int = 8,
+        top_k: int = 2,
+        channel_mixer_type: str = "swiglu",
         dtype: Any = torch.bfloat16
     ):
         super().__init__()
+        dtype = _resolve_cuda_dtype(dtype)
         self.vocab_size = vocab_size
-        self.d_byte = d_byte
         self.d_model = d_model
+        self.d_byte = d_byte if d_byte is not None else (d_model // 2)
+        d_byte = self.d_byte
+        self.conv_kernel_size = conv_kernel_size
+        self.num_leaves = num_leaves
+        self.top_k = top_k
+        self.channel_mixer_type = channel_mixer_type
         
         self.patch_to_byte = BitLinear(d_model, d_byte, bias=False, dtype=dtype)
         self.fusion = BitLinear(2 * d_byte, d_byte, bias=False, dtype=dtype)
         self.norm1 = RMSNorm(d_byte)
         
-        # Layer 2: Residual Gated SwiGLU Block
-        self.gate_proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
-        self.val_proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
-        self.down_proj = BitLinear(d_byte, d_byte, bias=False, dtype=dtype)
+        # Stage 2: Causal Depthwise Conv1D (K=8)
+        self.conv = nn.Conv1d(
+            in_channels=d_byte,
+            out_channels=d_byte,
+            kernel_size=conv_kernel_size,
+            padding=0,
+            groups=d_byte,
+            bias=True,
+            dtype=dtype if dtype is not None and dtype != torch.bfloat16 else None
+        )
+        self.conv_norm = RMSNorm(d_byte)
+        self.conv_act = nn.SiLU()
+        
+        # Stage 3: Channel Mixer (Ternary SwiGLU or ASDAG Sparse Tree Layer)
+        if channel_mixer_type == "swiglu":
+            from affine_ai.core.bitlinear import TernaryBitLinearSwiGLU
+            self.asdag = TernaryBitLinearSwiGLU(dim=d_byte, expand=2, dtype=dtype)
+        else:
+            asdag_cfg = ASDAGConfig(
+                dim=d_byte,
+                num_leaves=num_leaves,
+                top_k=top_k,
+                conv_kernel_size=conv_kernel_size,
+                channel_mixer_type="asdag_tree",
+                dtype=dtype
+            )
+            self.asdag = AdaptiveSparseTreeDAGLayer(asdag_cfg)
         self.norm2 = RMSNorm(d_byte)
         
         self.lm_head = BitLinear(d_byte, vocab_size, bias=False, dtype=dtype)
@@ -247,22 +286,10 @@ class ByteLocalDecoder(nn.Module):
         latent_patches: torch.Tensor,
         patch_assignments: torch.Tensor,
         return_hidden: bool = False,
-        return_logits: bool = True
+        return_logits: bool = True,
+        conv_state: Optional[torch.Tensor] = None,
+        return_conv_state: bool = False
     ) -> Any:
-        if not h_byte.is_cuda and not self.training and not torch.is_grad_enabled() and not return_hidden:
-            from affine_ai.core.cpp_ops import asdag_cpu_blt_2layer_decoder
-            return asdag_cpu_blt_2layer_decoder(
-                h_byte,
-                latent_patches,
-                self.patch_to_byte.weight,
-                self.fusion.weight,
-                self.gate_proj.weight,
-                self.val_proj.weight,
-                self.down_proj.weight,
-                self.lm_head.weight,
-                patch_assignments
-            )
-
         B, T, _ = h_byte.shape
         M = latent_patches.shape[1]
         # Project patches at patch-rate (M) rather than byte-rate (T) -> 11.6x faster on GPU
@@ -273,25 +300,65 @@ class ByteLocalDecoder(nn.Module):
         # Stage 1: Fusion + SiLU
         fused = self.norm1(F.silu(self.fusion(torch.cat([h_byte.to(patch_h.dtype), patch_h], dim=-1))))
         
-        # Stage 2: Residual Gated SwiGLU (twin gate+val in one kernel)
-        if not h_byte.is_cuda:
-            from affine_ai.core.cpp_ops import asdag_cpu_bitlinear_twin
-            gate_out, val_out = asdag_cpu_bitlinear_twin(
-                fused, self.gate_proj.weight, None, self.val_proj.weight, None
-            ).chunk(2, dim=-1)
-            h2 = F.silu(gate_out) * val_out
-            fused2 = self.norm2(fused + self.down_proj(h2))
+        # Stage 2: Causal Depthwise Conv1D
+        K = self.conv_kernel_size
+        if conv_state is not None:
+            fused_rows = torch.cat([conv_state, fused], dim=1)
+            if T == 1 and K <= 8 and fused_rows.shape[1] <= 512:
+                L_rows = fused_rows.shape[1]
+                w = self.conv.weight.squeeze(1)  # [d_byte, K]
+                if L_rows >= K:
+                    window = fused_rows[:, L_rows - K :]
+                else:
+                    pad_len = K - L_rows
+                    window = torch.cat(
+                        [fused_rows.new_zeros((B, pad_len, self.d_byte), dtype=fused_rows.dtype), fused_rows],
+                        dim=1,
+                    )
+                conv_out_1 = torch.einsum("bkd,dk->bd", window.float(), w.float())
+                if self.conv.bias is not None:
+                    conv_out_1 = conv_out_1 + self.conv.bias.float()
+                conv_out = conv_out_1.to(fused.dtype).unsqueeze(1)
+            else:
+                c_in = fused_rows.transpose(1, 2)
+                c_out = F.conv1d(c_in, self.conv.weight, self.conv.bias, padding=K - 1, groups=self.d_byte).transpose(1, 2)
+                conv_out = c_out[:, conv_state.shape[1] : conv_state.shape[1] + T]
+            keep = min(K - 1, fused_rows.shape[1])
+            next_conv_state = fused_rows[:, -keep:].detach() if keep > 0 else conv_state
         else:
-            h2 = F.silu(self.gate_proj(fused)) * self.val_proj(fused)
-            from affine_ai.core.norm import fused_add_rms_norm
-            _, fused2 = fused_add_rms_norm(self.down_proj(h2), fused, self.norm2.scale, self.norm2.eps)
+            if fused.is_cuda:
+                try:
+                    from affine_ai.kernels.triton_causal_conv import triton_causal_conv1d
+                    conv_out = triton_causal_conv1d(fused, self.conv.weight, self.conv.bias)
+                except Exception:
+                    fused_trans = fused.transpose(1, 2)
+                    fused_pad = F.pad(fused_trans, (K - 1, 0))
+                    conv_out = self.conv(fused_pad).transpose(1, 2)
+            else:
+                fused_trans = fused.transpose(1, 2)
+                fused_pad = F.pad(fused_trans, (K - 1, 0))
+                conv_out = self.conv(fused_pad).transpose(1, 2)
+            keep = min(K - 1, fused.shape[1])
+            next_conv_state = fused[:, -keep:].detach() if keep > 0 else None
+
+        fused_conv = self.conv_norm(fused + self.conv_act(conv_out))
+        
+        # Stage 3: ASDAG Sparse Tree Layer
+        tree_out = self.asdag(fused_conv)
+        fused2 = self.norm2(fused_conv + tree_out)
         
         if return_hidden and not return_logits:
+            if return_conv_state:
+                return None, fused2, next_conv_state
             return None, fused2
 
         logits = self.lm_head(fused2.to(self.lm_head.weight.dtype))
         if return_hidden:
+            if return_conv_state:
+                return logits, fused2, next_conv_state
             return logits, fused2
+        if return_conv_state:
+            return logits, next_conv_state
         return logits
 
 
@@ -307,7 +374,7 @@ class ASDAGByteLatentModel(nn.Module):
     def __init__(
         self,
         vocab_size: int = 256,
-        d_byte: int = 64,
+        d_byte: Optional[int] = None,
         d_model: int = 96,
         n_layers: int = 3,
         n_heads: int = 4,
@@ -320,8 +387,9 @@ class ASDAGByteLatentModel(nn.Module):
     ):
         super().__init__()
         self.vocab_size = vocab_size
-        self.d_byte = d_byte
         self.d_model = d_model
+        self.d_byte = d_byte if d_byte is not None else (d_model // 2)
+        d_byte = self.d_byte
         self.n_layers = n_layers
         self.target_patch_size = target_patch_size
         self.use_mtp = use_mtp

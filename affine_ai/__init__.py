@@ -13,6 +13,7 @@ from affine_ai.core.ast_dag import ASTDAGLayer, ASDAGConfig, AdaptiveSparseTreeD
 from affine_ai.core.backpressure_tree import FusedSparseBackpressureTreeV3
 from affine_ai.core.associative import NativeASDAGAssociativeMixer, PermutationProjection
 from affine_ai.core.swa import SlidingWindowAttentionMixer, interleave_swa
+from affine_ai.core.csa import CompressedSparseAttentionMixer, interleave_csa, SharedKVEntry
 
 AdaptiveBackpressureTreeLayer = FusedSparseBackpressureTreeV3  # Deprecated alias
 
@@ -61,6 +62,9 @@ __all__ = [
     "PermutationProjection",
     "SlidingWindowAttentionMixer",
     "interleave_swa",
+    "CompressedSparseAttentionMixer",
+    "interleave_csa",
+    "SharedKVEntry",
     "ASDAGLanguageModel",
     "ASDAGBlock",
     "ASDAGByteLatentModel",

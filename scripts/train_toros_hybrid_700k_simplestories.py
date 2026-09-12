@@ -40,7 +40,7 @@ def main():
     train_bytes = raw_data[:split]
     val_bytes = raw_data[split:]
 
-    batch_size = 32
+    batch_size = 96
     seq_len = 512
     bytes_per_step = batch_size * seq_len
     max_steps = 1000
@@ -68,15 +68,18 @@ def main():
     cfg = TorosHybridConfig(
         dim=288,
         n_encoder_layers=7,
+        d_byte=144,  # 2:1 Encoder to Decoder ratio (288 // 2 = 144)
+        conv_kernel_size=8,
         channel_mixer_type="asdag_tree",
         dtype=torch.bfloat16,
     )
     model = TorosHybridLanguageModel(cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
 
-    print(f"Model Architecture  : TorosHybrid (dim={cfg.dim}, layers={cfg.n_encoder_layers})")
-    print(f"Total Parameters    : {total_params:,d} parameters (~705k)")
-    print(f"Channel Mixer       : {cfg.channel_mixer_type} (DeepSeek Expert Bias Load-Balancing)")
+    print(f"Model Architecture  : TorosHybrid (dim={cfg.dim}, layers={cfg.n_encoder_layers}, d_byte={cfg.d_byte} [2:1 Ratio])")
+    print(f"Decoder Mixer       : Causal Conv1D (K=8) + ASDAG Sparse Tree (K=8, Top-2)")
+    print(f"Total Parameters    : {total_params:,d} parameters (~853k)")
+    print(f"Channel Mixer       : {cfg.channel_mixer_type} (Subtree Threshold Load-Balancing)")
     print(f"Execution Engine    : CUDA Graphs = True | Muon Optimizer = True")
     print("-" * 95)
 
@@ -129,7 +132,7 @@ def main():
             bpc_val = loss_val / math.log(2)
 
             print(
-                f"Step {step:4d}/{max_steps} | "
+                f"Step {step:5d}/{max_steps} | "
                 f"Loss: {loss_val:.4f} | "
                 f"PPL: {ppl_val:>6.2f} | "
                 f"BPC: {bpc_val:.3f} | "
@@ -138,6 +141,9 @@ def main():
                 f"Elapsed: {total_elapsed:>5.1f}s",
                 flush=True
             )
+
+        if step % 1000 == 0:
+            torch.save(model.state_dict(), f"checkpoints/toros_hybrid_700k_step{step}.pt")
 
         if step % trainer.eval_interval == 0 or step == max_steps:
             eval_metrics = trainer.evaluate()

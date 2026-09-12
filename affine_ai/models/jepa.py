@@ -32,7 +32,7 @@ class TorosJEPAConfig:
         `TorosJEPAConfig` is deprecated. Use `TorosHybridConfig` or `ASDAGConfig` instead.
     """
     dim: int = 128
-    d_byte: int = 64
+    d_byte: Optional[int] = None
     n_encoder_layers: int = 4
     n_predictor_layers: int = 1
     n_heads: int = 4
@@ -41,12 +41,16 @@ class TorosJEPAConfig:
     mlp_hidden_dim: int = 84
     time_mixer_rule: str = "gla"
     use_conv_prefix: bool = True
-    conv_kernel_size: int = 4
+    conv_kernel_size: int = 8
     sim_loss_weight: float = 1.0
     sigreg_weight: float = 1.0
     sigreg_n_sketches: int = 4
     std_target: float = 1.0
     dtype: Any = torch.float32
+
+    def __post_init__(self):
+        if self.d_byte is None:
+            self.d_byte = self.dim // 2
 
 
 from affine_ai.models.blt import ByteLocalEncoder, EntropyPatcher

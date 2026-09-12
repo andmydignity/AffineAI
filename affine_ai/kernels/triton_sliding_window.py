@@ -88,7 +88,7 @@ def _swa_fwd_kernel(
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_bh = tl.program_id(1).to(tl.int64)
-    T_i64 = T.to(tl.int64)
+    T_i64 = T
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
@@ -208,7 +208,7 @@ def _swa_bwd_dq_kernel(
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_bh = tl.program_id(1).to(tl.int64)
-    T_i64 = T.to(tl.int64)
+    T_i64 = T
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
@@ -324,7 +324,8 @@ def _swa_bwd_dkv_kernel(
 ):
     pid_n = tl.program_id(0).to(tl.int64)
     pid_bh = tl.program_id(1).to(tl.int64)
-    T_i64 = T.to(tl.int64)
+    zero_i64 = tl.zeros([], dtype=tl.int64)
+    T_i64 = zero_i64 + T
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
@@ -341,7 +342,6 @@ def _swa_bwd_dkv_kernel(
     dv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
 
     n_start = pid_n * BLOCK_N
-    zero_i64 = tl.zeros([], dtype=tl.int64)
     if pid_n == 0 and SINK:
         q_start = zero_i64
         q_end = T_i64

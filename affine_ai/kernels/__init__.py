@@ -105,6 +105,15 @@ triton_fused_perm_proj = _optional_import("affine_ai.kernels.triton_perm_proj", 
 # Sliding Window Attention
 sliding_window_attn = _optional_import("affine_ai.kernels.triton_sliding_window", "sliding_window_attn")
 
+# Causal Depthwise Conv1D
+triton_causal_conv1d = _optional_import("affine_ai.kernels.triton_causal_conv", "triton_causal_conv1d")
+TritonCausalConv1dFunction = _optional_import("affine_ai.kernels.triton_causal_conv", "TritonCausalConv1dFunction")
+
+# Quantized INT4 Sliding Window Attention
+quantized_sliding_window_attn = _optional_import("affine_ai.kernels.triton_quant_swa", "quantized_sliding_window_attn")
+pack_int4_kv = _optional_import("affine_ai.kernels.triton_quant_swa", "pack_int4_kv")
+unpack_int4_kv = _optional_import("affine_ai.kernels.triton_quant_swa", "unpack_int4_kv")
+
 if triton_adamw_step is None:
     try:
         import math
@@ -240,6 +249,9 @@ __all__ = [
     "triton_adamw_step",
     "triton_fused_perm_proj",
     "sliding_window_attn",
+    "quantized_sliding_window_attn",
+    "pack_int4_kv",
+    "unpack_int4_kv",
     "TRITON_AVAILABLE",
 ]
 

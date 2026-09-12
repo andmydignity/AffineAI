@@ -165,7 +165,7 @@ class ASDAGTrainer:
         use_lpc: bool = True,
         use_muon: bool = True,
         muon_lr: float = 0.03,
-        use_priority_replay: bool = True,
+        use_priority_replay: bool = False,
         replay_ratio: float = 0.25,
         replay_buffer_capacity: int = 4000,
         replay_max_replays: int = 3,
